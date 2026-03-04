@@ -16,6 +16,7 @@ class Settings(BaseModel):
     admin_id: int
     tlg_allowed_id: List[int]
     log_level: str = "INFO"
+    tracks_root_dir: Path
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -30,6 +31,9 @@ class Settings(BaseModel):
             "admin_id": int(os.getenv("ADMIN_ID", "0")),
             "tlg_allowed_id": tlg_allowed_parsed,
             "log_level": os.getenv("LOG_LEVEL", "INFO"),
+            "tracks_root_dir": os.getenv(
+                "TRACKS_ROOT_DIR", str(_BASE_DIR / "tracks")
+            ),
         }
 
         return cls(**data)
