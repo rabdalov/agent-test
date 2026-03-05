@@ -11,10 +11,11 @@ from urllib.parse import unquote, urlparse
 import httpx
 from aiogram import F, Router, types
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
 
 from .config import Settings
-from .models import PipelineState, PipelineStatus, PipelineStep, UserRequest
-from .pipeline import KaraokePipeline, _ORDERED_STEPS
+from .models import LyricsStates, PipelineState, PipelineStatus, PipelineStep, UserRequest
+from .pipeline import KaraokePipeline, LyricsNotFoundError, _ORDERED_STEPS
 
 
 class KaraokeHandlers:
@@ -27,7 +28,8 @@ class KaraokeHandlers:
 
     def _register_handlers(self) -> None:
         @self.router.message(CommandStart())
-        async def handle_start(message: types.Message) -> None:  # type: ignore[unused-ignore]
+        async def handle_start(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            await state.clear()
             await message.answer(
                 "Привет! Я бот для подготовки караоке-видео.\n"
                 "Отправьте мне аудиофайл (музыкальную композицию длительностью более 1 минуты), "
@@ -35,7 +37,7 @@ class KaraokeHandlers:
             )
 
         @self.router.message(F.audio)
-        async def handle_audio(message: types.Message) -> None:  # type: ignore[unused-ignore]
+        async def handle_audio(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             audio = message.audio
             if audio is None:
                 return
@@ -49,12 +51,8 @@ class KaraokeHandlers:
             tmp_path = tmp_dir / original_name
 
             await message.bot.download(audio, destination=tmp_path)
-            #artist=""
-            #title=""
-            #duration=120
             duration, artist, title = await self._probe_audio(tmp_path)
 
-            #track_name = self._build_track_name(original_name, artist, title)
             track_name = self._build_track_name(original_name or "track", None, None)
 
             if duration is None or duration < 60:
@@ -106,7 +104,11 @@ class KaraokeHandlers:
             async def _audio_progress(msg: str) -> None:
                 await message.answer(msg)
 
-            result = await pipeline.run(_audio_progress)
+            try:
+                result = await pipeline.run(_audio_progress)
+            except LyricsNotFoundError:
+                await self._ask_for_lyrics(message, state, track_id, track_dir)
+                return
 
             if result.status == PipelineStatus.COMPLETED:
                 await message.answer(
@@ -123,7 +125,7 @@ class KaraokeHandlers:
                 )
 
         @self.router.message(Command("continue"))
-        async def handle_continue(message: types.Message) -> None:  # type: ignore[unused-ignore]
+        async def handle_continue(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             result = self._find_latest_state()
             if result is None:
                 await message.answer(
@@ -131,16 +133,16 @@ class KaraokeHandlers:
                 )
                 return
 
-            state, track_dir = result
+            state_obj, track_dir = result
             track_name = track_dir.name
 
-            if state.status == PipelineStatus.COMPLETED:
-                if state.current_step is None:
+            if state_obj.status == PipelineStatus.COMPLETED:
+                if state_obj.current_step is None:
                     await message.answer(
                         "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
                     )
                     return
-                current_index = _ORDERED_STEPS.index(state.current_step)
+                current_index = _ORDERED_STEPS.index(state_obj.current_step)
                 if current_index + 1 >= len(_ORDERED_STEPS):
                     await message.answer(
                         "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
@@ -153,21 +155,21 @@ class KaraokeHandlers:
                     f"track: <code>{track_name}</code>",
                     parse_mode="HTML",
                 )
-                await self._run_from_step(message, track_dir, state, next_step)
+                await self._run_from_step(message, track_dir, state_obj, next_step, state)
 
-            elif state.status == PipelineStatus.FAILED:
-                if state.current_step is None:
+            elif state_obj.status == PipelineStatus.FAILED:
+                if state_obj.current_step is None:
                     await message.answer(
                         "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
                     )
                     return
-                step_name = state.current_step.value
+                step_name = state_obj.current_step.value
                 await message.answer(
                     f"🔁 Повторяю шаг {step_name}...\n"
                     f"track: <code>{track_name}</code>",
                     parse_mode="HTML",
                 )
-                await self._run_from_step(message, track_dir, state, state.current_step)
+                await self._run_from_step(message, track_dir, state_obj, state_obj.current_step, state)
 
             else:
                 await message.answer(
@@ -175,31 +177,93 @@ class KaraokeHandlers:
                 )
 
         @self.router.message(Command("step_separate"))
-        async def handle_step_separate(message: types.Message) -> None:  # type: ignore[unused-ignore]
-            await self._handle_step_command(message, PipelineStep.SEPARATE)
+        async def handle_step_separate(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.SEPARATE, state)
 
         @self.router.message(Command("step_transcribe"))
-        async def handle_step_transcribe(message: types.Message) -> None:  # type: ignore[unused-ignore]
-            await self._handle_step_command(message, PipelineStep.TRANSCRIBE)
+        async def handle_step_transcribe(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.TRANSCRIBE, state)
 
         @self.router.message(Command("step_lyrics"))
-        async def handle_step_lyrics(message: types.Message) -> None:  # type: ignore[unused-ignore]
-            await self._handle_step_command(message, PipelineStep.GET_LYRICS)
+        async def handle_step_lyrics(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.GET_LYRICS, state)
 
         @self.router.message(Command("step_align"))
-        async def handle_step_align(message: types.Message) -> None:  # type: ignore[unused-ignore]
-            await self._handle_step_command(message, PipelineStep.ALIGN)
+        async def handle_step_align(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.ALIGN, state)
 
         @self.router.message(Command("step_ass"))
-        async def handle_step_ass(message: types.Message) -> None:  # type: ignore[unused-ignore]
-            await self._handle_step_command(message, PipelineStep.GENERATE_ASS)
+        async def handle_step_ass(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.GENERATE_ASS, state)
 
         @self.router.message(Command("step_render"))
-        async def handle_step_render(message: types.Message) -> None:  # type: ignore[unused-ignore]
-            await self._handle_step_command(message, PipelineStep.RENDER_VIDEO)
+        async def handle_step_render(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.RENDER_VIDEO, state)
 
+        # ----- FSM: waiting for user to supply lyrics text -----
+        @self.router.message(LyricsStates.waiting_for_lyrics, F.text)
+        async def handle_lyrics_input(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            lyrics_text = (message.text or "").strip()
+            if not lyrics_text:
+                await message.answer("Текст песни не может быть пустым. Пришли полный текст.")
+                return
+
+            data = await state.get_data()
+            track_id: str | None = data.get("track_id")
+            if not track_id:
+                await state.clear()
+                await message.answer("❌ Не удалось определить трек. Пожалуйста, начните обработку заново.")
+                return
+
+            # Find track dir by track_id via state.json files
+            track_dir = self._find_track_dir_by_id(track_id)
+            if track_dir is None:
+                await state.clear()
+                await message.answer("❌ Папка трека не найдена. Пожалуйста, начните обработку заново.")
+                return
+
+            # Read existing PipelineState to get track_stem
+            state_path = track_dir / "state.json"
+            try:
+                pipeline_state = PipelineState.model_validate_json(
+                    state_path.read_text(encoding="utf-8")
+                )
+            except Exception as exc:
+                self._logger.error("Failed to read state.json for track_id=%s: %s", track_id, exc)
+                await state.clear()
+                await message.answer("❌ Не удалось прочитать состояние трека. Пожалуйста, начните заново.")
+                return
+
+            track_stem = pipeline_state.track_stem or track_dir.name
+
+            # Save lyrics to file
+            lyrics_file = track_dir / f"{track_stem}_lyrics.txt"
+            try:
+                lyrics_file.write_text(lyrics_text, encoding="utf-8")
+            except OSError as exc:
+                self._logger.error("Failed to write lyrics file for track_id=%s: %s", track_id, exc)
+                await state.clear()
+                await message.answer("❌ Не удалось сохранить текст песни. Попробуйте ещё раз.")
+                return
+
+            # Update PipelineState
+            pipeline_state.source_lyrics_file = str(lyrics_file)
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error("Failed to update state.json for track_id=%s: %s", track_id, exc)
+
+            # Clear FSM state
+            await state.clear()
+
+            await message.answer("✅ Текст песни получен. Продолжаю обработку...")
+
+            # Continue pipeline from ALIGN step
+            await self._run_from_step(message, track_dir, pipeline_state, PipelineStep.ALIGN, state)
+
+        # ----- General text handler (URLs) — must be AFTER FSM handler -----
         @self.router.message(F.text)
-        async def handle_text(message: types.Message) -> None:  # type: ignore[unused-ignore]
+        async def handle_text(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             text = (message.text or "").strip()
             url = self._extract_url(text)
             if url is None:
@@ -235,7 +299,7 @@ class KaraokeHandlers:
                 track_folder=str(track_dir),
             )
 
-            # Fix 1: save state.json at <tracks_root_dir> / <track_name> / state.json
+            # Save state.json at <tracks_root_dir> / <track_name> / state.json
             state_path = track_dir / "state.json"
             try:
                 state_path.write_text(
@@ -252,7 +316,7 @@ class KaraokeHandlers:
                 )
                 return
 
-            # Fix 3: download the file by HTTP URL and save locally
+            # Download the file by HTTP URL and save locally
             filename = url_basename if url_basename else "source_file"
             local_path = track_dir / filename
 
@@ -313,7 +377,11 @@ class KaraokeHandlers:
             async def _url_progress(msg: str) -> None:
                 await message.answer(msg)
 
-            result = await pipeline.run(_url_progress)
+            try:
+                result = await pipeline.run(_url_progress)
+            except LyricsNotFoundError:
+                await self._ask_for_lyrics(message, state, track_id, track_dir)
+                return
 
             if result.status == PipelineStatus.COMPLETED:
                 await message.answer(
@@ -335,6 +403,46 @@ class KaraokeHandlers:
                 "Полученное сообщение не является музыкальной композицией. "
                 "Пожалуйста, отправьте аудиофайл длительностью более 1 минуты."
             )
+
+    # ------------------------------------------------------------------
+    # Lyrics FSM helpers
+    # ------------------------------------------------------------------
+
+    async def _ask_for_lyrics(
+        self,
+        message: types.Message,
+        state: FSMContext,
+        track_id: str,
+        track_dir: Path,
+    ) -> None:
+        """Transition user to FSM state waiting_for_lyrics and ask to send lyrics."""
+        await state.set_state(LyricsStates.waiting_for_lyrics)
+        await state.update_data(track_id=track_id)
+        self._logger.info(
+            "LyricsNotFoundError for track_id=%s — requesting lyrics from user", track_id
+        )
+        await message.answer(
+            "🎵 Не удалось автоматически найти текст песни.\n\n"
+            "Пожалуйста, пришли полный текст песни в следующем сообщении."
+        )
+
+    def _find_track_dir_by_id(self, track_id: str) -> Path | None:
+        """Scan tracks root for a track_dir whose state.json has matching track_id."""
+        if not self._tracks_root_dir.exists():
+            return None
+        for subdir in self._tracks_root_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            state_path = subdir / "state.json"
+            if not state_path.exists():
+                continue
+            try:
+                data = json.loads(state_path.read_text(encoding="utf-8"))
+                if data.get("track_id") == track_id:
+                    return subdir
+            except Exception:
+                continue
+        return None
 
     # ------------------------------------------------------------------
     # Step-command helpers
@@ -377,6 +485,7 @@ class KaraokeHandlers:
         self,
         message: types.Message,
         step: PipelineStep,
+        state: FSMContext,
     ) -> None:
         """Common handler logic for /step_* commands."""
         result = self._find_latest_state()
@@ -386,7 +495,7 @@ class KaraokeHandlers:
             )
             return
 
-        state, track_dir = result
+        pipeline_state, track_dir = result
         track_name = track_dir.name
         step_name = step.value
 
@@ -395,7 +504,7 @@ class KaraokeHandlers:
             f"track: <code>{track_name}</code>",
             parse_mode="HTML",
         )
-        await self._run_from_step(message, track_dir, state, step)
+        await self._run_from_step(message, track_dir, pipeline_state, step, state)
 
     async def _run_from_step(
         self,
@@ -403,6 +512,7 @@ class KaraokeHandlers:
         track_dir: Path,
         state: PipelineState,
         step: PipelineStep,
+        fsm_context: FSMContext,
     ) -> None:
         """Reconstruct UserRequest from saved state and run the pipeline from the given step."""
         # Build a minimal UserRequest from persisted state data
@@ -427,7 +537,11 @@ class KaraokeHandlers:
         async def _step_progress(msg: str) -> None:
             await message.answer(msg)
 
-        result = await pipeline.run(_step_progress, start_from_step=step)
+        try:
+            result = await pipeline.run(_step_progress, start_from_step=step)
+        except LyricsNotFoundError:
+            await self._ask_for_lyrics(message, fsm_context, state.track_id, track_dir)
+            return
 
         if result.status == PipelineStatus.COMPLETED:
             await message.answer(
@@ -513,8 +627,6 @@ class KaraokeHandlers:
         if not base:
             base = "track"
 
-        #normalized = re.sub(r"[^\w\-]+", "_", base)
-        #normalized = normalized.strip("_")
         normalized = re.sub(r"[^\w\s\-]+", "", base)  # Удаляем спецсимволы, кроме букв/цифр/пробелов/дефиса
         normalized = re.sub(r"\s+", " ", normalized)  # Сжимаем множественные пробелы в один
         if not normalized:
@@ -542,7 +654,7 @@ class KaraokeHandlers:
     def _extract_url(self, text: str) -> str | None:
         """Return the first HTTP(S) URL found in *text*, or None.
 
-        Fix 2: if the message starts with http(s)://, treat the entire stripped
+        If the message starts with http(s)://, treat the entire stripped
         text as the URL (replacing spaces with %20 so filenames with spaces are
         preserved).  Otherwise, find the first occurrence of http and take
         everything from that position to the end of the string (again encoding
@@ -565,5 +677,3 @@ class KaraokeHandlers:
         except ValueError:
             return False
         return any(host == blocked or host.endswith("." + blocked) for blocked in self._BLOCKED_HOSTS)
-
-

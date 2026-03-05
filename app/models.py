@@ -1,5 +1,6 @@
 from enum import Enum
 
+from aiogram.fsm.state import State, StatesGroup
 from pydantic import BaseModel
 
 
@@ -50,3 +51,7 @@ class PipelineResult(BaseModel):
     status: PipelineStatus
     final_video_path: str | None = None
     error_message: str | None = None
+
+
+class LyricsStates(StatesGroup):
+    waiting_for_lyrics = State()

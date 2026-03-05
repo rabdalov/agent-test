@@ -25,6 +25,12 @@ class Settings(BaseModel):
     lang_default: str = "ru"
     prompt_speeches: str = ""
     speeches_timeout: int = 300
+    # Genius API token for automatic lyrics search (optional)
+    genius_token: str | None = None
+    # Lyrics providers
+    lyrics_enable_genius: bool = True   # Enable Genius API lyrics search
+    lyrics_enable_lyrica: bool = False  # Enable Lyrica lyrics search
+    lyrics_enable_lyricslib: bool = False  # Enable lyrics-lib lyrics search
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -33,6 +39,8 @@ class Settings(BaseModel):
             tlg_allowed_parsed = json.loads(raw_tlg_allowed)
         except json.JSONDecodeError:
             tlg_allowed_parsed = []
+
+        genius_token_raw = os.getenv("GENIUS_TOKEN", "") or None
 
         data = {
             "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -47,6 +55,10 @@ class Settings(BaseModel):
             "lang_default": os.getenv("LANG_DEFAULT", "ru"),
             "prompt_speeches": os.getenv("PROMPT_SPEECHES", ""),
             "speeches_timeout": int(os.getenv("SPEECHES_TIMEOUT", "300")),
+            "genius_token": genius_token_raw,
+            "lyrics_enable_genius": os.getenv("LYRICS_ENABLE_GENIUS", "true").lower() in ("true", "1", "yes"),
+            "lyrics_enable_lyrica": os.getenv("LYRICS_ENABLE_LYRICA", "false").lower() in ("true", "1", "yes"),
+            "lyrics_enable_lyricslib": os.getenv("LYRICS_ENABLE_LYRICSLIB", "false").lower() in ("true", "1", "yes"),
         }
 
         return cls(**data)

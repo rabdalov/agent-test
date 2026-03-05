@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .config import Settings
 from .demucs_service import DemucsService
+from .lyrics_service import LyricsService
 from .speeches_client import SpeechesClient
 from .models import (
     PipelineResult,
@@ -13,6 +14,11 @@ from .models import (
     PipelineStep,
     UserRequest,
 )
+
+
+class LyricsNotFoundError(Exception):
+    """Raised when lyrics cannot be found automatically."""
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +178,12 @@ class KaraokePipeline:
 
             try:
                 await step_methods[step]()
+            except LyricsNotFoundError:
+                # Let this propagate — the handler will request lyrics from the user.
+                self._state.status = PipelineStatus.FAILED
+                self._state.error_message = "Требуется ручной ввод текста песни"
+                self._save_state()
+                raise
             except Exception as exc:
                 error_msg = f"Ошибка на шаге {step.value}: {exc}"
                 logger.error(
@@ -307,11 +319,34 @@ class KaraokePipeline:
 
     async def _step_get_lyrics(self) -> None:
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
-        self._state.source_lyrics_file = str(
-            Path(self._request.track_folder) / f"{stem}.lyrics.txt"
+        track_dir = Path(self._request.track_folder)
+
+        lyrics_service = LyricsService(
+            genius_token=self._settings.genius_token,
+            enable_genius=self._settings.lyrics_enable_genius,
+            enable_lyrica=self._settings.lyrics_enable_lyrica,
+            enable_lyricslib=self._settings.lyrics_enable_lyricslib,
         )
+        lyrics = await lyrics_service.find_lyrics(
+            track_stem=stem,
+            track_file_name=self._state.track_file_name,
+        )
+
+        if lyrics is None:
+            raise LyricsNotFoundError(
+                f"Не удалось автоматически найти текст для трека '{stem}'"
+            )
+
+        lyrics_file = track_dir / f"{stem}_lyrics.txt"
+        lyrics_file.write_text(lyrics, encoding="utf-8")
+
+        self._state.source_lyrics_file = str(lyrics_file)
         self._save_state()
-        await asyncio.sleep(0)
+        logger.info(
+            "GET_LYRICS step completed for track_id=%s: lyrics saved to '%s'",
+            self._request.track_id,
+            lyrics_file,
+        )
 
     async def _step_align(self) -> None:
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
