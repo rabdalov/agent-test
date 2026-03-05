@@ -10,11 +10,11 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 from aiogram import F, Router, types
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 
 from .config import Settings
-from .models import PipelineStatus, UserRequest
-from .pipeline import KaraokePipeline
+from .models import PipelineState, PipelineStatus, PipelineStep, UserRequest
+from .pipeline import KaraokePipeline, _ORDERED_STEPS
 
 
 class KaraokeHandlers:
@@ -121,6 +121,82 @@ class KaraokeHandlers:
                     f"Причина: {result.error_message}",
                     parse_mode="HTML",
                 )
+
+        @self.router.message(Command("continue"))
+        async def handle_continue(message: types.Message) -> None:  # type: ignore[unused-ignore]
+            result = self._find_latest_state()
+            if result is None:
+                await message.answer(
+                    "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
+                )
+                return
+
+            state, track_dir = result
+            track_name = track_dir.name
+
+            if state.status == PipelineStatus.COMPLETED:
+                if state.current_step is None:
+                    await message.answer(
+                        "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
+                    )
+                    return
+                current_index = _ORDERED_STEPS.index(state.current_step)
+                if current_index + 1 >= len(_ORDERED_STEPS):
+                    await message.answer(
+                        "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
+                    )
+                    return
+                next_step = _ORDERED_STEPS[current_index + 1]
+                step_name = next_step.value
+                await message.answer(
+                    f"▶️ Продолжаю обработку со шага {step_name}...\n"
+                    f"track: <code>{track_name}</code>",
+                    parse_mode="HTML",
+                )
+                await self._run_from_step(message, track_dir, state, next_step)
+
+            elif state.status == PipelineStatus.FAILED:
+                if state.current_step is None:
+                    await message.answer(
+                        "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
+                    )
+                    return
+                step_name = state.current_step.value
+                await message.answer(
+                    f"🔁 Повторяю шаг {step_name}...\n"
+                    f"track: <code>{track_name}</code>",
+                    parse_mode="HTML",
+                )
+                await self._run_from_step(message, track_dir, state, state.current_step)
+
+            else:
+                await message.answer(
+                    "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
+                )
+
+        @self.router.message(Command("step_separate"))
+        async def handle_step_separate(message: types.Message) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.SEPARATE)
+
+        @self.router.message(Command("step_transcribe"))
+        async def handle_step_transcribe(message: types.Message) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.TRANSCRIBE)
+
+        @self.router.message(Command("step_lyrics"))
+        async def handle_step_lyrics(message: types.Message) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.GET_LYRICS)
+
+        @self.router.message(Command("step_align"))
+        async def handle_step_align(message: types.Message) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.ALIGN)
+
+        @self.router.message(Command("step_ass"))
+        async def handle_step_ass(message: types.Message) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.GENERATE_ASS)
+
+        @self.router.message(Command("step_render"))
+        async def handle_step_render(message: types.Message) -> None:  # type: ignore[unused-ignore]
+            await self._handle_step_command(message, PipelineStep.RENDER_VIDEO)
 
         @self.router.message(F.text)
         async def handle_text(message: types.Message) -> None:  # type: ignore[unused-ignore]
@@ -258,6 +334,113 @@ class KaraokeHandlers:
             await message.answer(
                 "Полученное сообщение не является музыкальной композицией. "
                 "Пожалуйста, отправьте аудиофайл длительностью более 1 минуты."
+            )
+
+    # ------------------------------------------------------------------
+    # Step-command helpers
+    # ------------------------------------------------------------------
+
+    def _find_latest_state(self) -> tuple[PipelineState, Path] | None:
+        """Find the track folder with the most recently modified state.json.
+
+        Returns a tuple of (PipelineState, track_dir) or None if not found.
+        """
+        best_mtime: float | None = None
+        best_state: PipelineState | None = None
+        best_dir: Path | None = None
+
+        if not self._tracks_root_dir.exists():
+            return None
+
+        for subdir in self._tracks_root_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            state_path = subdir / "state.json"
+            if not state_path.exists():
+                continue
+            try:
+                mtime = state_path.stat().st_mtime
+                state = PipelineState.model_validate_json(state_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self._logger.warning("Failed to read state.json in %s: %s", subdir, exc)
+                continue
+            if best_mtime is None or mtime > best_mtime:
+                best_mtime = mtime
+                best_state = state
+                best_dir = subdir
+
+        if best_state is None or best_dir is None:
+            return None
+        return best_state, best_dir
+
+    async def _handle_step_command(
+        self,
+        message: types.Message,
+        step: PipelineStep,
+    ) -> None:
+        """Common handler logic for /step_* commands."""
+        result = self._find_latest_state()
+        if result is None:
+            await message.answer(
+                "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
+            )
+            return
+
+        state, track_dir = result
+        track_name = track_dir.name
+        step_name = step.value
+
+        await message.answer(
+            f"▶️ Запускаю обработку с шага {step_name}...\n"
+            f"track: <code>{track_name}</code>",
+            parse_mode="HTML",
+        )
+        await self._run_from_step(message, track_dir, state, step)
+
+    async def _run_from_step(
+        self,
+        message: types.Message,
+        track_dir: Path,
+        state: PipelineState,
+        step: PipelineStep,
+    ) -> None:
+        """Reconstruct UserRequest from saved state and run the pipeline from the given step."""
+        # Build a minimal UserRequest from persisted state data
+        source = state.track_source or state.track_file_name or ""
+        # Prefer the local track_file_name path inside track_dir
+        if state.track_file_name:
+            candidate = track_dir / state.track_file_name
+            if candidate.exists():
+                source = str(candidate)
+            elif not source:
+                source = state.track_file_name
+
+        request = UserRequest(
+            user_id=message.from_user.id if message.from_user else 0,
+            track_id=state.track_id,
+            source_type="file",
+            source_url_or_file_path=source,
+            track_folder=str(track_dir),
+        )
+        pipeline = KaraokePipeline(request, self._settings)
+
+        async def _step_progress(msg: str) -> None:
+            await message.answer(msg)
+
+        result = await pipeline.run(_step_progress, start_from_step=step)
+
+        if result.status == PipelineStatus.COMPLETED:
+            await message.answer(
+                f"🎉 Шаг завершён успешно!\n"
+                f"track_id: <code>{result.track_id}</code>",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                f"💔 Шаг завершён с ошибкой.\n"
+                f"track_id: <code>{result.track_id}</code>\n"
+                f"Причина: {result.error_message}",
+                parse_mode="HTML",
             )
 
     def _ensure_tracks_root(self) -> None:

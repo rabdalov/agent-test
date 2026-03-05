@@ -33,6 +33,16 @@ class PipelineState(BaseModel):
     current_step: PipelineStep | None = None
     status: PipelineStatus = PipelineStatus.PENDING
     error_message: str | None = None
+    track_file_name: str | None = None
+    track_source: str | None = None
+    track_stem: str | None = None
+    vocal_file: str | None = None
+    instrumental_file: str | None = None
+    source_lyrics_file: str | None = None
+    transcribe_json_file: str | None = None
+    aligned_lyrics_file: str | None = None
+    ass_file: str | None = None
+    output_file: str | None = None
 
 
 class PipelineResult(BaseModel):

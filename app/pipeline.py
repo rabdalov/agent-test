@@ -35,6 +35,17 @@ _ORDERED_STEPS: list[PipelineStep] = [
     PipelineStep.RENDER_VIDEO,
 ]
 
+# Required artifact fields that must be set before a given step can run.
+# If a step is absent, no prerequisite artifacts are needed.
+_STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
+    PipelineStep.SEPARATE: ["track_file_name"],
+    PipelineStep.TRANSCRIBE: ["vocal_file"],
+    PipelineStep.GET_LYRICS: ["transcribe_json_file"],
+    PipelineStep.ALIGN: ["source_lyrics_file", "transcribe_json_file"],
+    PipelineStep.GENERATE_ASS: ["aligned_lyrics_file"],
+    PipelineStep.RENDER_VIDEO: ["ass_file", "vocal_file", "instrumental_file"],
+}
+
 
 class KaraokePipeline:
     def __init__(self, request: UserRequest, settings: Settings) -> None:
@@ -44,22 +55,96 @@ class KaraokePipeline:
             track_id=request.track_id,
             status=PipelineStatus.PENDING,
         )
-        demucs_output_dir = str(Path(request.track_folder).parent )
+        demucs_output_dir = str(Path(request.track_folder).parent)
         self._demucs_service = DemucsService(
             model=settings.demucs_model,
             output_format=settings.demucs_output_format,
             output_dir=demucs_output_dir,
         )
-        self._vocals_path: str | None = None
-        self._accompaniment_path: str | None = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     async def run(
         self,
         progress_callback: Callable[[str], Awaitable[None]],
+        start_from_step: PipelineStep | None = None,
+    ) -> PipelineResult:
+        """Run the pipeline.
+
+        Resolution order for the starting step:
+        1. If *start_from_step* is explicitly provided — use it (after
+           validating prerequisite artifacts).
+        2. Else if a ``state.json`` exists for this track with
+           ``status == FAILED`` — resume from ``current_step``.
+        3. Otherwise — run from the very beginning (DOWNLOAD).
+        """
+        first_step: PipelineStep
+
+        if start_from_step is not None:
+            # Mode 3: explicit start_from_step
+            saved = self._load_state()
+            if saved is not None:
+                # Restore artefacts accumulated in previous runs
+                self._state = saved
+            validation_error = self._validate_artifacts_for_step(start_from_step)
+            if validation_error:
+                logger.error(
+                    "Cannot start from step %s for track_id=%s: %s",
+                    start_from_step.value,
+                    self._request.track_id,
+                    validation_error,
+                )
+                self._state.status = PipelineStatus.FAILED
+                self._state.error_message = validation_error
+                self._save_state()
+                return PipelineResult(
+                    track_id=self._request.track_id,
+                    status=PipelineStatus.FAILED,
+                    error_message=validation_error,
+                )
+            first_step = start_from_step
+            logger.info(
+                "Pipeline starting from explicit step %s for track_id=%s",
+                first_step.value,
+                self._request.track_id,
+            )
+        else:
+            saved = self._load_state()
+            if saved is not None and saved.status == PipelineStatus.FAILED and saved.current_step is not None:
+                # Mode 2: resume from last failed step
+                self._state = saved
+                first_step = saved.current_step
+                logger.info(
+                    "Pipeline resuming from step %s for track_id=%s",
+                    first_step.value,
+                    self._request.track_id,
+                )
+                await progress_callback(
+                    f"🔄 Возобновление с шага {first_step.value}: {_STEP_LABELS[first_step]}..."
+                )
+            else:
+                # Mode 1: fresh start
+                first_step = PipelineStep.DOWNLOAD
+                logger.info(
+                    "Pipeline starting fresh for track_id=%s",
+                    self._request.track_id,
+                )
+
+        return await self._execute_from(first_step, progress_callback)
+
+    # ------------------------------------------------------------------
+    # Internal execution
+    # ------------------------------------------------------------------
+
+    async def _execute_from(
+        self,
+        first_step: PipelineStep,
+        progress_callback: Callable[[str], Awaitable[None]],
     ) -> PipelineResult:
         self._state.status = PipelineStatus.IN_PROGRESS
         self._save_state()
-        logger.info("Pipeline started for track_id=%s", self._request.track_id)
 
         step_methods: dict[PipelineStep, Callable[[], Awaitable[None]]] = {
             PipelineStep.DOWNLOAD: self._step_download,
@@ -71,9 +156,13 @@ class KaraokePipeline:
             PipelineStep.RENDER_VIDEO: self._step_render_video,
         }
 
-        for step in _ORDERED_STEPS:
+        start_index = _ORDERED_STEPS.index(first_step)
+        steps_to_run = _ORDERED_STEPS[start_index:]
+
+        for step in steps_to_run:
             label = _STEP_LABELS[step]
             self._state.current_step = step
+            self._state.status = PipelineStatus.IN_PROGRESS
             self._save_state()
 
             logger.info("Step %s started for track_id=%s", step.value, self._request.track_id)
@@ -103,12 +192,14 @@ class KaraokePipeline:
             await progress_callback(f"✅ Шаг {step.value} завершён")
 
         self._state.status = PipelineStatus.COMPLETED
+        self._state.error_message = None
         self._save_state()
         logger.info("Pipeline completed for track_id=%s", self._request.track_id)
 
         return PipelineResult(
             track_id=self._request.track_id,
             status=PipelineStatus.COMPLETED,
+            final_video_path=self._state.output_file,
         )
 
     # ------------------------------------------------------------------
@@ -126,11 +217,55 @@ class KaraokePipeline:
                 exc,
             )
 
+    def _load_state(self) -> PipelineState | None:
+        state_path = Path(self._request.track_folder) / "state.json"
+        if not state_path.exists():
+            return None
+        try:
+            return PipelineState.model_validate_json(state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(
+                "Failed to load state.json for track_id=%s: %s",
+                self._request.track_id,
+                exc,
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # Artifact prerequisite validation
+    # ------------------------------------------------------------------
+
+    def _validate_artifacts_for_step(self, step: PipelineStep) -> str | None:
+        """Return an error message if required artifacts for *step* are absent,
+        or None if all prerequisites are satisfied."""
+        required_fields = _STEP_REQUIRED_ARTIFACTS.get(step)
+        if not required_fields:
+            return None
+
+        missing: list[str] = []
+        for field in required_fields:
+            value = getattr(self._state, field, None)
+            if not value:
+                missing.append(field)
+
+        if missing:
+            return (
+                f"Невозможно начать с шага {step.value}: "
+                f"отсутствуют артефакты предыдущих шагов: {', '.join(missing)}"
+            )
+        return None
+
     # ------------------------------------------------------------------
     # Stub step methods — no real logic yet
     # ------------------------------------------------------------------
 
     async def _step_download(self) -> None:
+        source = self._request.source_url_or_file_path
+        stem = Path(source).stem
+        self._state.track_source = source
+        self._state.track_file_name = Path(source).name
+        self._state.track_stem = stem
+        self._save_state()
         await asyncio.sleep(0)
 
     async def _step_separate(self) -> None:
@@ -142,8 +277,8 @@ class KaraokePipeline:
             track_dir=track_dir,
         )
 
-        self._vocals_path = vocals_path
-        self._accompaniment_path = accompaniment_path
+        self._state.vocal_file = vocals_path
+        self._state.instrumental_file = accompaniment_path
 
         logger.info(
             "SEPARATE step completed for track_id=%s: vocals='%s', accompaniment='%s'",
@@ -151,18 +286,44 @@ class KaraokePipeline:
             vocals_path,
             accompaniment_path,
         )
+        self._save_state()
 
     async def _step_transcribe(self) -> None:
+        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        self._state.transcribe_json_file = str(
+            Path(self._request.track_folder) / f"{stem}.transcription.json"
+        )
+        self._save_state()
         await asyncio.sleep(0)
 
     async def _step_get_lyrics(self) -> None:
+        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        self._state.source_lyrics_file = str(
+            Path(self._request.track_folder) / f"{stem}.lyrics.txt"
+        )
+        self._save_state()
         await asyncio.sleep(0)
 
     async def _step_align(self) -> None:
+        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        self._state.aligned_lyrics_file = str(
+            Path(self._request.track_folder) / f"{stem}.aligned.json"
+        )
+        self._save_state()
         await asyncio.sleep(0)
 
     async def _step_generate_ass(self) -> None:
+        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        self._state.ass_file = str(
+            Path(self._request.track_folder) / f"{stem}.ass"
+        )
+        self._save_state()
         await asyncio.sleep(0)
 
     async def _step_render_video(self) -> None:
+        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        self._state.output_file = str(
+            Path(self._request.track_folder) / f"{stem}.mp4"
+        )
+        self._save_state()
         await asyncio.sleep(0)
