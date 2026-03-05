@@ -13,7 +13,8 @@ from aiogram import F, Router, types
 from aiogram.filters import CommandStart
 
 from .config import Settings
-from .models import UserRequest
+from .models import PipelineStatus, UserRequest
+from .pipeline import KaraokePipeline
 
 
 class KaraokeHandlers:
@@ -88,8 +89,38 @@ class KaraokeHandlers:
                 "Аудиофайл принят.\n"
                 f"track_id: <code>{track_id}</code>\n"
                 f'track_name: <code>{track_name}</code>\n'
-                f'Путь к файлу: <code>{final_path}</code>'
+                f'Путь к файлу: <code>{final_path}</code>',
+                parse_mode="HTML",
             )
+
+            user_id: int = message.from_user.id if message.from_user else 0
+            request = UserRequest(
+                user_id=user_id,
+                track_id=track_id,
+                source_type="file",
+                source_url_or_file_path=str(final_path),
+                track_folder=str(track_dir),
+            )
+            pipeline = KaraokePipeline(request, self._settings)
+
+            async def _audio_progress(msg: str) -> None:
+                await message.answer(msg)
+
+            result = await pipeline.run(_audio_progress)
+
+            if result.status == PipelineStatus.COMPLETED:
+                await message.answer(
+                    f"🎉 Обработка завершена успешно!\n"
+                    f"track_id: <code>{result.track_id}</code>",
+                    parse_mode="HTML",
+                )
+            else:
+                await message.answer(
+                    f"💔 Обработка завершена с ошибкой.\n"
+                    f"track_id: <code>{result.track_id}</code>\n"
+                    f"Причина: {result.error_message}",
+                    parse_mode="HTML",
+                )
 
         @self.router.message(F.text)
         async def handle_text(message: types.Message) -> None:  # type: ignore[unused-ignore]
@@ -125,6 +156,7 @@ class KaraokeHandlers:
                 track_id=track_id,
                 source_type="url",
                 source_url_or_file_path=url,
+                track_folder=str(track_dir),
             )
 
             # Fix 1: save state.json at <tracks_root_dir> / <track_name> / state.json
@@ -180,6 +212,7 @@ class KaraokeHandlers:
                 track_id=track_id,
                 source_type="url",
                 source_url_or_file_path=str(local_path),
+                track_folder=str(track_dir),
             )
             try:
                 state_path.write_text(
@@ -198,6 +231,27 @@ class KaraokeHandlers:
                 f"Путь к файлу: <code>{local_path}</code>",
                 parse_mode="HTML",
             )
+
+            pipeline = KaraokePipeline(request, self._settings)
+
+            async def _url_progress(msg: str) -> None:
+                await message.answer(msg)
+
+            result = await pipeline.run(_url_progress)
+
+            if result.status == PipelineStatus.COMPLETED:
+                await message.answer(
+                    f"🎉 Обработка завершена успешно!\n"
+                    f"track_id: <code>{result.track_id}</code>",
+                    parse_mode="HTML",
+                )
+            else:
+                await message.answer(
+                    f"💔 Обработка завершена с ошибкой.\n"
+                    f"track_id: <code>{result.track_id}</code>\n"
+                    f"Причина: {result.error_message}",
+                    parse_mode="HTML",
+                )
 
         @self.router.message()
         async def handle_non_audio(message: types.Message) -> None:  # type: ignore[unused-ignore]

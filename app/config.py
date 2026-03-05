@@ -17,6 +17,8 @@ class Settings(BaseModel):
     tlg_allowed_id: List[int]
     log_level: str = "INFO"
     tracks_root_dir: Path
+    demucs_model: str = "htdemucs"
+    demucs_output_format: str = "mp3"
 
     @classmethod
     def from_env(cls) -> "Settings":
