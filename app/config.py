@@ -19,6 +19,12 @@ class Settings(BaseModel):
     tracks_root_dir: Path
     demucs_model: str = "htdemucs"
     demucs_output_format: str = "mp3"
+    # speeches.ai transcription
+    speeches_base_url: str = "http://localhost:8000"
+    transcription_model_id: str = "whisper-1"
+    lang_default: str = "ru"
+    prompt_speeches: str = ""
+    speeches_timeout: int = 300
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -36,6 +42,11 @@ class Settings(BaseModel):
             "tracks_root_dir": os.getenv(
                 "TRACKS_ROOT_DIR", str(_BASE_DIR / "tracks")
             ),
+            "speeches_base_url": os.getenv("SPEECHES_BASE_URL", "http://localhost:8000"),
+            "transcription_model_id": os.getenv("TRANSCRIPTION_MODEL_ID", "whisper-1"),
+            "lang_default": os.getenv("LANG_DEFAULT", "ru"),
+            "prompt_speeches": os.getenv("PROMPT_SPEECHES", ""),
+            "speeches_timeout": int(os.getenv("SPEECHES_TIMEOUT", "300")),
         }
 
         return cls(**data)

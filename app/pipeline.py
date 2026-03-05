@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .config import Settings
 from .demucs_service import DemucsService
+from .speeches_client import SpeechesClient
 from .models import (
     PipelineResult,
     PipelineState,
@@ -61,6 +62,7 @@ class KaraokePipeline:
             output_format=settings.demucs_output_format,
             output_dir=demucs_output_dir,
         )
+        self._speeches_client = SpeechesClient(settings=settings)
 
     # ------------------------------------------------------------------
     # Public API
@@ -289,12 +291,19 @@ class KaraokePipeline:
         self._save_state()
 
     async def _step_transcribe(self) -> None:
+        vocal_file_str = self._state.vocal_file
+        if not vocal_file_str:
+            raise RuntimeError("vocal_file не задан — шаг SEPARATE не был выполнен")
+
+        vocal_file = Path(vocal_file_str)
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
-        self._state.transcribe_json_file = str(
-            Path(self._request.track_folder) / f"{stem}.transcription.json"
-        )
+        track_dir = Path(self._request.track_folder)
+        output_json = track_dir / f"{stem}_transcription.json"
+
+        await self._speeches_client.transcribe(vocal_file=vocal_file, output_json=output_json)
+
+        self._state.transcribe_json_file = str(output_json)
         self._save_state()
-        await asyncio.sleep(0)
 
     async def _step_get_lyrics(self) -> None:
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
