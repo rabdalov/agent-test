@@ -29,8 +29,10 @@ class Settings(BaseModel):
     genius_token: str | None = None
     # Lyrics providers
     lyrics_enable_genius: bool = True   # Enable Genius API lyrics search
-    lyrics_enable_lyrica: bool = False  # Enable Lyrica lyrics search
+    lyrics_enable_lyrica: bool = False  # Enable LyricaV2 HTTP service lyrics search
     lyrics_enable_lyricslib: bool = False  # Enable lyrics-lib lyrics search
+    # LyricaV2 service base URL (used when lyrics_enable_lyrica=true)
+    lyrica_base_url: str = "http://localhost:5000"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -59,6 +61,7 @@ class Settings(BaseModel):
             "lyrics_enable_genius": os.getenv("LYRICS_ENABLE_GENIUS", "true").lower() in ("true", "1", "yes"),
             "lyrics_enable_lyrica": os.getenv("LYRICS_ENABLE_LYRICA", "false").lower() in ("true", "1", "yes"),
             "lyrics_enable_lyricslib": os.getenv("LYRICS_ENABLE_LYRICSLIB", "false").lower() in ("true", "1", "yes"),
+            "lyrica_base_url": os.getenv("LYRICA_BASE_URL", "http://localhost:5000"),
         }
 
         return cls(**data)

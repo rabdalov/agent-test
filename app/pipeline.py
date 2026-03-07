@@ -3,6 +3,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from .alignment_service import AlignmentService, save_aligned_result
 from .config import Settings
 from .demucs_service import DemucsService
 from .lyrics_service import LyricsService
@@ -326,6 +327,7 @@ class KaraokePipeline:
             enable_genius=self._settings.lyrics_enable_genius,
             enable_lyrica=self._settings.lyrics_enable_lyrica,
             enable_lyricslib=self._settings.lyrics_enable_lyricslib,
+            lyrica_base_url=self._settings.lyrica_base_url,
         )
         lyrics = await lyrics_service.find_lyrics(
             track_stem=stem,
@@ -349,12 +351,37 @@ class KaraokePipeline:
         )
 
     async def _step_align(self) -> None:
+        transcribe_path = self._state.transcribe_json_file
+        lyrics_path = self._state.source_lyrics_file
+        if not transcribe_path:
+            raise RuntimeError("transcribe_json_file не задан — шаг TRANSCRIBE не был выполнен")
+        if not lyrics_path:
+            raise RuntimeError("source_lyrics_file не задан — шаг GET_LYRICS не был выполнен")
+
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
-        self._state.aligned_lyrics_file = str(
-            Path(self._request.track_folder) / f"{stem}.aligned.json"
+        track_dir = Path(self._request.track_folder)
+        output_path = track_dir / f"{stem}.aligned.json"
+
+        vocal_file = Path(self._state.vocal_file) if self._state.vocal_file else None
+
+        alignment_service = AlignmentService()
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: alignment_service.align_timestamps(
+                transcription_json_path=Path(transcribe_path),
+                source_lyrics_path=Path(lyrics_path),
+                audio_file=vocal_file,
+            ),
         )
+        save_aligned_result(result, output_path)
+
+        self._state.aligned_lyrics_file = str(output_path)
         self._save_state()
-        await asyncio.sleep(0)
+        logger.info(
+            "ALIGN step completed for track_id=%s: aligned_lyrics saved to '%s'",
+            self._request.track_id,
+            output_path,
+        )
 
     async def _step_generate_ass(self) -> None:
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem

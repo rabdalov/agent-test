@@ -3,6 +3,8 @@ import logging
 import re
 from functools import partial
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 _SEPARATORS = re.compile(r" — | - |_-_")
@@ -27,19 +29,21 @@ def _parse_artist_title(track_stem: str, track_file_name: str | None) -> tuple[s
 
 
 class LyricsService:
-    """Service for fetching song lyrics automatically via Genius API."""
+    """Service for fetching song lyrics automatically via Genius API and LyricaV2."""
 
     def __init__(
         self,
         genius_token: str | None = None,
-        enable_genius: bool = True,
+        enable_genius: bool = False,
         enable_lyrica: bool = False,
         enable_lyricslib: bool = False,
+        lyrica_base_url: str = "http://localhost:5000",
     ) -> None:
         self._genius_token = genius_token
         self.enable_genius = enable_genius
         self.enable_lyrica = enable_lyrica
         self.enable_lyricslib = enable_lyricslib
+        self._lyrica_base_url = lyrica_base_url.rstrip("/")
 
     async def find_lyrics(
         self,
@@ -87,22 +91,40 @@ class LyricsService:
         return None
 
     async def _search_lyrica(self, artist: str, title: str) -> str | None:
-        """Search lyrics using Lyrica library."""
+        """Search lyrics using LyricaV2 HTTP API (https://github.com/Wilooper/LyricaV2)."""
+        url = f"{self._lyrica_base_url}/lyrics/"
+        params = {"artist": artist, "song": title, "timestamps": True}
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(120.0, connect=10.0),
+                follow_redirects=True,
+            ) as client:
+                print(f"url:{url}")
+                print(f"params:{params}")
+                response = await client.get(url, params=params)
+                print(f"response:{response}")
 
-        def _sync_search() -> str | None:
-            try:
-                from lyrica import Song  # type: ignore[import-untyped]
-                song = Song(artist, title)
-                lyrics = song.lyrics
-                if lyrics and len(lyrics.strip()) > 50:
-                    return lyrics.strip()
-                return None
-            except Exception as e:
-                logger.warning(f"Lyrica search failed for '{artist} - {title}': {e}")
-                return None
+                response.raise_for_status()
+                data: dict = response.json()
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                f"LyricaV2 returned HTTP {e.response.status_code} for '{artist} - {title}'"
+            )
+            return None
+        except Exception as e:
+            logger.warning(f"LyricaV2 search failed for '{artist} - {title}': {e}")
+            return None
 
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _sync_search)
+        if data.get("status") != "success":
+            error_msg = data.get("error", {}).get("message", "unknown error")
+            logger.debug(f"LyricaV2 no results for '{artist} - {title}': {error_msg}")
+            return None
+
+        lyrics: str = data.get("data", {}).get("lyrics", "") or ""
+        lyrics = lyrics.strip()
+        if len(lyrics) > 50:
+            return lyrics
+        return None
 
     async def _search_genius_async(self, artist: str, title: str) -> str | None:
         """Async wrapper around synchronous Genius API search."""
