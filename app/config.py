@@ -33,6 +33,14 @@ class Settings(BaseModel):
     lyrics_enable_lyricslib: bool = False  # Enable lyrics-lib lyrics search
     # LyricaV2 service base URL (used when lyrics_enable_lyrica=true)
     lyrica_base_url: str = "http://localhost:5000"
+    # ASS subtitle font size (pixels, used in GENERATE_ASS step)
+    ass_font_size: int = 60
+    # Video render settings (RENDER_VIDEO step)
+    video_width: int = 1280
+    video_height: int = 720
+    video_background_color: str = "black"
+    video_ffmpeg_preset: str = "fast"
+    video_ffmpeg_crf: int = 22
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -62,6 +70,12 @@ class Settings(BaseModel):
             "lyrics_enable_lyrica": os.getenv("LYRICS_ENABLE_LYRICA", "false").lower() in ("true", "1", "yes"),
             "lyrics_enable_lyricslib": os.getenv("LYRICS_ENABLE_LYRICSLIB", "false").lower() in ("true", "1", "yes"),
             "lyrica_base_url": os.getenv("LYRICA_BASE_URL", "http://localhost:5000"),
+            "ass_font_size": int(os.getenv("ASS_FONT_SIZE", "60")),
+            "video_width": int(os.getenv("VIDEO_WIDTH", "1280")),
+            "video_height": int(os.getenv("VIDEO_HEIGHT", "720")),
+            "video_background_color": os.getenv("VIDEO_BACKGROUND_COLOR", "black"),
+            "video_ffmpeg_preset": os.getenv("VIDEO_FFMPEG_PRESET", "fast"),
+            "video_ffmpeg_crf": int(os.getenv("VIDEO_FFMPEG_CRF", "22")),
         }
 
         return cls(**data)

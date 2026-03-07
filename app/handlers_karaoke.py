@@ -14,7 +14,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 
 from .config import Settings
-from .models import LyricsStates, PipelineState, PipelineStatus, PipelineStep, UserRequest
+from .models import LyricsStates, PipelineResult, PipelineState, PipelineStatus, PipelineStep, UserRequest
 from .pipeline import KaraokePipeline, LyricsNotFoundError, _ORDERED_STEPS
 
 
@@ -111,11 +111,7 @@ class KaraokeHandlers:
                 return
 
             if result.status == PipelineStatus.COMPLETED:
-                await message.answer(
-                    f"🎉 Обработка завершена успешно!\n"
-                    f"track_id: <code>{result.track_id}</code>",
-                    parse_mode="HTML",
-                )
+                await self._send_result_video(message, result)
             else:
                 await message.answer(
                     f"💔 Обработка завершена с ошибкой.\n"
@@ -384,11 +380,7 @@ class KaraokeHandlers:
                 return
 
             if result.status == PipelineStatus.COMPLETED:
-                await message.answer(
-                    f"🎉 Обработка завершена успешно!\n"
-                    f"track_id: <code>{result.track_id}</code>",
-                    parse_mode="HTML",
-                )
+                await self._send_result_video(message, result)
             else:
                 await message.answer(
                     f"💔 Обработка завершена с ошибкой.\n"
@@ -544,11 +536,7 @@ class KaraokeHandlers:
             return
 
         if result.status == PipelineStatus.COMPLETED:
-            await message.answer(
-                f"🎉 Шаг завершён успешно!\n"
-                f"track_id: <code>{result.track_id}</code>",
-                parse_mode="HTML",
-            )
+            await self._send_result_video(message, result)
         else:
             await message.answer(
                 f"💔 Шаг завершён с ошибкой.\n"
@@ -556,6 +544,53 @@ class KaraokeHandlers:
                 f"Причина: {result.error_message}",
                 parse_mode="HTML",
             )
+
+    # ------------------------------------------------------------------
+    # Video delivery helper
+    # ------------------------------------------------------------------
+
+    async def _send_result_video(
+        self,
+        message: types.Message,
+        result: PipelineResult,
+    ) -> None:
+        """Send the rendered MP4 video to the user, or a text message if unavailable."""
+        video_path_str = result.final_video_path
+        if video_path_str:
+            video_path = Path(video_path_str)
+            if video_path.exists():
+                try:
+                    from aiogram.types import FSInputFile
+                    video_file = FSInputFile(video_path, filename=video_path.name)
+                    await message.answer_video(
+                        video=video_file,
+                        caption=(
+                            f"🎉 Обработка завершена успешно!\n"
+                            f"track_id: <code>{result.track_id}</code>"
+                        ),
+                        parse_mode="HTML",
+                    )
+                    return
+                except Exception as exc:
+                    self._logger.error(
+                        "Failed to send video for track_id=%s: %s",
+                        result.track_id,
+                        exc,
+                    )
+                    # Fall through to text-only response
+            else:
+                self._logger.warning(
+                    "Output video file not found for track_id=%s: %s",
+                    result.track_id,
+                    video_path_str,
+                )
+
+        await message.answer(
+            f"🎉 Обработка завершена успешно!\n"
+            f"track_id: <code>{result.track_id}</code>\n"
+            f"Видеофайл: <code>{video_path_str or 'не задан'}</code>",
+            parse_mode="HTML",
+        )
 
     def _ensure_tracks_root(self) -> None:
         self._tracks_root_dir.mkdir(parents=True, exist_ok=True)

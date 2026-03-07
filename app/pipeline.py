@@ -4,10 +4,12 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from .alignment_service import AlignmentService, save_aligned_result
+from .ass_generator import AssGenerator
 from .config import Settings
 from .demucs_service import DemucsService
 from .lyrics_service import LyricsService
 from .speeches_client import SpeechesClient
+from .video_renderer import VideoRenderer
 from .models import (
     PipelineResult,
     PipelineState,
@@ -384,17 +386,68 @@ class KaraokePipeline:
         )
 
     async def _step_generate_ass(self) -> None:
+        aligned_path_str = self._state.aligned_lyrics_file
+        if not aligned_path_str:
+            raise RuntimeError("aligned_lyrics_file не задан — шаг ALIGN не был выполнен")
+
+        aligned_path = Path(aligned_path_str)
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
-        self._state.ass_file = str(
-            Path(self._request.track_folder) / f"{stem}.ass"
+        track_dir = Path(self._request.track_folder)
+        output_ass = track_dir / f"{stem}.ass"
+
+        track_title = stem.replace("_", " ")
+
+        generator = AssGenerator(font_size=self._settings.ass_font_size)
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: generator.generate(
+                aligned_json_path=aligned_path,
+                output_ass_path=output_ass,
+                track_title=track_title,
+            ),
         )
+
+        self._state.ass_file = str(output_ass)
         self._save_state()
-        await asyncio.sleep(0)
+        logger.info(
+            "GENERATE_ASS step completed for track_id=%s: ass_file='%s'",
+            self._request.track_id,
+            output_ass,
+        )
 
     async def _step_render_video(self) -> None:
+        ass_file_str = self._state.ass_file
+        if not ass_file_str:
+            raise RuntimeError("ass_file не задан — шаг GENERATE_ASS не был выполнен")
+
+        instrumental_file_str = self._state.instrumental_file
+        if not instrumental_file_str:
+            raise RuntimeError("instrumental_file не задан — шаг SEPARATE не был выполнен")
+
+        ass_path = Path(ass_file_str)
+        audio_path = Path(instrumental_file_str)
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
-        self._state.output_file = str(
-            Path(self._request.track_folder) / f"{stem}.mp4"
+        track_dir = Path(self._request.track_folder)
+        output_path = track_dir / f"{stem}.mp4"
+
+        renderer = VideoRenderer(
+            width=self._settings.video_width,
+            height=self._settings.video_height,
+            background_color=self._settings.video_background_color,
+            ffmpeg_preset=self._settings.video_ffmpeg_preset,
+            ffmpeg_crf=self._settings.video_ffmpeg_crf,
         )
+
+        await renderer.render(
+            audio_path=audio_path,
+            ass_path=ass_path,
+            output_path=output_path,
+        )
+
+        self._state.output_file = str(output_path)
         self._save_state()
-        await asyncio.sleep(0)
+        logger.info(
+            "RENDER_VIDEO step completed for track_id=%s: output_file='%s'",
+            self._request.track_id,
+            output_path,
+        )
