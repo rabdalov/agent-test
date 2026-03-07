@@ -11,7 +11,7 @@ Output JSON schema
   "words": [
     {"word": "...", "start_time": 1.23, "end_time": 1.78}
   ],
-  "lines": [
+  "segments": [
     {"text": "full line of text", "start_time": 1.23, "end_time": 3.45}
   ]
 }
@@ -60,12 +60,12 @@ class LineWithTimestamp:
 class AlignedLyricsResult:
     """Complete alignment result: word-level and line-level timestamps."""
     words: list[WordWithTimestamp] = field(default_factory=list)
-    lines: list[LineWithTimestamp] = field(default_factory=list)
+    segments: list[LineWithTimestamp] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "words": [w.to_dict() for w in self.words],
-            "lines": [ln.to_dict() for ln in self.lines],
+            "segments": [ln.to_dict() for ln in self.segments],
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -217,13 +217,13 @@ class AlignmentStrategy(ABC):
     def align(
         self,
         transcription_words: list[WordWithTimestamp],
-        lyrics_lines: list[tuple[float | None, str]],
+        lyrics_segments: list[tuple[float | None, str]],
     ) -> AlignedLyricsResult:
         """Align transcription timestamps with full lyrics.
 
         Args:
             transcription_words: Words with timestamps from ASR.
-            lyrics_lines: List of (optional_timestamp, line_text) pairs
+            lyrics_segments: List of (optional_timestamp, line_text) pairs
                           parsed from the lyrics file.
 
         Returns:
@@ -240,7 +240,7 @@ class LrcDirectStrategy(AlignmentStrategy):
     def align(
         self,
         transcription_words: list[WordWithTimestamp],
-        lyrics_lines: list[tuple[float | None, str]],
+        lyrics_segments: list[tuple[float | None, str]],
     ) -> AlignedLyricsResult:
         # Build line-level timestamps from LRC tags
         lines_out: list[LineWithTimestamp] = []
@@ -248,14 +248,14 @@ class LrcDirectStrategy(AlignmentStrategy):
 
         # Collect stamped lines
         stamped: list[tuple[float, str]] = []
-        for ts, text in lyrics_lines:
+        for ts, text in lyrics_segments:
             if ts is not None:
                 stamped.append((ts, text))
 
         # If no stamped lines, delegate to sequence alignment
         if not stamped:
             fallback = SequenceAlignmentStrategy()
-            return fallback.align(transcription_words, lyrics_lines)
+            return fallback.align(transcription_words, lyrics_segments)
 
         # Determine end times: start of next line (or last transcription word)
         max_end = transcription_words[-1].end_time if transcription_words else 0.0
@@ -275,7 +275,7 @@ class LrcDirectStrategy(AlignmentStrategy):
                 we = start_ts + (wi + 1) * step
                 words_out.append(WordWithTimestamp(word=w, start_time=round(ws, 3), end_time=round(we, 3)))
 
-        return AlignedLyricsResult(words=words_out, lines=lines_out)
+        return AlignedLyricsResult(words=words_out, segments=lines_out)
 
 
 class SequenceAlignmentStrategy(AlignmentStrategy):
@@ -284,14 +284,14 @@ class SequenceAlignmentStrategy(AlignmentStrategy):
     def align(
         self,
         transcription_words: list[WordWithTimestamp],
-        lyrics_lines: list[tuple[float | None, str]],
+        lyrics_segments: list[tuple[float | None, str]],
     ) -> AlignedLyricsResult:
         # Flatten lyrics into a single word list, keeping track of line boundaries
         lyrics_flat_words: list[str] = []
         # Map from lyrics word index → line index
         word_to_line: list[int] = []
         line_texts: list[str] = []
-        for line_idx, (_, line_text) in enumerate(lyrics_lines):
+        for line_idx, (_, line_text) in enumerate(lyrics_segments):
             if not line_text.strip():
                 continue
             line_texts.append(line_text.strip())
@@ -374,7 +374,7 @@ class SequenceAlignmentStrategy(AlignmentStrategy):
                 end_t = 0.0
             lines_out.append(LineWithTimestamp(text=text, start_time=start_t, end_time=end_t))
 
-        return AlignedLyricsResult(words=words_out, lines=lines_out)
+        return AlignedLyricsResult(words=words_out, segments=lines_out)
 
     @staticmethod
     def _interpolate_timestamps(
@@ -563,15 +563,15 @@ class AlignmentService:
 
         # --- Load lyrics ---
         lyrics_text = source_lyrics_path.read_text(encoding="utf-8")
-        lyrics_lines = parse_lyrics_text(lyrics_text)
+        lyrics_segments = parse_lyrics_text(lyrics_text)
 
-        if not lyrics_lines:
+        if not lyrics_segments:
             raise ValueError(
                 f"AlignmentService: lyrics file is empty or produced no lines: {source_lyrics_path}"
             )
 
         # --- Select strategy ---
-        strategy = self._select_strategy(lyrics_lines)
+        strategy = self._select_strategy(lyrics_segments)
         logger.info(
             "AlignmentService: using %s for track lyrics from '%s'",
             type(strategy).__name__,
@@ -579,28 +579,28 @@ class AlignmentService:
         )
 
         # --- Run alignment ---
-        result = strategy.align(transcription_words, lyrics_lines)
+        result = strategy.align(transcription_words, lyrics_segments)
 
         # --- Post-process: guarantee non-negative, monotonically-non-decreasing times ---
         result = self._sanitise(result)
 
         logger.info(
-            "AlignmentService: alignment produced %d words, %d lines",
+            "AlignmentService: alignment produced %d words, %d segments",
             len(result.words),
-            len(result.lines),
+            len(result.segments),
         )
         return result
 
     def _select_strategy(
         self,
-        lyrics_lines: list[tuple[float | None, str]],
+        lyrics_segments: list[tuple[float | None, str]],
     ) -> AlignmentStrategy:
-        non_empty = [line for ts, line in lyrics_lines if line.strip()]
+        non_empty = [line for ts, line in lyrics_segments if line.strip()]
         if not non_empty:
             return SequenceAlignmentStrategy()
 
-        stamped = sum(1 for ts, _ in lyrics_lines if ts is not None)
-        fraction = stamped / len(lyrics_lines) if lyrics_lines else 0.0
+        stamped = sum(1 for ts, _ in lyrics_segments if ts is not None)
+        fraction = stamped / len(lyrics_segments) if lyrics_segments else 0.0
         if fraction >= self._LRC_THRESHOLD:
             return LrcDirectStrategy()
         return SequenceAlignmentStrategy()
@@ -611,7 +611,7 @@ class AlignmentService:
         for wt in result.words:
             wt.start_time = max(0.0, round(wt.start_time, 3))
             wt.end_time = max(wt.start_time, round(wt.end_time, 3))
-        for lt in result.lines:
+        for lt in result.segments:
             lt.start_time = max(0.0, round(lt.start_time, 3))
             lt.end_time = max(lt.start_time, round(lt.end_time, 3))
         return result
