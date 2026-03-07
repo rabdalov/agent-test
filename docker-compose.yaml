@@ -1,0 +1,26 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      # Persistent storage for downloaded tracks, intermediate files and rendered videos
+      - tracks_data:/tracks
+    env_file:
+      # Copy example.env → .env and fill in your secrets before starting
+      - .env
+    environment:
+      TRACKS_ROOT_DIR: /tracks
+    # Demucs runs on CPU inside the container — no GPU device needed by default.
+    # Uncomment the block below if you have an NVIDIA GPU available:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  tracks_data:

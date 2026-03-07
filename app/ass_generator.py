@@ -9,6 +9,16 @@ The output JSON schema consumed here (from AlignmentService):
   "words":    [{"word": "...", "start_time": 1.23, "end_time": 1.78}, ...],
   "segments": [{"text": "full line of text", "start_time": 1.23, "end_time": 3.45}, ...]
 }
+
+Subtitle layout
+---------------
+Screen always shows TWO lines:
+  Line 1 (upper, ActiveLine style) — the current/active segment with per-word
+          colour highlight ({\rHighlight}word{\rDefault}).
+  Line 2 (lower, NextLine style)   — the next/preparatory segment shown in a
+          dimmed colour so the singer can prepare.
+
+When the last segment is active, the next-line area is empty.
 """
 from __future__ import annotations
 
@@ -70,11 +80,9 @@ def _find_word_in_segment(segment_text: str, word: str, start_idx: int = 0) -> i
 
     # Partial / prefix fallback
     tokens = clean_seg.split()
-    accumulated = 0
     for tok in tokens:
         if tok.startswith(clean_word) or clean_word.startswith(tok):
             return segment_text.lower().find(word.lower().strip(".,!?;:\"'"), start_idx)
-        accumulated += len(tok) + 1  # +1 for space
 
     return -1
 
@@ -82,6 +90,21 @@ def _find_word_in_segment(segment_text: str, word: str, start_idx: int = 0) -> i
 # ---------------------------------------------------------------------------
 # ASS header template
 # ---------------------------------------------------------------------------
+
+# Alignment codes (ASS):
+#   2 = bottom-centre (default subtitle position)
+#   8 = top-centre
+# MarginV controls vertical offset from the respective edge.
+#
+# Two-line layout:
+#   ActiveLine — bottom area (Alignment=2), higher MarginV shifts it up from bottom
+#   NextLine   — below ActiveLine (Alignment=2), lower MarginV keeps it near bottom
+#   Title      — top-centre (Alignment=8)
+#
+# Colour format: &HAABBGGRR  (AA=alpha, 0=opaque)
+#   White     &H00FFFFFF
+#   Cyan      &H00FFFF00   (highlighted word)
+#   Light grey&H00AAAAAA   (next-line preview)
 
 _ASS_HEADER_TEMPLATE = """\
 [Script Info]
@@ -93,10 +116,10 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,  Arial,{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,2,5,30,30,50,1
-Style: Highlight,Arial,{font_size},&H00FF00FF,&H00FF00FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,2,5,30,30,50,1
-Style: TextLine, Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,2,5,30,30,50,1
-Style: Title,    Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,2,8,30,30,50,1
+Style: ActiveLine, Arial,{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,2,2,30,30,120,1
+Style: Highlight,  Arial,{font_size},&H0000FFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,2,2,30,30,120,1
+Style: NextLine,   Arial,{font_size},&H00AAAAAA,&H00AAAAAA,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,30,30,20,1
+Style: Title,      Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,2,8,30,30,50,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -110,10 +133,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 class AssGenerator:
     """Generates an ASS karaoke subtitle file from an aligned lyrics JSON.
 
-    The generated file contains:
-    - A title dialogue line shown for the full track duration.
-    - Per-segment TextLine entries (whole line, always visible during segment).
-    - Per-word Highlight entries that overlay the active word in a different colour.
+    Screen layout — always two lines:
+    - **Line 1** (ActiveLine style, bottom area, higher position): current segment
+      with per-word colour highlight (``{\\rHighlight}word{\\rDefault}``).
+    - **Line 2** (NextLine style, bottom edge): next/preparatory segment shown in
+      a dimmed colour so the singer can prepare.
 
     Usage::
 
@@ -191,9 +215,10 @@ class AssGenerator:
         # Group words into segments
         grouped = self._group_words_into_segments(segments, words)
 
-        # Generate dialogue entries
-        for seg_entry in grouped:
-            lines.extend(self._build_segment_dialogues(seg_entry))
+        # Generate dialogue entries — two lines at a time
+        for idx, seg_entry in enumerate(grouped):
+            next_seg_entry: dict | None = grouped[idx + 1] if idx + 1 < len(grouped) else None
+            lines.extend(self._build_segment_dialogues(seg_entry, next_seg_entry))
 
         ass_content = "".join(lines)
         output_ass_path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,8 +283,17 @@ class AssGenerator:
 
         return result
 
-    def _build_segment_dialogues(self, seg: dict) -> list[str]:
-        """Build all ASS Dialogue lines for a single segment.
+    def _build_segment_dialogues(
+        self,
+        seg: dict,
+        next_seg: dict | None,
+    ) -> list[str]:
+        """Build all ASS Dialogue lines for one segment pair (active + next).
+
+        Produces:
+        - Per-word Highlight entries on the ActiveLine style (upper position).
+        - One NextLine entry covering the full segment duration with the next
+          segment's text (or empty if this is the last segment).
 
         Returns a list of formatted dialogue strings (each ending with '\\n').
         """
@@ -268,28 +302,30 @@ class AssGenerator:
         seg_text: str = seg["text"]
         seg_words: list[dict] = seg["words"]
 
+        next_text: str = next_seg["text"] if next_seg else ""
+
         lines: list[str] = []
 
-        # Static full-line entry (TextLine style — always visible during segment)
-        lines.append(
-            f"Dialogue: 0,"
-            f"{_format_ass_time(seg_start)},"
-            f"{_format_ass_time(seg_end)},"
-            f"TextLine,,0,0,0,,{seg_text}\n"
-        )
+        # ---- Next/preparatory line (always static during this segment) ----
+        if next_text:
+            lines.append(
+                f"Dialogue: 0,"
+                f"{_format_ass_time(seg_start)},"
+                f"{_format_ass_time(seg_end)},"
+                f"NextLine,,0,0,0,,{next_text}\n"
+            )
 
-        # Per-word highlight entries
+        # ---- Active line: per-word highlight on ActiveLine style ----
         for i, word_entry in enumerate(seg_words):
             word_start: float = word_entry["start"]
             word_end: float = word_entry["end"]
-            word_text: str = word_entry["word"]
 
             highlighted = self._build_highlighted_text(seg_text, seg_words, i)
             lines.append(
                 f"Dialogue: 1,"
                 f"{_format_ass_time(word_start)},"
                 f"{_format_ass_time(word_end)},"
-                f"Default,,0,0,0,,{highlighted}\n"
+                f"ActiveLine,,0,0,0,,{highlighted}\n"
             )
 
         return lines
@@ -300,11 +336,12 @@ class AssGenerator:
         seg_words: list[dict],
         highlight_idx: int,
     ) -> str:
-        """Return *seg_text* with word at *highlight_idx* wrapped in ASS style tags.
+        """Return *seg_text* with the word at *highlight_idx* wrapped in style tags.
 
-        Iterates through all words searching their positions in the segment text
-        (left to right) to correctly track the search cursor.  The word at
-        *highlight_idx* is wrapped with ``{\\rHighlight}…{\\rDefault}``.
+        All words before *highlight_idx* are left as-is; the active word is
+        wrapped with ``{\\rHighlight}…{\\rActiveLine}`` so it renders in cyan
+        while the rest of the line stays in the ActiveLine (white) colour.
+        Words after the active one remain in their default ActiveLine colour.
         """
         highlighted_text = seg_text
         search_start = 0
@@ -316,15 +353,23 @@ class AssGenerator:
             if pos == -1:
                 continue
 
+            bare = w_text.strip(".,!?;:\"'")
+
             if j == highlight_idx:
-                # Length in the *modified* string so far — use actual bare word length
-                bare = w_text.strip(".,!?;:\"'")
                 before = highlighted_text[:pos]
                 after = highlighted_text[pos + len(bare):]
-                highlighted_text = f"{before}{{\\rHighlight}}{bare}{{\\rDefault}}{after}"
-                # Advance by highlight tags + word length to keep future searches valid
-                search_start = pos + len(bare) + len("{\\rHighlight}") + len("{\\rDefault}")
+                # Switch to Highlight style for the word, then back to ActiveLine
+                highlighted_text = (
+                    f"{before}{{\\rHighlight}}{bare}{{\\rActiveLine}}{after}"
+                )
+                # Advance past inserted tags + the word itself
+                search_start = (
+                    pos
+                    + len(bare)
+                    + len("{\\rHighlight}")
+                    + len("{\\rActiveLine}")
+                )
             else:
-                search_start = pos + len(w_text.strip(".,!?;:\"'"))
+                search_start = pos + len(bare)
 
         return highlighted_text

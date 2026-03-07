@@ -31,6 +31,7 @@ class PipelineStatus(str, Enum):
 
 class PipelineState(BaseModel):
     track_id: str
+    user_id: int | None = None
     current_step: PipelineStep | None = None
     status: PipelineStatus = PipelineStatus.PENDING
     error_message: str | None = None

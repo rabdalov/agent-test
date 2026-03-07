@@ -63,6 +63,7 @@ class KaraokePipeline:
         self._settings = settings
         self._state = PipelineState(
             track_id=request.track_id,
+            user_id=request.user_id,
             status=PipelineStatus.PENDING,
         )
         demucs_output_dir = str(Path(request.track_folder).parent)
@@ -99,6 +100,8 @@ class KaraokePipeline:
             if saved is not None:
                 # Restore artefacts accumulated in previous runs
                 self._state = saved
+                # Always keep user_id from the current request
+                self._state.user_id = self._request.user_id
             validation_error = self._validate_artifacts_for_step(start_from_step)
             if validation_error:
                 logger.error(
@@ -126,6 +129,8 @@ class KaraokePipeline:
             if saved is not None and saved.status == PipelineStatus.FAILED and saved.current_step is not None:
                 # Mode 2: resume from last failed step
                 self._state = saved
+                # Always keep user_id from the current request
+                self._state.user_id = self._request.user_id
                 first_step = saved.current_step
                 logger.info(
                     "Pipeline resuming from step %s for track_id=%s",

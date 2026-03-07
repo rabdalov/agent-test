@@ -26,9 +26,26 @@ class KaraokeHandlers:
         self.router = Router()
         self._register_handlers()
 
+    def _is_user_allowed(self, message: types.Message) -> bool:
+        """Return True if the sender's user_id is in the allowed list."""
+        allowed = self._settings.tlg_allowed_id
+        if not allowed:
+            return True
+        user_id = message.from_user.id if message.from_user else None
+        return user_id in allowed
+
+    async def _reject_unauthorized(self, message: types.Message) -> None:
+        """Send a rejection notice and log the attempt."""
+        user_id = message.from_user.id if message.from_user else "unknown"
+        self._logger.warning("Unauthorized access attempt from user_id=%s", user_id)
+        await message.answer("⛔ У вас нет доступа к этому боту.")
+
     def _register_handlers(self) -> None:
         @self.router.message(CommandStart())
         async def handle_start(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             await state.clear()
             await message.answer(
                 "Привет! Я бот для подготовки караоке-видео.\n"
@@ -38,91 +55,33 @@ class KaraokeHandlers:
 
         @self.router.message(F.audio)
         async def handle_audio(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             audio = message.audio
             if audio is None:
                 return
-
-            self._ensure_tracks_root()
-
-            tmp_dir = self._tracks_root_dir / "_tmp"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-
             original_name = audio.file_name or f"audio_{audio.file_unique_id}.mp3"
-            tmp_path = tmp_dir / original_name
+            await self._handle_media_file(message, state, audio, original_name)
 
-            await message.bot.download(audio, destination=tmp_path)
-            duration, artist, title = await self._probe_audio(tmp_path)
-
-            track_name = self._build_track_name(original_name or "track", None, None)
-
-            if duration is None or duration < 60:
-                if tmp_path.exists():
-                    try:
-                        tmp_path.unlink()
-                    except OSError:
-                        self._logger.warning("Failed to remove temporary file %s", tmp_path)
-
-                await message.answer(
-                    f'Полученный файл "{track_name}" не является музыкальной композицией '
-                    "(длительность менее 1 минуты или не удалось определить длительность)."
-                )
+        @self.router.message(F.video)
+        async def handle_video(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
                 return
-
-            track_id = uuid.uuid4().hex
-            track_dir = self._tracks_root_dir / track_name
-            track_dir.mkdir(parents=True, exist_ok=True)
-
-            final_path = track_dir / f"{track_name}.mp3"
-
-            try:
-                shutil.move(str(tmp_path), final_path)
-            except OSError as exc:
-                self._logger.error("Failed to move file %s to %s: %s", tmp_path, final_path, exc)
-                await message.answer(
-                    "Не удалось сохранить аудиофайл. Пожалуйста, попробуйте отправить его ещё раз позже."
-                )
+            video = message.video
+            if video is None:
                 return
-
-            await message.answer(
-                "Аудиофайл принят.\n"
-                f"track_id: <code>{track_id}</code>\n"
-                f'track_name: <code>{track_name}</code>\n'
-                f'Путь к файлу: <code>{final_path}</code>',
-                parse_mode="HTML",
-            )
-
-            user_id: int = message.from_user.id if message.from_user else 0
-            request = UserRequest(
-                user_id=user_id,
-                track_id=track_id,
-                source_type="file",
-                source_url_or_file_path=str(final_path),
-                track_folder=str(track_dir),
-            )
-            pipeline = KaraokePipeline(request, self._settings)
-
-            async def _audio_progress(msg: str) -> None:
-                await message.answer(msg)
-
-            try:
-                result = await pipeline.run(_audio_progress)
-            except LyricsNotFoundError:
-                await self._ask_for_lyrics(message, state, track_id, track_dir)
-                return
-
-            if result.status == PipelineStatus.COMPLETED:
-                await self._send_result_video(message, result)
-            else:
-                await message.answer(
-                    f"💔 Обработка завершена с ошибкой.\n"
-                    f"track_id: <code>{result.track_id}</code>\n"
-                    f"Причина: {result.error_message}",
-                    parse_mode="HTML",
-                )
+            original_name = video.file_name or f"video_{video.file_unique_id}.mp4"
+            await self._handle_media_file(message, state, video, original_name)
 
         @self.router.message(Command("continue"))
         async def handle_continue(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
-            result = self._find_latest_state()
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+            caller_user_id = message.from_user.id if message.from_user else None
+            result = self._find_latest_state(user_id=caller_user_id)
             if result is None:
                 await message.answer(
                     "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
@@ -174,31 +133,52 @@ class KaraokeHandlers:
 
         @self.router.message(Command("step_separate"))
         async def handle_step_separate(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             await self._handle_step_command(message, PipelineStep.SEPARATE, state)
 
         @self.router.message(Command("step_transcribe"))
         async def handle_step_transcribe(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             await self._handle_step_command(message, PipelineStep.TRANSCRIBE, state)
 
         @self.router.message(Command("step_lyrics"))
         async def handle_step_lyrics(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             await self._handle_step_command(message, PipelineStep.GET_LYRICS, state)
 
         @self.router.message(Command("step_align"))
         async def handle_step_align(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             await self._handle_step_command(message, PipelineStep.ALIGN, state)
 
         @self.router.message(Command("step_ass"))
         async def handle_step_ass(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             await self._handle_step_command(message, PipelineStep.GENERATE_ASS, state)
 
         @self.router.message(Command("step_render"))
         async def handle_step_render(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             await self._handle_step_command(message, PipelineStep.RENDER_VIDEO, state)
 
         # ----- FSM: waiting for user to supply lyrics text -----
         @self.router.message(LyricsStates.waiting_for_lyrics, F.text)
         async def handle_lyrics_input(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             lyrics_text = (message.text or "").strip()
             if not lyrics_text:
                 await message.answer("Текст песни не может быть пустым. Пришли полный текст.")
@@ -260,6 +240,9 @@ class KaraokeHandlers:
         # ----- General text handler (URLs) — must be AFTER FSM handler -----
         @self.router.message(F.text)
         async def handle_text(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             text = (message.text or "").strip()
             url = self._extract_url(text)
             if url is None:
@@ -391,6 +374,9 @@ class KaraokeHandlers:
 
         @self.router.message()
         async def handle_non_audio(message: types.Message) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
             await message.answer(
                 "Полученное сообщение не является музыкальной композицией. "
                 "Пожалуйста, отправьте аудиофайл длительностью более 1 минуты."
@@ -440,9 +426,10 @@ class KaraokeHandlers:
     # Step-command helpers
     # ------------------------------------------------------------------
 
-    def _find_latest_state(self) -> tuple[PipelineState, Path] | None:
+    def _find_latest_state(self, user_id: int | None = None) -> tuple[PipelineState, Path] | None:
         """Find the track folder with the most recently modified state.json.
 
+        If *user_id* is given, only consider tracks belonging to that user.
         Returns a tuple of (PipelineState, track_dir) or None if not found.
         """
         best_mtime: float | None = None
@@ -464,6 +451,9 @@ class KaraokeHandlers:
             except Exception as exc:
                 self._logger.warning("Failed to read state.json in %s: %s", subdir, exc)
                 continue
+            # Filter by user_id when provided
+            if user_id is not None and state.user_id is not None and state.user_id != user_id:
+                continue
             if best_mtime is None or mtime > best_mtime:
                 best_mtime = mtime
                 best_state = state
@@ -480,7 +470,8 @@ class KaraokeHandlers:
         state: FSMContext,
     ) -> None:
         """Common handler logic for /step_* commands."""
-        result = self._find_latest_state()
+        caller_user_id = message.from_user.id if message.from_user else None
+        result = self._find_latest_state(user_id=caller_user_id)
         if result is None:
             await message.answer(
                 "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
@@ -594,6 +585,93 @@ class KaraokeHandlers:
 
     def _ensure_tracks_root(self) -> None:
         self._tracks_root_dir.mkdir(parents=True, exist_ok=True)
+
+    async def _handle_media_file(
+        self,
+        message: types.Message,
+        state: FSMContext,
+        media: Any,
+        original_name: str,
+    ) -> None:
+        """Common handler for audio and video file messages (mp3, flac, mp4, etc.)."""
+        self._ensure_tracks_root()
+
+        tmp_dir = self._tracks_root_dir / "_tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        tmp_path = tmp_dir / original_name
+
+        await message.bot.download(media, destination=tmp_path)  # type: ignore[union-attr]
+        duration, artist, title = await self._probe_audio(tmp_path)
+
+        track_name = self._build_track_name(original_name, None, None)
+
+        if duration is None or duration < 60:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    self._logger.warning("Failed to remove temporary file %s", tmp_path)
+
+            await message.answer(
+                f'Полученный файл "{track_name}" не является музыкальной композицией '
+                "(длительность менее 1 минуты или не удалось определить длительность)."
+            )
+            return
+
+        track_id = uuid.uuid4().hex
+        track_dir = self._tracks_root_dir / track_name
+        track_dir.mkdir(parents=True, exist_ok=True)
+
+        # Preserve original file extension (mp3, flac, mp4, …)
+        src_suffix = Path(original_name).suffix or ".mp3"
+        final_path = track_dir / f"{track_name}{src_suffix}"
+
+        try:
+            shutil.move(str(tmp_path), final_path)
+        except OSError as exc:
+            self._logger.error("Failed to move file %s to %s: %s", tmp_path, final_path, exc)
+            await message.answer(
+                "Не удалось сохранить аудиофайл. Пожалуйста, попробуйте отправить его ещё раз позже."
+            )
+            return
+
+        await message.answer(
+            "Аудиофайл принят.\n"
+            f"track_id: <code>{track_id}</code>\n"
+            f"track_name: <code>{track_name}</code>\n"
+            f"Путь к файлу: <code>{final_path}</code>",
+            parse_mode="HTML",
+        )
+
+        user_id: int = message.from_user.id if message.from_user else 0
+        request = UserRequest(
+            user_id=user_id,
+            track_id=track_id,
+            source_type="file",
+            source_url_or_file_path=str(final_path),
+            track_folder=str(track_dir),
+        )
+        pipeline = KaraokePipeline(request, self._settings)
+
+        async def _media_progress(msg: str) -> None:
+            await message.answer(msg)
+
+        try:
+            result = await pipeline.run(_media_progress)
+        except LyricsNotFoundError:
+            await self._ask_for_lyrics(message, state, track_id, track_dir)
+            return
+
+        if result.status == PipelineStatus.COMPLETED:
+            await self._send_result_video(message, result)
+        else:
+            await message.answer(
+                f"💔 Обработка завершена с ошибкой.\n"
+                f"track_id: <code>{result.track_id}</code>\n"
+                f"Причина: {result.error_message}",
+                parse_mode="HTML",
+            )
 
     async def _probe_audio(self, path: Path) -> tuple[float | None, str | None, str | None]:
         cmd = [
