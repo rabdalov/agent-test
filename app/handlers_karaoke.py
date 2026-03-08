@@ -635,25 +635,33 @@ class KaraokeHandlers:
         if video_path_str:
             video_path = Path(video_path_str)
             if video_path.exists():
-                try:
-                    from aiogram.types import FSInputFile
-                    video_file = FSInputFile(video_path, filename=video_path.name)
-                    await message.answer_video(
-                        video=video_file,
-                        caption=(
-                            f"🎉 Обработка завершена успешно!\n"
-                            f"track_id: <code>{result.track_id}</code>"
-                        ),
-                        parse_mode="HTML",
+                # Check if we should send the video to the user based on configuration
+                if self._settings.send_video_to_user:
+                    try:
+                        from aiogram.types import FSInputFile
+                        video_file = FSInputFile(video_path, filename=video_path.name)
+                        await message.answer_video(
+                            video=video_file,
+                            caption=(
+                                f"🎉 Обработка завершена успешно!\n"
+                                f"track_id: <code>{result.track_id}</code>"
+                            ),
+                            parse_mode="HTML",
+                        )
+                        return
+                    except Exception as exc:
+                        self._logger.error(
+                            "Failed to send video for track_id=%s: %s",
+                            result.track_id,
+                            exc,
+                        )
+                        # Fall through to text-only response
+                else:
+                    # Video sending is disabled, skip sending but log the fact
+                    self._logger.info(
+                        "Video sending is disabled via configuration. Video file is available at: %s",
+                        video_path_str
                     )
-                    return
-                except Exception as exc:
-                    self._logger.error(
-                        "Failed to send video for track_id=%s: %s",
-                        result.track_id,
-                        exc,
-                    )
-                    # Fall through to text-only response
             else:
                 self._logger.warning(
                     "Output video file not found for track_id=%s: %s",
@@ -661,6 +669,7 @@ class KaraokeHandlers:
                     video_path_str,
                 )
 
+        # Send completion message regardless of whether video was sent
         await message.answer(
             f"🎉 Обработка завершена успешно!\n"
             f"track_id: <code>{result.track_id}</code>\n"

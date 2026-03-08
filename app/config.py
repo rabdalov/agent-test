@@ -48,6 +48,9 @@ class Settings(BaseModel):
     # Normal/expected duration (seconds) for the first word of a line;
     # used to compute the corrected start_time of the first real word.
     normal_word_time: float = 1.5
+    # Send video to user after processing (RENDER_VIDEO step)
+    # If true, video is sent to user via Telegram; if false, video is not sent but remains available locally
+    send_video_to_user: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -85,6 +88,7 @@ class Settings(BaseModel):
             "video_ffmpeg_crf": int(os.getenv("VIDEO_FFMPEG_CRF", "22")),
             "max_word_time": float(os.getenv("MAX_WORD_TIME", "5.0")),
             "normal_word_time": float(os.getenv("NORMAL_WORD_TIME", "1.5")),
+            "send_video_to_user": os.getenv("SEND_VIDEO_TO_USER", "true").lower() in ("true", "1", "yes"),
         }
 
         return cls(**data)
