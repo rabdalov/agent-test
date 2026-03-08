@@ -141,11 +141,14 @@ class KaraokePipeline:
                     f"🔄 Возобновление с шага {first_step.value}: {_STEP_LABELS[first_step]}..."
                 )
             else:
-                # Mode 1: fresh start
+                # Mode 1: fresh start — but preserve any fields already saved (e.g. lang chosen by the user)
+                if saved is not None and saved.lang is not None:
+                    self._state.lang = saved.lang
                 first_step = PipelineStep.DOWNLOAD
                 logger.info(
-                    "Pipeline starting fresh for track_id=%s",
+                    "Pipeline starting fresh for track_id=%s (lang=%s)",
                     self._request.track_id,
+                    self._state.lang,
                 )
 
         return await self._execute_from(first_step, progress_callback)
@@ -383,6 +386,8 @@ class KaraokePipeline:
                 transcription_json_path=Path(transcribe_path),
                 source_lyrics_path=Path(lyrics_path),
                 audio_file=vocal_file,
+                max_word_time=self._settings.max_word_time,
+                normal_word_time=self._settings.normal_word_time,
             ),
         )
         save_aligned_result(result, output_path)

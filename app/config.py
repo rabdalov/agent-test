@@ -41,6 +41,13 @@ class Settings(BaseModel):
     video_background_color: str = "black"
     video_ffmpeg_preset: str = "fast"
     video_ffmpeg_crf: int = 22
+    # Align timing correction settings (ALIGN step)
+    # Maximum allowed duration (seconds) for the first word of a line;
+    # if exceeded, a "(проигрыш)" gap marker is inserted before it.
+    max_word_time: float = 5.0
+    # Normal/expected duration (seconds) for the first word of a line;
+    # used to compute the corrected start_time of the first real word.
+    normal_word_time: float = 1.5
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -76,6 +83,8 @@ class Settings(BaseModel):
             "video_background_color": os.getenv("VIDEO_BACKGROUND_COLOR", "black"),
             "video_ffmpeg_preset": os.getenv("VIDEO_FFMPEG_PRESET", "fast"),
             "video_ffmpeg_crf": int(os.getenv("VIDEO_FFMPEG_CRF", "22")),
+            "max_word_time": float(os.getenv("MAX_WORD_TIME", "5.0")),
+            "normal_word_time": float(os.getenv("NORMAL_WORD_TIME", "1.5")),
         }
 
         return cls(**data)
