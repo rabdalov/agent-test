@@ -12,9 +12,10 @@ import httpx
 from aiogram import F, Router, types
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .config import Settings
-from .models import LyricsStates, PipelineResult, PipelineState, PipelineStatus, PipelineStep, UserRequest
+from .models import LyricsStates, PipelineResult, PipelineState, PipelineStatus, PipelineStep, TrackLangStates, UserRequest
 from .pipeline import KaraokePipeline, LyricsNotFoundError, _ORDERED_STEPS
 
 
@@ -237,6 +238,103 @@ class KaraokeHandlers:
             # Continue pipeline from ALIGN step
             await self._run_from_step(message, track_dir, pipeline_state, PipelineStep.ALIGN, state)
 
+        # ----- FSM: waiting for user to select song language -----
+        @self.router.callback_query(TrackLangStates.waiting_for_lang, F.data.startswith("lang_choice:"))
+        async def handle_lang_choice(callback: types.CallbackQuery, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            # Check access by callback sender (callback.from_user), not by callback.message.from_user (which is the bot)
+            allowed = self._settings.tlg_allowed_id
+            caller_id = callback.from_user.id if callback.from_user else None
+            if allowed and caller_id not in allowed:
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+
+            lang = (callback.data or "").split(":", 1)[-1]  # "ru" or "en"
+            data = await state.get_data()
+            track_id: str | None = data.get("track_id")
+            track_folder: str | None = data.get("track_folder")
+
+            await callback.answer()  # acknowledge button press
+
+            if not track_id or not track_folder:
+                await state.clear()
+                if callback.message:
+                    await callback.message.answer(  # type: ignore[union-attr]
+                        "❌ Не удалось определить трек. Пожалуйста, начните обработку заново."
+                    )
+                return
+
+            track_dir = Path(track_folder)
+
+            # Persist lang into state.json so the pipeline can pick it up
+            state_path = track_dir / "state.json"
+            try:
+                pipeline_state = PipelineState.model_validate_json(
+                    state_path.read_text(encoding="utf-8")
+                )
+            except Exception as exc:
+                self._logger.error("Failed to read state.json for track_id=%s: %s", track_id, exc)
+                await state.clear()
+                if callback.message:
+                    await callback.message.answer(  # type: ignore[union-attr]
+                        "❌ Не удалось прочитать состояние трека. Пожалуйста, начните заново."
+                    )
+                return
+
+            pipeline_state.lang = lang
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error("Failed to update state.json with lang for track_id=%s: %s", track_id, exc)
+
+            await state.clear()
+
+            lang_label = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+            if callback.message:
+                await callback.message.edit_text(  # type: ignore[union-attr]
+                    f"Язык исполнения выбран: {lang_label}\n\nЗапускаю обработку..."
+                )
+
+            # Rebuild UserRequest from saved state and run the pipeline
+            source = pipeline_state.track_source or pipeline_state.track_file_name or ""
+            if pipeline_state.track_file_name:
+                candidate = track_dir / pipeline_state.track_file_name
+                if candidate.exists():
+                    source = str(candidate)
+
+            request = UserRequest(
+                user_id=pipeline_state.user_id or 0,
+                track_id=track_id,
+                source_type="file",
+                source_url_or_file_path=source,
+                track_folder=str(track_dir),
+            )
+            pipeline = KaraokePipeline(request, self._settings)
+
+            async def _lang_progress(msg: str) -> None:
+                if callback.message:
+                    await callback.message.answer(msg)  # type: ignore[union-attr]
+
+            try:
+                result = await pipeline.run(_lang_progress)
+            except LyricsNotFoundError:
+                if callback.message:
+                    await self._ask_for_lyrics(
+                        callback.message, state, track_id, track_dir  # type: ignore[arg-type]
+                    )
+                return
+
+            if result.status == PipelineStatus.COMPLETED:
+                if callback.message:
+                    await self._send_result_video(callback.message, result)  # type: ignore[arg-type]
+            else:
+                if callback.message:
+                    await callback.message.answer(  # type: ignore[union-attr]
+                        f"💔 Обработка завершена с ошибкой.\n"
+                        f"track_id: <code>{result.track_id}</code>\n"
+                        f"Причина: {result.error_message}",
+                        parse_mode="HTML",
+                    )
+
         # ----- General text handler (URLs) — must be AFTER FSM handler -----
         @self.router.message(F.text)
         async def handle_text(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
@@ -270,30 +368,7 @@ class KaraokeHandlers:
             track_dir.mkdir(parents=True, exist_ok=True)
 
             user_id: int = message.from_user.id if message.from_user else 0
-            request = UserRequest(
-                user_id=user_id,
-                track_id=track_id,
-                source_type="url",
-                source_url_or_file_path=url,
-                track_folder=str(track_dir),
-            )
-
-            # Save state.json at <tracks_root_dir> / <track_name> / state.json
             state_path = track_dir / "state.json"
-            try:
-                state_path.write_text(
-                    request.model_dump_json(indent=2),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                self._logger.error(
-                    "Failed to write state file for track %s: %s", track_id, exc
-                )
-                await message.answer(
-                    "Не удалось сохранить информацию о треке. "
-                    "Пожалуйста, попробуйте ещё раз позже."
-                )
-                return
 
             # Download the file by HTTP URL and save locally
             filename = url_basename if url_basename else "source_file"
@@ -325,19 +400,17 @@ class KaraokeHandlers:
                 )
                 return
 
-            # Update request with local file path and re-save state.json
-            request = UserRequest(
-                user_id=user_id,
+            # Save preliminary PipelineState with local file path, so language callback can find the track
+            pipeline_state_url = PipelineState(
                 track_id=track_id,
-                source_type="url",
-                source_url_or_file_path=str(local_path),
-                track_folder=str(track_dir),
+                user_id=user_id,
+                status=PipelineStatus.PENDING,
+                track_file_name=local_path.name,
+                track_source=str(local_path),
+                track_stem=track_name,
             )
             try:
-                state_path.write_text(
-                    request.model_dump_json(indent=2),
-                    encoding="utf-8",
-                )
+                state_path.write_text(pipeline_state_url.model_dump_json(indent=2), encoding="utf-8")
             except OSError as exc:
                 self._logger.error(
                     "Failed to update state file for track %s: %s", track_id, exc
@@ -351,26 +424,8 @@ class KaraokeHandlers:
                 parse_mode="HTML",
             )
 
-            pipeline = KaraokePipeline(request, self._settings)
-
-            async def _url_progress(msg: str) -> None:
-                await message.answer(msg)
-
-            try:
-                result = await pipeline.run(_url_progress)
-            except LyricsNotFoundError:
-                await self._ask_for_lyrics(message, state, track_id, track_dir)
-                return
-
-            if result.status == PipelineStatus.COMPLETED:
-                await self._send_result_video(message, result)
-            else:
-                await message.answer(
-                    f"💔 Обработка завершена с ошибкой.\n"
-                    f"track_id: <code>{result.track_id}</code>\n"
-                    f"Причина: {result.error_message}",
-                    parse_mode="HTML",
-                )
+            # Ask the user for the song language before starting the pipeline
+            await self._ask_for_lang(message, state, track_id, str(track_dir))
 
         @self.router.message()
         async def handle_non_audio(message: types.Message) -> None:  # type: ignore[unused-ignore]
@@ -381,6 +436,36 @@ class KaraokeHandlers:
                 "Полученное сообщение не является музыкальной композицией. "
                 "Пожалуйста, отправьте аудиофайл длительностью более 1 минуты."
             )
+
+    # ------------------------------------------------------------------
+    # Language selection FSM helpers
+    # ------------------------------------------------------------------
+
+    async def _ask_for_lang(
+        self,
+        message: types.Message,
+        state: FSMContext,
+        track_id: str,
+        track_folder: str,
+    ) -> None:
+        """Enter FSM state waiting_for_lang and send an inline keyboard to select song language."""
+        await state.set_state(TrackLangStates.waiting_for_lang)
+        await state.update_data(track_id=track_id, track_folder=track_folder)
+        self._logger.info("Asking user for song language for track_id=%s", track_id)
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_choice:ru"),
+                    InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_choice:en"),
+                ]
+            ]
+        )
+        await message.answer(
+            "🎵 На каком языке исполняется эта песня?\n\n"
+            "Выберите язык исполнения:",
+            reply_markup=keyboard,
+        )
 
     # ------------------------------------------------------------------
     # Lyrics FSM helpers
@@ -636,6 +721,8 @@ class KaraokeHandlers:
             )
             return
 
+        user_id: int = message.from_user.id if message.from_user else 0
+
         await message.answer(
             "Аудиофайл принят.\n"
             f"track_id: <code>{track_id}</code>\n"
@@ -644,34 +731,23 @@ class KaraokeHandlers:
             parse_mode="HTML",
         )
 
-        user_id: int = message.from_user.id if message.from_user else 0
-        request = UserRequest(
-            user_id=user_id,
+        # Save preliminary PipelineState so that the language callback can find the track
+        pipeline_state = PipelineState(
             track_id=track_id,
-            source_type="file",
-            source_url_or_file_path=str(final_path),
-            track_folder=str(track_dir),
+            user_id=user_id,
+            status=PipelineStatus.PENDING,
+            track_file_name=final_path.name,
+            track_source=str(final_path),
+            track_stem=track_name,
         )
-        pipeline = KaraokePipeline(request, self._settings)
-
-        async def _media_progress(msg: str) -> None:
-            await message.answer(msg)
-
+        state_path = track_dir / "state.json"
         try:
-            result = await pipeline.run(_media_progress)
-        except LyricsNotFoundError:
-            await self._ask_for_lyrics(message, state, track_id, track_dir)
-            return
+            state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._logger.error("Failed to write state.json for track_id=%s: %s", track_id, exc)
 
-        if result.status == PipelineStatus.COMPLETED:
-            await self._send_result_video(message, result)
-        else:
-            await message.answer(
-                f"💔 Обработка завершена с ошибкой.\n"
-                f"track_id: <code>{result.track_id}</code>\n"
-                f"Причина: {result.error_message}",
-                parse_mode="HTML",
-            )
+        # Ask the user for the song language before starting the pipeline
+        await self._ask_for_lang(message, state, track_id, str(track_dir))
 
     async def _probe_audio(self, path: Path) -> tuple[float | None, str | None, str | None]:
         cmd = [

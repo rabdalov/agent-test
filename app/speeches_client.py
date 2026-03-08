@@ -19,7 +19,7 @@ class SpeechesClient:
         self._prompt = settings.prompt_speeches
         self._timeout = settings.speeches_timeout
 
-    async def transcribe(self, vocal_file: Path, output_json: Path) -> Path:
+    async def transcribe(self, vocal_file: Path, output_json: Path, language: str | None = None) -> Path:
         """Транскрибирует аудиофайл vocal_file через speeches.ai API.
 
         Отправляет POST-запрос с multipart/form-data, сохраняет ответ
@@ -27,15 +27,18 @@ class SpeechesClient:
 
         :param vocal_file: Путь к входному аудиофайлу (вокальная дорожка)
         :param output_json: Путь к выходному JSON-файлу с результатом транскрипции
+        :param language: Язык аудио ('ru', 'en' и т.д.); если None — используется lang_default из настроек
         :returns: Путь к output_json
         :raises RuntimeError: При HTTP-ошибке или недоступности сервиса
         """
         url = f"{self._base_url}/v1/audio/transcriptions"
+        effective_language = language if language is not None else self._language
 
         logger.info(
-            "SpeechesClient: starting transcription for '%s' via %s",
+            "SpeechesClient: starting transcription for '%s' via %s (language=%s)",
             vocal_file,
             url,
+            effective_language,
         )
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -46,7 +49,7 @@ class SpeechesClient:
                     "response_format": "verbose_json",
                     "timestamp_granularities[]": "word",
                     "stream": "false",
-                    "language": self._language,
+                    "language": effective_language,
                     "temperature": "0.0",
                     "prompt": self._prompt,
                 }

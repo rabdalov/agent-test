@@ -320,7 +320,12 @@ class KaraokePipeline:
         track_dir = Path(self._request.track_folder)
         output_json = track_dir / f"{stem}_transcription.json"
 
-        await self._speeches_client.transcribe(vocal_file=vocal_file, output_json=output_json)
+        # Передаём язык из состояния (выбранный пользователем) или None (SpeechesClient использует lang_default)
+        await self._speeches_client.transcribe(
+            vocal_file=vocal_file,
+            output_json=output_json,
+            language=self._state.lang,
+        )
 
         self._state.transcribe_json_file = str(output_json)
         self._save_state()

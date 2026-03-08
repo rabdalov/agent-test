@@ -38,6 +38,7 @@ class PipelineState(BaseModel):
     track_file_name: str | None = None
     track_source: str | None = None
     track_stem: str | None = None
+    lang: str | None = None  # язык песни, выбранный пользователем ('ru' | 'en')
     vocal_file: str | None = None
     instrumental_file: str | None = None
     source_lyrics_file: str | None = None
@@ -56,3 +57,7 @@ class PipelineResult(BaseModel):
 
 class LyricsStates(StatesGroup):
     waiting_for_lyrics = State()
+
+
+class TrackLangStates(StatesGroup):
+    waiting_for_lang = State()
