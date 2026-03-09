@@ -17,6 +17,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from .config import Settings
 from .models import LyricsStates, PipelineResult, PipelineState, PipelineStatus, PipelineStep, TrackLangStates, UserRequest
 from .pipeline import KaraokePipeline, LyricsNotFoundError, _ORDERED_STEPS
+from .yandex_music_downloader import YandexMusicDownloader
 
 
 class KaraokeHandlers:
@@ -353,9 +354,14 @@ class KaraokeHandlers:
 
             if self._is_blocked_url(url):
                 await message.answer(
-                    "Ссылки на Яндекс Музыку и YouTube пока не поддерживаются. "
-                    "Поддержка этих источников появится в будущих версиях бота."
+                    "Ссылки на YouTube пока не поддерживаются. "
+                    "Поддержка YouTube появится в будущих версиях бота."
                 )
+                return
+
+            # Handle Yandex Music URL separately
+            if self._is_yandex_music_url(url):
+                await self._handle_yandex_music_url(message, state, url)
                 return
 
             self._ensure_tracks_root()
@@ -842,7 +848,6 @@ class KaraokeHandlers:
     )
 
     _BLOCKED_HOSTS: tuple[str, ...] = (
-        "music.yandex.ru",
         "youtube.com",
         "www.youtube.com",
         "youtu.be",
@@ -868,10 +873,150 @@ class KaraokeHandlers:
         return None
 
     def _is_blocked_url(self, url: str) -> bool:
-        """Return True if *url* points to Yandex Music or YouTube."""
+        """Return True if *url* points to YouTube."""
         try:
             parsed = urlparse(url)
             host = parsed.netloc.lower()
         except ValueError:
             return False
         return any(host == blocked or host.endswith("." + blocked) for blocked in self._BLOCKED_HOSTS)
+
+    def _is_yandex_music_url(self, url: str) -> bool:
+        """Return True if *url* points to Yandex Music."""
+        try:
+            parsed = urlparse(url)
+            host = parsed.netloc.lower()
+        except ValueError:
+            return False
+        return host == "music.yandex.ru" or host.endswith(".music.yandex.ru")
+
+    async def _handle_yandex_music_url(
+        self,
+        message: types.Message,
+        state: FSMContext,
+        url: str,
+    ) -> None:
+        """Handle Yandex Music URL: download track and fetch lyrics."""
+        self._ensure_tracks_root()
+
+        user_id: int = message.from_user.id if message.from_user else 0
+
+        await message.answer(
+            f"⏳ Загружаю трек с Яндекс Музыки...\n"
+            f"URL: {url}"
+        )
+
+        # Initialize Yandex Music downloader
+        downloader = YandexMusicDownloader(token=self._settings.yandex_music_token)
+
+        try:
+            # First get track info to build directory name
+            track_info = await downloader.get_track_info(url)
+        except Exception as exc:
+            self._logger.error(
+                "Failed to get track info from Yandex Music: %s", exc
+            )
+            await message.answer(
+                f"❌ Не удалось получить информацию о треке: {exc}"
+            )
+            return
+
+        # Build track name like in standard flow (using _build_track_name)
+        track_name = self._build_track_name(
+            track_info.title or "track",
+            track_info.artist,
+            track_info.title
+        )
+
+        # Create track directory with normalized name (not UUID!)
+        track_dir = self._tracks_root_dir / track_name
+        track_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Now download track to the created directory
+            track_info = await downloader.download(url, track_dir)
+        except Exception as exc:
+            self._logger.error(
+                "Failed to download track from Yandex Music: %s", exc
+            )
+            await message.answer(
+                f"❌ Не удалось скачать трек с Яндекс Музыки: {exc}"
+            )
+            return
+
+        # Check duration
+        duration, _, _ = await self._probe_audio(track_info.local_path)
+        if duration is None or duration < 60:
+            await message.answer(
+                f"Полученный трек не является музыкальной композицией "
+                "(длительность менее 1 минуты или не удалось определить длительность)."
+            )
+            return
+
+        # Generate track_id for PipelineState (UUID, not used for directory name)
+        track_id = uuid.uuid4().hex
+
+        # Try to fetch lyrics/LRC from Yandex Music
+        lyrics_saved = False
+        try:
+            lyrics_result = await downloader.fetch_lyrics(track_info.track_id)
+
+            # Save LRC (preferred) or plain text as source_lyrics_file
+            stem = track_info.track_stem
+            if lyrics_result.lrc_text:
+                lrc_file = track_dir / f"{stem}_lyrics.txt"
+                lrc_file.write_text(lyrics_result.lrc_text, encoding="utf-8")
+                lyrics_path = str(lrc_file)
+                lyrics_saved = True
+                self._logger.info(
+                    "Saved LRC lyrics for track_id=%s to %s", track_id, lyrics_path
+                )
+            elif lyrics_result.plain_text:
+                txt_file = track_dir / f"{stem}_lyrics.txt"
+                txt_file.write_text(lyrics_result.plain_text, encoding="utf-8")
+                lyrics_path = str(txt_file)
+                lyrics_saved = True
+                self._logger.info(
+                    "Saved plain text lyrics for track_id=%s to %s", track_id, lyrics_path
+                )
+        except Exception as exc:
+            self._logger.warning(
+                "Failed to fetch lyrics from Yandex Music for track_id=%s: %s",
+                track_id,
+                exc,
+            )
+            # Continue without lyrics - pipeline will request from user if needed
+
+        # Save PipelineState
+        pipeline_state = PipelineState(
+            track_id=track_id,
+            user_id=user_id,
+            status=PipelineStatus.PENDING,
+            track_file_name=track_info.local_path.name,
+            track_source=str(track_info.local_path),
+            track_stem=track_info.track_stem,
+        )
+        if lyrics_saved:
+            pipeline_state.source_lyrics_file = lyrics_path
+
+        state_path = track_dir / "state.json"
+        try:
+            state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._logger.error(
+                "Failed to write state.json for track_id=%s: %s", track_id, exc
+            )
+
+        # Notify user
+        lyrics_msg = "\nТекст с таймкодами получен с Яндекс Музыки!" if lyrics_saved else ""
+        await message.answer(
+            f"✅ Трек загружен с Яндекс Музыки!\n"
+            f"track_id: <code>{track_id}</code>\n"
+            f"Название: <code>{track_info.track_stem}</code>\n"
+            f"Длительность: {int(duration // 60)}:{int(duration % 60):02d}"
+            f"{lyrics_msg}",
+            parse_mode="HTML",
+        )
+
+        # Ask for language and continue with pipeline
+        await self._ask_for_lang(message, state, track_id, str(track_dir))
