@@ -53,6 +53,12 @@ class Settings(BaseModel):
     # Send video to user after processing (RENDER_VIDEO step)
     # If true, video is sent to user via Telegram; if false, video is not sent but remains available locally
     send_video_to_user: bool = True
+    # OpenRouter LLM settings (for CORRECT_TRANSCRIPT step)
+    openrouter_api_key: str | None = None
+    openrouter_model: str = "qwen/qwen3-next-80b-a3b-instruct:free"
+    openrouter_api_url: str = "https://api.openrouter.ai/v1"
+    # Enable/disable CORRECT_TRANSCRIPT step (uses LLM to correct transcription)
+    correct_transcript_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -92,6 +98,10 @@ class Settings(BaseModel):
             "max_word_time": float(os.getenv("MAX_WORD_TIME", "5.0")),
             "normal_word_time": float(os.getenv("NORMAL_WORD_TIME", "1.5")),
             "send_video_to_user": os.getenv("SEND_VIDEO_TO_USER", "true").lower() in ("true", "1", "yes"),
+            "openrouter_api_key": os.getenv("OPENROUTER_API_KEY") or None,
+            "openrouter_model": os.getenv("OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free"),
+            "openrouter_api_url": os.getenv("OPENROUTER_API", "https://api.openrouter.ai/v1"),
+            "correct_transcript_enabled": os.getenv("CORRECT_TRANSCRIPT_ENABLED", "true").lower() in ("true", "1", "yes"),
         }
 
         return cls(**data)

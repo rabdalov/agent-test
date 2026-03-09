@@ -13,6 +13,7 @@ dependencies = [
   "demucs>=4.0.0",
   "httpx>=0.28.1",
   "lyricsgenius>=3.0.0",
+  "openai>=1.0.0",
   "pydantic>=2.0.0,<3.0.0",
   "yandex-music>=2.2.0",
 ]

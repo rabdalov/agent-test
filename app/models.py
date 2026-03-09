@@ -14,9 +14,10 @@ class UserRequest(BaseModel):
 
 class PipelineStep(str, Enum):
     DOWNLOAD = "DOWNLOAD"
+    GET_LYRICS = "GET_LYRICS"
     SEPARATE = "SEPARATE"
     TRANSCRIBE = "TRANSCRIBE"
-    GET_LYRICS = "GET_LYRICS"
+    CORRECT_TRANSCRIPT = "CORRECT_TRANSCRIPT"
     ALIGN = "ALIGN"
     GENERATE_ASS = "GENERATE_ASS"
     RENDER_VIDEO = "RENDER_VIDEO"
@@ -43,6 +44,7 @@ class PipelineState(BaseModel):
     instrumental_file: str | None = None
     source_lyrics_file: str | None = None
     transcribe_json_file: str | None = None
+    corrected_transcribe_json_file: str | None = None
     aligned_lyrics_file: str | None = None
     ass_file: str | None = None
     output_file: str | None = None

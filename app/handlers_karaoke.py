@@ -154,6 +154,13 @@ class KaraokeHandlers:
                 return
             await self._handle_step_command(message, PipelineStep.TRANSCRIBE, state)
 
+        @self.router.message(Command("step_correct"))
+        async def handle_step_correct(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+            await self._handle_step_command(message, PipelineStep.CORRECT_TRANSCRIPT, state)
+
         @self.router.message(Command("step_align"))
         async def handle_step_align(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             if not self._is_user_allowed(message):

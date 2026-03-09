@@ -6,7 +6,9 @@ from pathlib import Path
 from .alignment_service import AlignmentService, save_aligned_result
 from .ass_generator import AssGenerator
 from .config import Settings
+from .correct_transcript_service import CorrectTranscriptService
 from .demucs_service import DemucsService
+from .llm_client import LLMClient
 from .lyrics_service import LyricsService
 from .speeches_client import SpeechesClient
 from .video_renderer import VideoRenderer
@@ -30,6 +32,7 @@ _STEP_LABELS: dict[PipelineStep, str] = {
     PipelineStep.GET_LYRICS: "получение текста",
     PipelineStep.SEPARATE: "разделение дорожек",
     PipelineStep.TRANSCRIBE: "транскрипция",
+    PipelineStep.CORRECT_TRANSCRIPT: "корректировка транскрипции",
     PipelineStep.ALIGN: "выравнивание",
     PipelineStep.GENERATE_ASS: "генерация субтитров",
     PipelineStep.RENDER_VIDEO: "рендеринг видео",
@@ -40,6 +43,7 @@ _ORDERED_STEPS: list[PipelineStep] = [
     PipelineStep.GET_LYRICS,
     PipelineStep.SEPARATE,
     PipelineStep.TRANSCRIBE,
+    PipelineStep.CORRECT_TRANSCRIPT,
     PipelineStep.ALIGN,
     PipelineStep.GENERATE_ASS,
     PipelineStep.RENDER_VIDEO,
@@ -51,6 +55,7 @@ _STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
     PipelineStep.GET_LYRICS: ["track_file_name", "track_stem"],
     PipelineStep.SEPARATE: ["track_source"],
     PipelineStep.TRANSCRIBE: ["vocal_file"],
+    PipelineStep.CORRECT_TRANSCRIPT: ["transcribe_json_file", "source_lyrics_file"],
     PipelineStep.ALIGN: ["source_lyrics_file", "transcribe_json_file"],
     PipelineStep.GENERATE_ASS: ["aligned_lyrics_file"],
     PipelineStep.RENDER_VIDEO: ["ass_file", "vocal_file", "instrumental_file"],
@@ -172,7 +177,7 @@ class KaraokePipeline:
                         self._state.track_source = saved.track_source
                     # Copy other artifacts that might exist
                     for field in ['vocal_file', 'instrumental_file', 'transcribe_json_file',
-                                  'aligned_lyrics_file', 'ass_file', 'output_file']:
+                                  'corrected_transcribe_json_file', 'aligned_lyrics_file', 'ass_file', 'output_file']:
                         saved_value = getattr(saved, field, None)
                         if saved_value is not None:
                             setattr(self._state, field, saved_value)
@@ -202,6 +207,7 @@ class KaraokePipeline:
             PipelineStep.GET_LYRICS: self._step_get_lyrics,
             PipelineStep.SEPARATE: self._step_separate,
             PipelineStep.TRANSCRIBE: self._step_transcribe,
+            PipelineStep.CORRECT_TRANSCRIPT: self._step_correct_transcribe,
             PipelineStep.ALIGN: self._step_align,
             PipelineStep.GENERATE_ASS: self._step_generate_ass,
             PipelineStep.RENDER_VIDEO: self._step_render_video,
@@ -365,6 +371,75 @@ class KaraokePipeline:
         self._state.transcribe_json_file = str(output_json)
         self._save_state()
 
+    async def _step_correct_transcribe(self) -> None:
+        # Check if step is enabled in config
+        if not self._settings.correct_transcript_enabled:
+            logger.info(
+                "CORRECT_TRANSCRIPT step skipped (disabled in config) for track_id=%s",
+                self._request.track_id,
+            )
+            return
+
+        # Check if we have API key
+        if not self._settings.openrouter_api_key:
+            logger.warning(
+                "CORRECT_TRANSCRIPT step skipped (no API key) for track_id=%s",
+                self._request.track_id,
+            )
+            return
+
+        transcribe_path = self._state.transcribe_json_file
+        lyrics_path = self._state.source_lyrics_file
+
+        if not transcribe_path:
+            raise RuntimeError(
+                "transcribe_json_file не задан — шаг TRANSCRIBE не был выполнен"
+            )
+        if not lyrics_path:
+            raise RuntimeError(
+                "source_lyrics_file не задан — шаг GET_LYRICS не был выполнен"
+            )
+
+        # Create LLM client
+        llm_client = LLMClient(
+            api_key=self._settings.openrouter_api_key,
+            model=self._settings.openrouter_model,
+            api_url=self._settings.openrouter_api_url,
+        )
+
+        try:
+            # Create correction service
+            correct_service = CorrectTranscriptService(llm_client=llm_client)
+
+            # Perform correction
+            corrected_data = await correct_service.correct_transcript(
+                transcription_json_path=Path(transcribe_path),
+                lyrics_path=Path(lyrics_path),
+            )
+
+            # Save corrected transcription
+            import json
+
+            stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+            track_dir = Path(self._request.track_folder)
+            output_json = track_dir / f"{stem}_transcription_corrected.json"
+
+            output_json.write_text(
+                json.dumps(corrected_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            self._state.corrected_transcribe_json_file = str(output_json)
+            self._save_state()
+
+            logger.info(
+                "CORRECT_TRANSCRIPT step completed for track_id=%s: corrected_file='%s'",
+                self._request.track_id,
+                output_json,
+            )
+        finally:
+            await llm_client.close()
+
     async def _step_get_lyrics(self) -> None:
         # Проверяем, есть ли уже файл с текстом песни в state
         existing_lyrics_file = self._state.source_lyrics_file
@@ -413,7 +488,8 @@ class KaraokePipeline:
         )
 
     async def _step_align(self) -> None:
-        transcribe_path = self._state.transcribe_json_file
+        # Use corrected transcription if available, otherwise use original
+        transcribe_path = self._state.corrected_transcribe_json_file or self._state.transcribe_json_file
         lyrics_path = self._state.source_lyrics_file
         if not transcribe_path:
             raise RuntimeError("transcribe_json_file не задан — шаг TRANSCRIBE не был выполнен")
