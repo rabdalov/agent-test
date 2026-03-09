@@ -306,14 +306,15 @@ class AssGenerator:
 
         lines: list[str] = []
 
-        # ---- Next/preparatory line (always static during this segment) ----
-        if next_text:
-            lines.append(
-                f"Dialogue: 0,"
-                f"{_format_ass_time(seg_start)},"
-                f"{_format_ass_time(seg_end)},"
-                f"NextLine,,0,0,0,,{next_text}\n"
-            )
+        # ---- Active line: ActiveLine style ----
+
+        lines.append(
+            f"Dialogue: 0,"
+            f"{_format_ass_time(seg_start)},"
+            f"{_format_ass_time(seg_end)},"
+            f"ActiveLine,,0,0,0,,{seg_text}\n"
+        )
+
 
         # ---- Active line: per-word highlight on ActiveLine style ----
         for i, word_entry in enumerate(seg_words):
@@ -326,6 +327,14 @@ class AssGenerator:
                 f"{_format_ass_time(word_start)},"
                 f"{_format_ass_time(word_end)},"
                 f"ActiveLine,,0,0,0,,{highlighted}\n"
+            )
+        # ---- Next/preparatory line (always static during this segment) ----
+        if next_text:
+            lines.append(
+                f"Dialogue: 0,"
+                f"{_format_ass_time(seg_start)},"
+                f"{_format_ass_time(seg_end)},"
+                f"NextLine,,0,0,0,,{next_text}\n"
             )
 
         return lines
