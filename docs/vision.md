@@ -178,7 +178,7 @@
       - создаёт `track_id` и папку трека,
       - сохраняет/скачивает исходный медиафайл,
       - формирует `UserRequest` и запускает `KaraokePipeline`.  
-    - Пайплайн последовательно проходит шаги `DOWNLOAD → SEPARATE → TRANSCRIBE → GET_LYRICS → ALIGN → GENERATE_ASS → RENDER_VIDEO`, на каждом шаге:
+    - Пайплайн последовательно проходит шаги `DOWNLOAD → GET_LYRICS → SEPARATE → TRANSCRIBE → ALIGN → GENERATE_ASS → RENDER_VIDEO`, на каждом шаге:
       - читает нужные входные файлы из папки трека,
       - записывает результаты в новые файлы,
       - обновляет `PipelineState` в JSON,

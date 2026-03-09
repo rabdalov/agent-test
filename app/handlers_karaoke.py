@@ -133,6 +133,13 @@ class KaraokeHandlers:
                     "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
                 )
 
+        @self.router.message(Command("step_lyrics"))
+        async def handle_step_lyrics(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+            await self._handle_step_command(message, PipelineStep.GET_LYRICS, state)
+
         @self.router.message(Command("step_separate"))
         async def handle_step_separate(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             if not self._is_user_allowed(message):
@@ -146,13 +153,6 @@ class KaraokeHandlers:
                 await self._reject_unauthorized(message)
                 return
             await self._handle_step_command(message, PipelineStep.TRANSCRIBE, state)
-
-        @self.router.message(Command("step_lyrics"))
-        async def handle_step_lyrics(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
-            if not self._is_user_allowed(message):
-                await self._reject_unauthorized(message)
-                return
-            await self._handle_step_command(message, PipelineStep.GET_LYRICS, state)
 
         @self.router.message(Command("step_align"))
         async def handle_step_align(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
@@ -236,8 +236,8 @@ class KaraokeHandlers:
 
             await message.answer("✅ Текст песни получен. Продолжаю обработку...")
 
-            # Continue pipeline from ALIGN step
-            await self._run_from_step(message, track_dir, pipeline_state, PipelineStep.ALIGN, state)
+            # Continue pipeline from SEPARATE step (after GET_LYRICS)
+            await self._run_from_step(message, track_dir, pipeline_state, PipelineStep.SEPARATE, state)
 
         # ----- FSM: waiting for user to select song language -----
         @self.router.callback_query(TrackLangStates.waiting_for_lang, F.data.startswith("lang_choice:"))
@@ -589,6 +589,12 @@ class KaraokeHandlers:
         fsm_context: FSMContext,
     ) -> None:
         """Reconstruct UserRequest from saved state and run the pipeline from the given step."""
+        self._logger.info(
+            "_run_from_step called for track_id=%s, step=%s, source_lyrics_file=%s",
+            state.track_id,
+            step.value,
+            state.source_lyrics_file,
+        )
         # Build a minimal UserRequest from persisted state data
         source = state.track_source or state.track_file_name or ""
         # Prefer the local track_file_name path inside track_dir

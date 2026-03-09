@@ -27,9 +27,9 @@ logger = logging.getLogger(__name__)
 
 _STEP_LABELS: dict[PipelineStep, str] = {
     PipelineStep.DOWNLOAD: "скачивание",
+    PipelineStep.GET_LYRICS: "получение текста",
     PipelineStep.SEPARATE: "разделение дорожек",
     PipelineStep.TRANSCRIBE: "транскрипция",
-    PipelineStep.GET_LYRICS: "получение текста",
     PipelineStep.ALIGN: "выравнивание",
     PipelineStep.GENERATE_ASS: "генерация субтитров",
     PipelineStep.RENDER_VIDEO: "рендеринг видео",
@@ -48,8 +48,8 @@ _ORDERED_STEPS: list[PipelineStep] = [
 # Required artifact fields that must be set before a given step can run.
 # If a step is absent, no prerequisite artifacts are needed.
 _STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
-    PipelineStep.GET_LYRICS: ["track_file_name"],
-    PipelineStep.SEPARATE: ["track_file_name"],
+    PipelineStep.GET_LYRICS: ["track_file_name", "track_stem"],
+    PipelineStep.SEPARATE: ["track_source"],
     PipelineStep.TRANSCRIBE: ["vocal_file"],
     PipelineStep.ALIGN: ["source_lyrics_file", "transcribe_json_file"],
     PipelineStep.GENERATE_ASS: ["aligned_lyrics_file"],
@@ -94,14 +94,29 @@ class KaraokePipeline:
         """
         first_step: PipelineStep
 
+        logger.info(
+            "Pipeline.run called for track_id=%s with start_from_step=%s, request.source=%s",
+            self._request.track_id,
+            start_from_step,
+            self._request.source_url_or_file_path,
+        )
+
         if start_from_step is not None:
             # Mode 3: explicit start_from_step
             saved = self._load_state()
+            logger.info(
+                "Pipeline mode 3: explicit start_from_step=%s, saved state exists=%s",
+                start_from_step,
+                saved is not None,
+            )
             if saved is not None:
                 # Restore artefacts accumulated in previous runs
                 self._state = saved
                 # Always keep user_id from the current request
                 self._state.user_id = self._request.user_id
+                # Also restore track_source if not set in request
+                if not self._state.track_source and self._request.source_url_or_file_path:
+                    self._state.track_source = self._request.source_url_or_file_path
             validation_error = self._validate_artifacts_for_step(start_from_step)
             if validation_error:
                 logger.error(
@@ -184,9 +199,9 @@ class KaraokePipeline:
 
         step_methods: dict[PipelineStep, Callable[[], Awaitable[None]]] = {
             PipelineStep.DOWNLOAD: self._step_download,
+            PipelineStep.GET_LYRICS: self._step_get_lyrics,
             PipelineStep.SEPARATE: self._step_separate,
             PipelineStep.TRANSCRIBE: self._step_transcribe,
-            PipelineStep.GET_LYRICS: self._step_get_lyrics,
             PipelineStep.ALIGN: self._step_align,
             PipelineStep.GENERATE_ASS: self._step_generate_ass,
             PipelineStep.RENDER_VIDEO: self._step_render_video,
@@ -362,7 +377,6 @@ class KaraokePipeline:
                     self._request.track_id,
                     lyrics_path,
                 )
-                # Всё равно записываем путь в state на случай, если его там не было
                 self._state.source_lyrics_file = str(lyrics_path)
                 self._save_state()
                 return
