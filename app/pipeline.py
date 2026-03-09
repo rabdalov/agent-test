@@ -577,9 +577,14 @@ class KaraokePipeline:
         if not track_source_str:
             raise RuntimeError("track_source не задан — шаг DOWNLOAD не был выполнен")
 
+        vocal_file_str = self._state.vocal_file
+        if not vocal_file_str:
+            raise RuntimeError("vocal_file не задан — шаг SEPARATE не был выполнен")
+
         ass_path = Path(ass_file_str)
         instrumental_path = Path(instrumental_file_str)
         original_path = Path(track_source_str)
+        vocal_path = Path(vocal_file_str)
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
         track_dir = Path(self._request.track_folder)
         output_path = track_dir / f"{stem}.mp4"
@@ -590,11 +595,13 @@ class KaraokePipeline:
             background_color=self._settings.video_background_color,
             ffmpeg_preset=self._settings.video_ffmpeg_preset,
             ffmpeg_crf=self._settings.video_ffmpeg_crf,
+            mix_voice_volume=self._settings.audio_mix_voice_volume,
         )
 
         await renderer.render(
             instrumental_path=instrumental_path,
             original_path=original_path,
+            vocal_path=vocal_path,
             ass_path=ass_path,
             output_path=output_path,
         )

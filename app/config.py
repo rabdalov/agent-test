@@ -53,6 +53,9 @@ class Settings(BaseModel):
     # Send video to user after processing (RENDER_VIDEO step)
     # If true, video is sent to user via Telegram; if false, video is not sent but remains available locally
     send_video_to_user: bool = True
+    # Audio mix voice volume for Instrumental+Voice track (RENDER_VIDEO step)
+    # Volume level for voice track when mixing instrumental + voice (as decimal: 0.4 = 40%)
+    audio_mix_voice_volume: float = 0.4
     # OpenRouter LLM settings (for CORRECT_TRANSCRIPT step)
     openrouter_api_key: str | None = None
     openrouter_model: str = "qwen/qwen3-next-80b-a3b-instruct:free"
@@ -98,6 +101,7 @@ class Settings(BaseModel):
             "max_word_time": float(os.getenv("MAX_WORD_TIME", "5.0")),
             "normal_word_time": float(os.getenv("NORMAL_WORD_TIME", "1.5")),
             "send_video_to_user": os.getenv("SEND_VIDEO_TO_USER", "true").lower() in ("true", "1", "yes"),
+            "audio_mix_voice_volume": float(os.getenv("AUDIO_MIX_VOICE_VOLUME", "0.4")),
             "openrouter_api_key": os.getenv("OPENROUTER_API_KEY") or None,
             "openrouter_model": os.getenv("OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free"),
             "openrouter_api_url": os.getenv("OPENROUTER_API", "https://api.openrouter.ai/v1"),
