@@ -10,20 +10,22 @@ class VideoRenderError(Exception):
 
 
 class VideoRenderer:
-    """Renders a karaoke MP4 video from an instrumental audio track and an ASS subtitle file.
+    """Renders a karaoke MP4 video with multiple audio tracks and an ASS subtitle file.
 
     The renderer generates a static-colour background video stream, burns the ASS
-    subtitles into it via the ``ass`` filter, and muxes the result with the provided
-    audio track.
+    subtitles into it via the ``ass`` filter, and muxes the result with multiple
+    audio tracks (Instrumental, Original, etc.).
 
-    Example equivalent shell command::
+    Example equivalent shell command (2 audio tracks)::
 
-        ffmpeg -loop 1 -i background.jpg -i audio.mp3 \\
-            -filter_complex "[0:v]scale=740:494[v]; [v]ass='subtitles.ass'" \\
+        ffmpeg -f lavfi -i "color=c=black:s=1280x720:r=25" -i instrumental.mp3 -i original.mp3 \\
+            -filter_complex "[0:v]ass='subtitles.ass'[vout]" \\
+            -map "[vout]" -map "1:a" -map "2:a" \\
             -c:v libx264 -preset fast -tune stillimage -crf 22 \\
-            -c:a aac -b:a 320k \\
-            -shortest output.mp4 \\
-            -pix_fmt yuv420p
+            -c:a aac -b:a 320k -shortest -pix_fmt yuv420p \\
+            -metadata:s:a:0 title="Instrumental" -metadata:s:a:1 title="Original" \\
+            -disposition:a:0 default -disposition:a:1 0 \\
+            output.mp4
 
     Instead of a background image we use ``lavfi`` colour source so no external
     image file is needed.
@@ -48,16 +50,20 @@ class VideoRenderer:
 
     async def render(
         self,
-        audio_path: Path,
+        *,
+        instrumental_path: Path,
+        original_path: Path,
         ass_path: Path,
         output_path: Path,
     ) -> Path:
-        """Render the karaoke video.
+        """Render the karaoke video with multiple audio tracks.
 
         Parameters
         ----------
-        audio_path:
-            Path to the audio file (instrumental or vocals-removed track).
+        instrumental_path:
+            Path to the instrumental audio file (vocals removed).
+        original_path:
+            Path to the original audio file (full mix with vocals).
         ass_path:
             Path to the ``.ass`` subtitle file with karaoke highlights.
         output_path:
@@ -86,7 +92,7 @@ class VideoRenderer:
         if len(ass_for_filter) >= 2 and ass_for_filter[1] == ":":
             ass_for_filter = ass_for_filter[0] + "\\:" + ass_for_filter[2:]
 
-        # The lavfi input is [0:v]; audio is [1:a].
+        # The lavfi input is [0:v]; instrumental audio is [1:a]; original audio is [2:a].
         # We apply the `ass` filter directly to [0:v].
         filter_complex = f"[0:v]ass='{ass_for_filter}'[vout]"
 
@@ -96,12 +102,15 @@ class VideoRenderer:
             # Video: synthetic lavfi colour background → input [0:v]
             "-f", "lavfi",
             "-i", f"color=c={self._background_color}:s={self._width}x{self._height}:r=25",
-            # Audio input → [1:a]
-            "-i", str(audio_path.resolve()),
+            # Audio input 1: Instrumental → [1:a]
+            "-i", str(instrumental_path.resolve()),
+            # Audio input 2: Original → [2:a]
+            "-i", str(original_path.resolve()),
             # Filter: burn ASS subtitles into the colour background
             "-filter_complex", filter_complex,
             "-map", "[vout]",
-            "-map", "1:a",
+            "-map", "1:a",                    # First audio track: Instrumental
+            "-map", "2:a",                    # Second audio track: Original
             # Video codec settings
             "-c:v", "libx264",
             "-preset", self._ffmpeg_preset,
@@ -113,12 +122,19 @@ class VideoRenderer:
             "-b:a", self._audio_bitrate,
             # Stop when the audio ends
             "-shortest",
+            # Metadata: name the audio tracks
+            "-metadata:s:a:0", "title=Instrumental",
+            "-metadata:s:a:1", "title=Original",
+            # Disposition: first track is default, second is not
+            "-disposition:a:0", "default",
+            "-disposition:a:1", "0",
             str(output_path.resolve()),
         ]
 
         logger.info(
-            "VideoRenderer: starting ffmpeg render\n  audio='%s'\n  ass='%s'\n  output='%s'",
-            audio_path,
+            "VideoRenderer: starting ffmpeg render\n  instrumental='%s'\n  original='%s'\n  ass='%s'\n  output='%s'",
+            instrumental_path,
+            original_path,
             ass_path,
             output_path,
         )

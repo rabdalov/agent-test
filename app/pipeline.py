@@ -488,8 +488,19 @@ class KaraokePipeline:
         )
 
     async def _step_align(self) -> None:
-        # Use corrected transcription if available, otherwise use original
-        transcribe_path = self._state.corrected_transcribe_json_file or self._state.transcribe_json_file
+        # Use corrected transcription if available and exists, otherwise use original
+        if self._state.corrected_transcribe_json_file and Path(self._state.corrected_transcribe_json_file).exists():
+            transcribe_path = self._state.corrected_transcribe_json_file
+            logger.info(
+                "ALIGN step: using corrected transcription '%s'",
+                transcribe_path,
+            )
+        else:
+            transcribe_path = self._state.transcribe_json_file
+            logger.info(
+                "ALIGN step: using original transcription '%s'",
+                transcribe_path,
+            )
         lyrics_path = self._state.source_lyrics_file
         if not transcribe_path:
             raise RuntimeError("transcribe_json_file не задан — шаг TRANSCRIBE не был выполнен")
@@ -562,8 +573,13 @@ class KaraokePipeline:
         if not instrumental_file_str:
             raise RuntimeError("instrumental_file не задан — шаг SEPARATE не был выполнен")
 
+        track_source_str = self._state.track_source
+        if not track_source_str:
+            raise RuntimeError("track_source не задан — шаг DOWNLOAD не был выполнен")
+
         ass_path = Path(ass_file_str)
-        audio_path = Path(instrumental_file_str)
+        instrumental_path = Path(instrumental_file_str)
+        original_path = Path(track_source_str)
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
         track_dir = Path(self._request.track_folder)
         output_path = track_dir / f"{stem}.mp4"
@@ -577,7 +593,8 @@ class KaraokePipeline:
         )
 
         await renderer.render(
-            audio_path=audio_path,
+            instrumental_path=instrumental_path,
+            original_path=original_path,
             ass_path=ass_path,
             output_path=output_path,
         )
