@@ -171,13 +171,12 @@ class YandexMusicDownloader:
             track_stem = f"track_{track_id}"
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{track_stem}.mp3"
 
         logger.info(
             "YandexMusicDownloader: downloading track '%s' (ID: %d) to '%s'",
             track_stem,
             track_id,
-            output_path,
+            output_dir,
         )
 
         # Download track
@@ -187,20 +186,50 @@ class YandexMusicDownloader:
             if not download_info:
                 raise RuntimeError(f"No download info available for track {track_id}")
 
-            # Get the first available format (prefer mp3)
+            # First, try to find FLAC version (highest quality)
             best_format = None
             for fmt in download_info:
-                if fmt.codec == "mp3":
+                if fmt.codec == "flac":
                     best_format = fmt
+                    logger.info(
+                        "YandexMusicDownloader: found FLAC format for track %d (bitrate: %d)",
+                        track_id,
+                        fmt.bitrate_in_kbps,
+                    )
                     break
+
+            # If no FLAC, fallback to MP3
+            if best_format is None:
+                for fmt in download_info:
+                    if fmt.codec == "mp3":
+                        best_format = fmt
+                        logger.info(
+                            "YandexMusicDownloader: FLAC not available, using MP3 for track %d (bitrate: %d)",
+                            track_id,
+                            fmt.bitrate_in_kbps,
+                        )
+                        break
+
+            # If still no format found, use first available
             if best_format is None:
                 best_format = download_info[0]
+                logger.info(
+                    "YandexMusicDownloader: using first available format for track %d: %s (%d kbps)",
+                    track_id,
+                    best_format.codec,
+                    best_format.bitrate_in_kbps,
+                )
+
+            # Determine file extension based on codec
+            file_ext = ".flac" if best_format.codec == "flac" else ".mp3"
+            output_path = output_dir / f"{track_stem}{file_ext}"
 
             # Download the file
             track.download(output_path, bitrate_in_kbps=best_format.bitrate_in_kbps)
             logger.info(
-                "YandexMusicDownloader: track downloaded successfully to '%s'",
+                "YandexMusicDownloader: track downloaded successfully to '%s' (codec: %s)",
                 output_path,
+                best_format.codec,
             )
 
         except Exception as exc:

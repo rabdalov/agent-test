@@ -37,9 +37,9 @@ _STEP_LABELS: dict[PipelineStep, str] = {
 
 _ORDERED_STEPS: list[PipelineStep] = [
     PipelineStep.DOWNLOAD,
+    PipelineStep.GET_LYRICS,
     PipelineStep.SEPARATE,
     PipelineStep.TRANSCRIBE,
-    PipelineStep.GET_LYRICS,
     PipelineStep.ALIGN,
     PipelineStep.GENERATE_ASS,
     PipelineStep.RENDER_VIDEO,
@@ -48,9 +48,9 @@ _ORDERED_STEPS: list[PipelineStep] = [
 # Required artifact fields that must be set before a given step can run.
 # If a step is absent, no prerequisite artifacts are needed.
 _STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
+    PipelineStep.GET_LYRICS: ["track_file_name"],
     PipelineStep.SEPARATE: ["track_file_name"],
     PipelineStep.TRANSCRIBE: ["vocal_file"],
-    PipelineStep.GET_LYRICS: ["transcribe_json_file"],
     PipelineStep.ALIGN: ["source_lyrics_file", "transcribe_json_file"],
     PipelineStep.GENERATE_ASS: ["aligned_lyrics_file"],
     PipelineStep.RENDER_VIDEO: ["ass_file", "vocal_file", "instrumental_file"],
@@ -142,8 +142,25 @@ class KaraokePipeline:
                 )
             else:
                 # Mode 1: fresh start — but preserve any fields already saved (e.g. lang chosen by the user)
-                if saved is not None and saved.lang is not None:
-                    self._state.lang = saved.lang
+                # Copy all available artifacts from saved state for fresh start
+                if saved is not None:
+                    if saved.lang is not None:
+                        self._state.lang = saved.lang
+                    # Copy all artifact paths that exist in saved state
+                    if saved.source_lyrics_file is not None:
+                        self._state.source_lyrics_file = saved.source_lyrics_file
+                    if saved.track_file_name is not None:
+                        self._state.track_file_name = saved.track_file_name
+                    if saved.track_stem is not None:
+                        self._state.track_stem = saved.track_stem
+                    if saved.track_source is not None:
+                        self._state.track_source = saved.track_source
+                    # Copy other artifacts that might exist
+                    for field in ['vocal_file', 'instrumental_file', 'transcribe_json_file',
+                                  'aligned_lyrics_file', 'ass_file', 'output_file']:
+                        saved_value = getattr(saved, field, None)
+                        if saved_value is not None:
+                            setattr(self._state, field, saved_value)
                 first_step = PipelineStep.DOWNLOAD
                 logger.info(
                     "Pipeline starting fresh for track_id=%s (lang=%s)",
@@ -334,6 +351,22 @@ class KaraokePipeline:
         self._save_state()
 
     async def _step_get_lyrics(self) -> None:
+        # Проверяем, есть ли уже файл с текстом песни в state
+        existing_lyrics_file = self._state.source_lyrics_file
+        if existing_lyrics_file:
+            lyrics_path = Path(existing_lyrics_file)
+            if lyrics_path.exists() and lyrics_path.stat().st_size > 0:
+                lyrics = lyrics_path.read_text(encoding="utf-8")
+                logger.info(
+                    "GET_LYRICS step skipped for track_id=%s: lyrics loaded from existing file '%s'",
+                    self._request.track_id,
+                    lyrics_path,
+                )
+                # Всё равно записываем путь в state на случай, если его там не было
+                self._state.source_lyrics_file = str(lyrics_path)
+                self._save_state()
+                return
+
         stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
         track_dir = Path(self._request.track_folder)
 
