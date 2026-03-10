@@ -4,6 +4,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import quote
 
+from aiogram import Bot
+
 from .alignment_service import AlignmentService, save_aligned_result
 from .ass_generator import AssGenerator
 from .config import Settings
@@ -88,6 +90,8 @@ class KaraokePipeline:
         self,
         progress_callback: Callable[[str], Awaitable[None]],
         start_from_step: PipelineStep | None = None,
+        chat_id: int | None = None,
+        message_id: int | None = None,
     ) -> PipelineResult:
         """Run the pipeline.
 
@@ -97,7 +101,13 @@ class KaraokePipeline:
         2. Else if a ``state.json`` exists for this track with
            ``status == FAILED`` — resume from ``current_step``.
         3. Otherwise — run from the very beginning (DOWNLOAD).
+
+        If chat_id and message_id are provided, the progress messages will be
+        edited in-place instead of sending new messages.
         """
+        # Store for edit-in-place
+        self._chat_id = chat_id
+        self._current_message_id = message_id
         first_step: PipelineStep
 
         logger.info(
@@ -203,6 +213,9 @@ class KaraokePipeline:
         self._state.status = PipelineStatus.IN_PROGRESS
         self._save_state()
 
+        # Store callback reference for potential edit-in-place
+        self._progress_callback = progress_callback
+
         step_methods: dict[PipelineStep, Callable[[], Awaitable[None]]] = {
             PipelineStep.DOWNLOAD: self._step_download,
             PipelineStep.GET_LYRICS: self._step_get_lyrics,
@@ -235,6 +248,19 @@ class KaraokePipeline:
                 self._save_state()
                 raise
             except Exception as exc:
+                # Check if this is CORRECT_TRANSCRIPT step - continue to next step on error
+                if step == PipelineStep.CORRECT_TRANSCRIPT:
+                    error_msg = f"Ошибка на шаге {step.value}: {exc}"
+                    logger.warning(
+                        "Step %s failed for track_id=%s: %s. Continuing to next step.",
+                        step.value,
+                        self._request.track_id,
+                        exc,
+                    )
+                    await progress_callback(f"⚠️ Шаг {step.value} завершился с ошибкой: {exc}. Продолжаю...")
+                    # Continue to next step instead of returning error
+                    continue
+
                 error_msg = f"Ошибка на шаге {step.value}: {exc}"
                 logger.error(
                     "Step %s failed for track_id=%s: %s",
@@ -253,7 +279,7 @@ class KaraokePipeline:
                 )
 
             logger.info("Step %s completed for track_id=%s", step.value, self._request.track_id)
-            await progress_callback(f"✅ Шаг {step.value} завершён")
+            await progress_callback(f"✅ Шаг {step.value}: {_STEP_LABELS[step]}...завершён")
 
         self._state.status = PipelineStatus.COMPLETED
         self._state.error_message = None

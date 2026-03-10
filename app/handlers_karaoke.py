@@ -51,8 +51,8 @@ class KaraokeHandlers:
             await state.clear()
             await message.answer(
                 "Привет! Я бот для подготовки караоке-видео.\n"
-                "Отправьте мне аудиофайл (музыкальную композицию длительностью более 1 минуты), "
-                "и я подготовлю данные для караоке-пайплайна."
+                "Отправьте мне аудиофайл (mp3 или flac) или ссылку на аудиофайл (включая Я-Муззыку), "
+                "и я подготовлю караоке-видео с тремя дорожками: минус, плюс, задавленный плюс."
             )
 
         @self.router.message(F.audio)
@@ -318,9 +318,22 @@ class KaraokeHandlers:
             )
             pipeline = KaraokePipeline(request, self._settings)
 
+            # Send initial progress message and get its ID
+            initial_msg = await callback.message.edit_text("⏳ Начинаю обработку...")  # type: ignore[union-attr]
+            message_id = initial_msg.message_id
+
             async def _lang_progress(msg: str) -> None:
-                if callback.message:
-                    await callback.message.answer(msg)  # type: ignore[union-attr]
+                # Edit the initial message instead of sending new ones
+                try:
+                    await callback.message.bot.edit_message_text(  # type: ignore[union-attr]
+                        text=msg,
+                        chat_id=callback.message.chat.id,  # type: ignore[union-attr]
+                        message_id=message_id,
+                    )
+                except Exception as edit_err:
+                    self._logger.warning("Failed to edit message: %s", edit_err)
+                    if callback.message:
+                        await callback.message.answer(msg)  # type: ignore[union-attr]
 
             try:
                 result = await pipeline.run(_lang_progress)
@@ -621,8 +634,21 @@ class KaraokeHandlers:
         )
         pipeline = KaraokePipeline(request, self._settings)
 
+        # Send initial progress message and get its ID
+        initial_msg = await message.answer("⏳ Начинаю обработку...")
+        message_id = initial_msg.message_id
+
         async def _step_progress(msg: str) -> None:
-            await message.answer(msg)
+            # Edit the initial message instead of sending new ones
+            try:
+                await message.bot.edit_message_text(  # type: ignore[union-attr]
+                    text=msg,
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                )
+            except Exception as edit_err:
+                self._logger.warning("Failed to edit message: %s", edit_err)
+                await message.answer(msg)
 
         try:
             result = await pipeline.run(_step_progress, start_from_step=step)
