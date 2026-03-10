@@ -4,6 +4,11 @@ from aiogram.fsm.state import State, StatesGroup
 from pydantic import BaseModel
 
 
+class User(BaseModel):
+    user_id: int
+    user_name: str | None = None
+
+
 class UserRequest(BaseModel):
     user_id: int
     track_id: str

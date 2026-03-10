@@ -4,7 +4,9 @@ import os
 from pathlib import Path
 from typing import List
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
+
+from app.models import User
 
 
 _SENSITIVE_NAME_PARTS = ("TOKEN", "KEY", "SECRET", "JWC")
@@ -15,6 +17,8 @@ class Settings(BaseModel):
     telegram_bot_token: str
     admin_id: int
     tlg_allowed_id: List[int]
+    allowed_users: List[User] = Field(default_factory=list)
+    denied_users: List[User] = Field(default_factory=list)
     log_level: str = "INFO"
     tracks_root_dir: Path
     demucs_model: str = "htdemucs"
@@ -112,7 +116,58 @@ class Settings(BaseModel):
             "correct_transcript_enabled": os.getenv("CORRECT_TRANSCRIPT_ENABLED", "true").lower() in ("true", "1", "yes"),
         }
 
-        return cls(**data)
+        settings = cls(**data)
+        settings._load_users()
+        return settings
+
+    def _get_users_file_path(self) -> Path:
+        """Путь к файлу с пользователями."""
+        return _BASE_DIR / "users.json"
+
+    def _load_users(self) -> None:
+        """Загрузка пользователей из JSON-файла."""
+        users_file = self._get_users_file_path()
+        if not users_file.is_file():
+            return
+        try:
+            data = json.loads(users_file.read_text(encoding="utf-8"))
+            allowed = data.get("allowed_users", [])
+            denied = data.get("denied_users", [])
+            self.allowed_users = [User(**u) for u in allowed]
+            self.denied_users = [User(**u) for u in denied]
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.warning(f"Failed to load users from {users_file}: {e}")
+
+    def save_users(self) -> None:
+        """Сохранение пользователей в JSON-файл."""
+        users_file = self._get_users_file_path()
+        data = {
+            "allowed_users": [u.model_dump() for u in self.allowed_users],
+            "denied_users": [u.model_dump() for u in self.denied_users],
+        }
+        users_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def add_allowed_user(self, user_id: int, user_name: str | None = None) -> None:
+        """Добавить пользователя в список разрешённых."""
+        self.denied_users = [u for u in self.denied_users if u.user_id != user_id]
+        if not any(u.user_id == user_id for u in self.allowed_users):
+            self.allowed_users.append(User(user_id=user_id, user_name=user_name))
+        self.save_users()
+
+    def add_denied_user(self, user_id: int, user_name: str | None = None) -> None:
+        """Добавить пользователя в список отклонённых."""
+        self.allowed_users = [u for u in self.allowed_users if u.user_id != user_id]
+        if not any(u.user_id == user_id for u in self.denied_users):
+            self.denied_users.append(User(user_id=user_id, user_name=user_name))
+        self.save_users()
+
+    def is_user_allowed(self, user_id: int) -> bool:
+        """Проверить, разрешён ли пользователь."""
+        return any(u.user_id == user_id for u in self.allowed_users)
+
+    def is_user_denied(self, user_id: int) -> bool:
+        """Проверить, отклонён ли пользователь."""
+        return any(u.user_id == user_id for u in self.denied_users)
 
 
 def setup_logging(log_level: str) -> None:

@@ -30,16 +30,27 @@ class KaraokeHandlers:
 
     def _is_user_allowed(self, message: types.Message) -> bool:
         """Return True if the sender's user_id is in the allowed list."""
+        user_id = message.from_user.id if message.from_user else None
+        if user_id is None:
+            return False
+        # Проверяем по новому механизму пользователей
+        if self._settings.is_user_denied(user_id):
+            return False
+        if self._settings.is_user_allowed(user_id):
+            return True
+        # Если пользователь не в списках, проверяем старый список tlg_allowed_id
         allowed = self._settings.tlg_allowed_id
         if not allowed:
             return True
-        user_id = message.from_user.id if message.from_user else None
         return user_id in allowed
 
     async def _reject_unauthorized(self, message: types.Message) -> None:
         """Send a rejection notice and log the attempt."""
-        user_id = message.from_user.id if message.from_user else "unknown"
+        user_id = message.from_user.id if message.from_user else None
+        user_name = message.from_user.full_name if message.from_user else None
         self._logger.warning("Unauthorized access attempt from user_id=%s", user_id)
+        # Уведомляем администратора о запросе от неавторизованного пользователя
+        await self._notify_admin_of_unauthorized_access(user_id, user_name)
         await message.answer("⛔ У вас нет доступа к этому боту.")
 
     def _register_handlers(self) -> None:
@@ -246,15 +257,47 @@ class KaraokeHandlers:
             # Continue pipeline from SEPARATE step (after GET_LYRICS)
             await self._run_from_step(message, track_dir, pipeline_state, PipelineStep.SEPARATE, state)
 
+        # ----- Admin callback handler -----
+        @self.router.callback_query(F.data.startswith("admin_"))
+        async def handle_admin_callback(callback: types.CallbackQuery) -> None:
+            """Handle admin decisions for user access."""
+            data = callback.data or ""
+            if data.startswith("admin_allow:"):
+                _, user_id_str, user_name = data.split(":", 2)
+                try:
+                    user_id = int(user_id_str)
+                except ValueError:
+                    await callback.answer("❌ Неверный user_id.", show_alert=True)
+                    return
+                await self._handle_admin_decision(callback, "allow", user_id, user_name)
+            elif data.startswith("admin_deny:"):
+                _, user_id_str, user_name = data.split(":", 2)
+                try:
+                    user_id = int(user_id_str)
+                except ValueError:
+                    await callback.answer("❌ Неверный user_id.", show_alert=True)
+                    return
+                await self._handle_admin_decision(callback, "deny", user_id, user_name)
+            else:
+                await callback.answer("Неизвестная команда.", show_alert=True)
+
         # ----- FSM: waiting for user to select song language -----
         @self.router.callback_query(TrackLangStates.waiting_for_lang, F.data.startswith("lang_choice:"))
         async def handle_lang_choice(callback: types.CallbackQuery, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             # Check access by callback sender (callback.from_user), not by callback.message.from_user (which is the bot)
-            allowed = self._settings.tlg_allowed_id
             caller_id = callback.from_user.id if callback.from_user else None
-            if allowed and caller_id not in allowed:
+            if caller_id is None:
+                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
+                return
+            if self._settings.is_user_denied(caller_id):
                 await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
                 return
+            if not self._settings.is_user_allowed(caller_id):
+                # Проверяем старый список tlg_allowed_id
+                allowed = self._settings.tlg_allowed_id
+                if allowed and caller_id not in allowed:
+                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                    return
 
             lang = (callback.data or "").split(":", 1)[-1]  # "ru" or "en"
             data = await state.get_data()
@@ -462,6 +505,76 @@ class KaraokeHandlers:
                 "Полученное сообщение не является музыкальной композицией. "
                 "Пожалуйста, отправьте аудиофайл длительностью более 1 минуты."
             )
+
+    # ------------------------------------------------------------------
+    # Admin notification helpers
+    # ------------------------------------------------------------------
+
+    async def _notify_admin_of_unauthorized_access(
+        self,
+        user_id: int | None,
+        user_name: str | None,
+    ) -> None:
+        """Send a notification to admin about unauthorized access request."""
+        admin_id = self._settings.admin_id
+        if not admin_id:
+            self._logger.warning("No admin_id configured, skipping admin notification")
+            return
+
+        # Создаём inline-клавиатуру с кнопками "Добавить" и "Отклонить"
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Добавить",
+                        callback_data=f"admin_allow:{user_id}:{user_name or ''}"
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Отклонить",
+                        callback_data=f"admin_deny:{user_id}:{user_name or ''}"
+                    )
+                ]
+            ]
+        )
+
+        try:
+            from aiogram import Bot
+            bot = Bot(token=self._settings.telegram_bot_token)
+            await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"⚠️ *Запрос доступа от неавторизованного пользователя*\n\n"
+                    f"*User ID:* `{user_id}`\n"
+                    f"*Имя:* {user_name or 'не указано'}\n\n"
+                    f"Выберите действие:"
+                ),
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+        except Exception as exc:
+            self._logger.error("Failed to send admin notification: %s", exc)
+
+    async def _handle_admin_decision(
+        self,
+        callback: types.CallbackQuery,
+        decision: str,  # "allow" или "deny"
+        user_id: int,
+        user_name: str | None
+    ) -> None:
+        """Handle admin's decision to allow or deny a user."""
+        if decision == "allow":
+            self._settings.add_allowed_user(user_id, user_name)
+            await callback.answer(f"✅ Пользователь {user_id} добавлен в разрешённые.", show_alert=True)
+        else:
+            self._settings.add_denied_user(user_id, user_name)
+            await callback.answer(f"❌ Пользователь {user_id} добавлен в отклонённые.", show_alert=True)
+
+        # Удаляем клавиатуру из сообщения
+        if callback.message:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Language selection FSM helpers
