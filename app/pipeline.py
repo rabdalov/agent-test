@@ -2,6 +2,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from urllib.parse import quote
 
 from .alignment_service import AlignmentService, save_aligned_result
 from .ass_generator import AssGenerator
@@ -607,9 +608,51 @@ class KaraokePipeline:
         )
 
         self._state.output_file = str(output_path)
+
+        # Формируем ссылку на скачивание, если задан CONTENT_EXTERNAL_URL
+        if self._settings.content_external_url:
+            # Формат ссылки: https://{external_url}/music?getfile={encoded_path}
+            # content_external_url может быть задан как с https://, так и без
+            base_url = self._settings.content_external_url
+            if not base_url.startswith("http://") and not base_url.startswith("https://"):
+                base_url = f"https://{base_url}"
+            
+            # Убираем trailing slash из base_url, если он есть
+            base_url = base_url.rstrip("/")
+            
+            # Проверяем, заканчивается ли base_url на '/music' и при необходимости не добавляем его снова
+            if base_url.endswith("/music"):
+                endpoint = ""
+            else:
+                endpoint = "/music"
+            
+            # Используем имя подкаталога из track_source вместо track_stem
+            track_subdir = ""
+            if self._state.track_source:
+                track_source_path = Path(self._state.track_source)
+                parent_dir = track_source_path.parent
+                track_subdir = parent_dir.name
+            else:
+                # fallback к track_stem если track_source не задан
+                track_subdir = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+            
+            output_filename = output_path.name
+            # Кодируем путь для URL
+            filepath = f"{track_subdir}/{output_filename}"
+            encoded_path = quote(filepath, safe="/")
+            self._state.download_url = (
+                f"{base_url}{endpoint}?getfile={encoded_path}"
+            )
+            logger.info(
+                "RENDER_VIDEO step: download URL formed for track_id=%s: %s",
+                self._request.track_id,
+                self._state.download_url,
+            )
+
         self._save_state()
         logger.info(
-            "RENDER_VIDEO step completed for track_id=%s: output_file='%s'",
+            "RENDER_VIDEO step completed for track_id=%s: output_file='%s', download_url=%s",
             self._request.track_id,
             output_path,
+            self._state.download_url,
         )

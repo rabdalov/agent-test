@@ -48,6 +48,7 @@ class PipelineState(BaseModel):
     aligned_lyrics_file: str | None = None
     ass_file: str | None = None
     output_file: str | None = None
+    download_url: str | None = None
 
 
 class PipelineResult(BaseModel):

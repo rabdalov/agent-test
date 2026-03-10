@@ -651,6 +651,24 @@ class KaraokeHandlers:
     ) -> None:
         """Send the rendered MP4 video to the user, or a text message if unavailable."""
         video_path_str = result.final_video_path
+        download_url: str | None = None
+
+        # Try to read download_url from state.json
+        if video_path_str:
+            video_path = Path(video_path_str)
+            state_path = video_path.parent / "state.json"
+            if state_path.exists():
+                try:
+                    from .models import PipelineState
+                    state = PipelineState.model_validate_json(state_path.read_text(encoding="utf-8"))
+                    download_url = state.download_url
+                except Exception as exc:
+                    self._logger.warning(
+                        "Failed to read download_url from state.json for track_id=%s: %s",
+                        result.track_id,
+                        exc,
+                    )
+
         if video_path_str:
             video_path = Path(video_path_str)
             if video_path.exists():
@@ -664,6 +682,7 @@ class KaraokeHandlers:
                             caption=(
                                 f"🎉 Обработка завершена успешно!\n"
                                 f"track_id: <code>{result.track_id}</code>"
+                                + (f"\n📥 Скачать: <a href='{download_url}'>ссылка</a>" if download_url else "")
                             ),
                             parse_mode="HTML",
                         )
@@ -689,10 +708,12 @@ class KaraokeHandlers:
                 )
 
         # Send completion message regardless of whether video was sent
+        download_url_msg = f"\n📥 Скачать: <a href='{download_url}'>ссылка</a>" if download_url else ""
         await message.answer(
             f"🎉 Обработка завершена успешно!\n"
             f"track_id: <code>{result.track_id}</code>\n"
-            f"Видеофайл: <code>{video_path_str or 'не задан'}</code>",
+            f"Видеофайл: <code>{video_path_str or 'не задан'}</code>"
+            f"{download_url_msg}",
             parse_mode="HTML",
         )
 
