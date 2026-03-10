@@ -1,0 +1,14 @@
+{
+  "allowed_users": [
+    {
+      "user_id": 123,
+      "user_name": "User1"
+    }
+  ],
+  "denied_users": [
+    {
+      "user_id": 456,
+      "user_name": "User2"
+    }
+  ]
+}

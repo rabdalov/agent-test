@@ -1,14 +1,18 @@
 {
   "allowed_users": [
     {
-      "user_id": 123,
-      "user_name": "User1"
+      "user_id": 523593047,
+      "user_name": "Renat_Ab"
+    },
+    {
+      "user_id": 1374395202,
+      "user_name": "Lili"
+    },
+    {
+      "user_id": 353396055,
+      "user_name": "Julse"
     }
   ],
   "denied_users": [
-    {
-      "user_id": 456,
-      "user_name": "User2"
-    }
   ]
 }
