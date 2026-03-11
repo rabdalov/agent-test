@@ -205,7 +205,7 @@ class YouTubeDownloader:
         }
 
         try:
-            def download_audio() -> tuple[Path, dict]:
+            def download_audio() -> tuple[Path, str, dict]:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     # extract_info скачивает аудио и возвращает метаданные
                     info = ydl.extract_info(url, download=True)
@@ -227,9 +227,9 @@ class YouTubeDownloader:
                         if not mp3_files:
                             raise RuntimeError("Скачанный аудиофайл не найден")
                         local_path = mp3_files[0]
-                    return local_path, info
+                    return local_path, safe_title, info
 
-            local_path, info = await asyncio.to_thread(download_audio)
+            local_path, safe_title, info = await asyncio.to_thread(download_audio)
         except yt_dlp.utils.DownloadError as e:
             logger.error(
                 "YouTubeDownloader: failed to download audio for URL %s: %s",
@@ -245,7 +245,6 @@ class YouTubeDownloader:
             raise RuntimeError(f"Ошибка при скачивании аудио: {e}")
 
         # Use normalized title as track_stem for consistency with directory naming
-        # safe_title was computed earlier in this function
         track_stem = safe_title
         # Убедимся, что video_id соответствует извлечённому
         extracted_id = info.get("id")
