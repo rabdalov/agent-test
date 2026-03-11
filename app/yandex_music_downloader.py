@@ -8,6 +8,8 @@ from typing import NamedTuple
 import yandex_music
 from yandex_music import Client
 
+from .utils import normalize_filename
+
 logger = logging.getLogger(__name__)
 
 
@@ -164,11 +166,9 @@ class YandexMusicDownloader:
         # Get track metadata
         title = track.title
         artists = ", ".join(artist.name for artist in track.artists) if track.artists else "Unknown"
-        track_stem = f"{artists} - {title}".replace("/", "-").replace("\\", "-")
-        # Remove invalid filesystem characters
-        track_stem = re.sub(r'[<>:"*?|]', "", track_stem).strip()
-        if not track_stem:
-            track_stem = f"track_{track_id}"
+        track_stem = f"{artists} - {title}"
+        # Apply normalization according to project rules
+        track_stem = normalize_filename(track_stem)
 
         output_dir.mkdir(parents=True, exist_ok=True)
 

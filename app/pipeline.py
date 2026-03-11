@@ -22,6 +22,7 @@ from .models import (
     PipelineStep,
     UserRequest,
 )
+from .utils import normalize_filename
 
 
 class LyricsNotFoundError(Exception):
@@ -354,7 +355,7 @@ class KaraokePipeline:
         stem = Path(source).stem
         self._state.track_source = source
         self._state.track_file_name = Path(source).name
-        self._state.track_stem = stem
+        self._state.track_stem = normalize_filename(stem)
         self._save_state()
         await asyncio.sleep(0)
 
@@ -384,7 +385,8 @@ class KaraokePipeline:
             raise RuntimeError("vocal_file не задан — шаг SEPARATE не был выполнен")
 
         vocal_file = Path(vocal_file_str)
-        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        stem = normalize_filename(raw_stem)
         track_dir = Path(self._request.track_folder)
         output_json = track_dir / f"{stem}_transcription.json"
 
@@ -447,7 +449,8 @@ class KaraokePipeline:
             # Save corrected transcription
             import json
 
-            stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+            raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+            stem = normalize_filename(raw_stem)
             track_dir = Path(self._request.track_folder)
             output_json = track_dir / f"{stem}_transcription_corrected.json"
 
@@ -483,7 +486,8 @@ class KaraokePipeline:
                 self._save_state()
                 return
 
-        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        stem = normalize_filename(raw_stem)
         track_dir = Path(self._request.track_folder)
 
         lyrics_service = LyricsService(
@@ -534,7 +538,8 @@ class KaraokePipeline:
         if not lyrics_path:
             raise RuntimeError("source_lyrics_file не задан — шаг GET_LYRICS не был выполнен")
 
-        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        stem = normalize_filename(raw_stem)
         track_dir = Path(self._request.track_folder)
         output_path = track_dir / f"{stem}.aligned.json"
 
@@ -567,7 +572,8 @@ class KaraokePipeline:
             raise RuntimeError("aligned_lyrics_file не задан — шаг ALIGN не был выполнен")
 
         aligned_path = Path(aligned_path_str)
-        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        stem = normalize_filename(raw_stem)
         track_dir = Path(self._request.track_folder)
         output_ass = track_dir / f"{stem}.ass"
 
@@ -612,7 +618,8 @@ class KaraokePipeline:
         instrumental_path = Path(instrumental_file_str)
         original_path = Path(track_source_str)
         vocal_path = Path(vocal_file_str)
-        stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        stem = normalize_filename(raw_stem)
         track_dir = Path(self._request.track_folder)
         output_path = track_dir / f"{stem}.mp4"
 
@@ -652,19 +659,12 @@ class KaraokePipeline:
             else:
                 endpoint = "/music"
             
-            # Используем имя подкаталога из track_source вместо track_stem
-            track_subdir = ""
-            if self._state.track_source:
-                track_source_path = Path(self._state.track_source)
-                parent_dir = track_source_path.parent
-                track_subdir = parent_dir.name
-            else:
-                # fallback к track_stem если track_source не задан
-                track_subdir = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+            # track_dir всегда равен track_stem (нормализованному)
+            track_dir_name = stem
             
             output_filename = output_path.name
             # Кодируем путь для URL
-            filepath = f"{track_subdir}/{output_filename}"
+            filepath = f"{track_dir_name}/{output_filename}"
             encoded_path = quote(filepath, safe="/")
             self._state.download_url = (
                 f"{base_url}{endpoint}?getfile={encoded_path}"

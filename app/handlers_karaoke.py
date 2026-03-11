@@ -18,6 +18,8 @@ from .config import Settings
 from .models import LyricsStates, PipelineResult, PipelineState, PipelineStatus, PipelineStep, TrackLangStates, UserRequest
 from .pipeline import KaraokePipeline, LyricsNotFoundError, _ORDERED_STEPS
 from .yandex_music_downloader import YandexMusicDownloader
+from .youtube_downloader import YouTubeDownloader
+from .utils import normalize_filename
 
 
 class KaraokeHandlers:
@@ -432,6 +434,11 @@ class KaraokeHandlers:
                 await self._handle_yandex_music_url(message, state, url)
                 return
 
+            # Handle YouTube URL separately
+            if self._is_youtube_url(url):
+                await self._handle_youtube_url(message, state, url)
+                return
+
             self._ensure_tracks_root()
 
             track_id = uuid.uuid4().hex
@@ -445,7 +452,8 @@ class KaraokeHandlers:
             state_path = track_dir / "state.json"
 
             # Download the file by HTTP URL and save locally
-            filename = url_basename if url_basename else "source_file"
+            # Normalize filename for consistency
+            filename = normalize_filename(url_basename) if url_basename else "source_file"
             local_path = track_dir / filename
 
             # Create a temporary PipelineState for error notifications
@@ -1205,20 +1213,13 @@ class KaraokeHandlers:
     ) -> str:
         if artist or title:
             parts = [part for part in [artist, title] if part]
-            base = "-".join(parts)
+            # Используем тот же формат, что и в yandex_music_downloader.py: "artist - title"
+            base = " - ".join(parts)
         else:
             base = Path(original_filename).stem
 
-        base = base.strip()
-        if not base:
-            base = "track"
-
-        normalized = re.sub(r"[^\w\s\-]+", "", base)  # Удаляем спецсимволы, кроме букв/цифр/пробелов/дефиса
-        normalized = re.sub(r"\s+", " ", normalized)  # Сжимаем множественные пробелы в один
-        if not normalized:
-            normalized = base
-
-        return normalized
+        # Применяем нормализацию имени файла согласно правилам
+        return normalize_filename(base)
 
     # ------------------------------------------------------------------
     # URL helpers
@@ -1229,12 +1230,7 @@ class KaraokeHandlers:
         re.IGNORECASE,
     )
 
-    _BLOCKED_HOSTS: tuple[str, ...] = (
-        "youtube.com",
-        "www.youtube.com",
-        "youtu.be",
-        "m.youtube.com",
-    )
+    _BLOCKED_HOSTS: tuple[str, ...] = ()
 
     def _extract_url(self, text: str) -> str | None:
         """Return the first HTTP(S) URL found in *text*, or None.
@@ -1271,6 +1267,22 @@ class KaraokeHandlers:
         except ValueError:
             return False
         return host == "music.yandex.ru" or host.endswith(".music.yandex.ru")
+
+    def _is_youtube_url(self, url: str) -> bool:
+        """Return True if *url* points to YouTube."""
+        try:
+            parsed = urlparse(url)
+            host = parsed.netloc.lower()
+        except ValueError:
+            return False
+        youtube_hosts = (
+            "youtube.com",
+            "www.youtube.com",
+            "youtu.be",
+            "m.youtube.com",
+            "music.youtube.com",
+        )
+        return any(host == h or host.endswith("." + h) for h in youtube_hosts)
 
     async def _handle_yandex_music_url(
         self,
@@ -1413,6 +1425,128 @@ class KaraokeHandlers:
             f"Название: <code>{track_info.track_stem}</code>\n"
             f"Длительность: {int(duration // 60)}:{int(duration % 60):02d}"
             f"{lyrics_msg}",
+            parse_mode="HTML",
+        )
+
+        # Ask for language and continue with pipeline
+        await self._ask_for_lang(message, state, track_id, str(track_dir), pipeline_state)
+
+    async def _handle_youtube_url(
+        self,
+        message: types.Message,
+        state: FSMContext,
+        url: str,
+    ) -> None:
+        """Handle YouTube URL: download audio and proceed with pipeline."""
+        self._ensure_tracks_root()
+
+        user_id: int = message.from_user.id if message.from_user else 0
+        track_id = uuid.uuid4().hex  # generate early for notification
+
+        # Create preliminary PipelineState (without track details)
+        pipeline_state = PipelineState(
+            track_id=track_id,
+            user_id=user_id,
+            status=PipelineStatus.PENDING,
+        )
+        # Send initial notification (reply) and store its ID
+        await self._send_or_edit_notification(
+            message,
+            pipeline_state,
+            f"⏳ Загружаю аудио с YouTube...\nURL: {url}",
+            parse_mode="HTML",
+        )
+        # Update state.json (will be created later when we have track_dir)
+
+        # Initialize YouTube downloader
+        downloader = YouTubeDownloader(quality="best")
+
+        try:
+            # First get video metadata to build directory name
+            meta = await downloader.get_track_info(url)
+        except Exception as exc:
+            self._logger.error(
+                "Failed to get video metadata from YouTube: %s", exc
+            )
+            # Edit notification with error
+            await self._send_or_edit_notification(
+                message,
+                pipeline_state,
+                f"❌ Не удалось получить информацию о видео: {exc}",
+                parse_mode="HTML",
+            )
+            return
+
+        # Check duration (must be at least 1 minute)
+        if meta.duration < 60:
+            await self._send_or_edit_notification(
+                message,
+                pipeline_state,
+                "Полученное видео не является музыкальной композицией "
+                "(длительность менее 1 минуты).",
+                parse_mode="HTML",
+            )
+            return
+
+        # Build track name like in standard flow (using _build_track_name)
+        track_name = self._build_track_name(
+            meta.title or "video",
+            meta.artist,
+            meta.title
+        )
+
+        # Create track directory with normalized name (not UUID!)
+        track_dir = self._tracks_root_dir / track_name
+        track_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Now download audio to the created directory
+            track_info = await downloader.download(url, track_dir)
+        except Exception as exc:
+            self._logger.error(
+                "Failed to download audio from YouTube: %s", exc
+            )
+            await self._send_or_edit_notification(
+                message,
+                pipeline_state,
+                f"❌ Не удалось скачать аудио с YouTube: {exc}",
+                parse_mode="HTML",
+            )
+            return
+
+        # Verify duration again using ffprobe (optional but safe)
+        duration, _, _ = await self._probe_audio(track_info.local_path)
+        if duration is None or duration < 60:
+            await self._send_or_edit_notification(
+                message,
+                pipeline_state,
+                "Полученный аудиофайл не является музыкальной композицией "
+                "(длительность менее 1 минуты или не удалось определить длительность).",
+                parse_mode="HTML",
+            )
+            return
+
+        # Update PipelineState with track details
+        pipeline_state.track_file_name = track_info.local_path.name
+        pipeline_state.track_source = str(track_info.local_path)
+        pipeline_state.track_stem = track_info.track_stem
+
+        state_path = track_dir / "state.json"
+        try:
+            state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._logger.error(
+                "Failed to write state.json for track_id=%s: %s", track_id, exc
+            )
+
+        # Edit notification with success message
+        await self._send_or_edit_notification(
+            message,
+            pipeline_state,
+            f"✅ Аудио загружено с YouTube!\n"
+            f"track_id: <code>{track_id}</code>\n"
+            f"Название: <code>{track_info.track_stem}</code>\n"
+            f"Длительность: {int(duration // 60)}:{int(duration % 60):02d}",
             parse_mode="HTML",
         )
 

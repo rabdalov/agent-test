@@ -33,6 +33,8 @@ class Settings(BaseModel):
     genius_token: str | None = None
     # Yandex Music token for downloading tracks and fetching lyrics (optional)
     yandex_music_token: str | None = None
+    # YouTube download quality preference (e.g., "best", "worst", "192")
+    youtube_download_quality: str = "best"
     # Lyrics providers
     lyrics_enable_genius: bool = True   # Enable Genius API lyrics search
     lyrics_enable_lyrica: bool = False  # Enable LyricaV2 HTTP service lyrics search
@@ -95,6 +97,7 @@ class Settings(BaseModel):
             "speeches_timeout": int(os.getenv("SPEECHES_TIMEOUT", "300")),
             "genius_token": genius_token_raw,
             "yandex_music_token": os.getenv("YANDEX_MUSIC_TOKEN"),
+            "youtube_download_quality": os.getenv("YOUTUBE_DOWNLOAD_QUALITY", "best"),
             "lyrics_enable_genius": os.getenv("LYRICS_ENABLE_GENIUS", "true").lower() in ("true", "1", "yes"),
             "lyrics_enable_lyrica": os.getenv("LYRICS_ENABLE_LYRICA", "false").lower() in ("true", "1", "yes"),
             "lyrics_enable_lyricslib": os.getenv("LYRICS_ENABLE_LYRICSLIB", "false").lower() in ("true", "1", "yes"),
