@@ -54,6 +54,8 @@ class PipelineState(BaseModel):
     ass_file: str | None = None
     output_file: str | None = None
     download_url: str | None = None
+    notification_chat_id: int | None = None  # ID чата для редактирования уведомлений
+    notification_message_id: int | None = None  # ID сообщения для редактирования уведомлений
 
 
 class PipelineResult(BaseModel):

@@ -50,7 +50,7 @@ class KaraokeHandlers:
         user_name = message.from_user.full_name if message.from_user else None
         self._logger.warning("Unauthorized access attempt from user_id=%s", user_id)
         # Уведомляем администратора о запросе от неавторизованного пользователя
-        await self._notify_admin_of_unauthorized_access(user_id, user_name)
+        await self._notify_admin_of_unauthorized_access(message, user_id, user_name)
         await message.answer("⛔ У вас нет доступа к этому боту.")
 
     def _register_handlers(self) -> None:
@@ -252,7 +252,12 @@ class KaraokeHandlers:
             # Clear FSM state
             await state.clear()
 
-            await message.answer("✅ Текст песни получен. Продолжаю обработку...")
+            # Edit notification with success message (or send new)
+            await self._send_or_edit_notification(
+                message,
+                pipeline_state,
+                "✅ Текст песни получен. Продолжаю обработку...",
+            )
 
             # Continue pipeline from SEPARATE step (after GET_LYRICS)
             await self._run_from_step(message, track_dir, pipeline_state, PipelineStep.SEPARATE, state)
@@ -383,7 +388,7 @@ class KaraokeHandlers:
             except LyricsNotFoundError:
                 if callback.message:
                     await self._ask_for_lyrics(
-                        callback.message, state, track_id, track_dir  # type: ignore[arg-type]
+                        callback.message, state, track_id, track_dir, pipeline_state  # type: ignore[arg-type]
                     )
                 return
 
@@ -443,6 +448,13 @@ class KaraokeHandlers:
             filename = url_basename if url_basename else "source_file"
             local_path = track_dir / filename
 
+            # Create a temporary PipelineState for error notifications
+            error_state = PipelineState(
+                track_id=track_id,
+                user_id=user_id,
+                status=PipelineStatus.PENDING,
+            )
+
             try:
                 async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
                     async with client.stream("GET", url) as response:
@@ -454,18 +466,22 @@ class KaraokeHandlers:
                 self._logger.error(
                     "Failed to download file for track %s from %s: %s", track_id, url, exc
                 )
-                await message.answer(
+                await self._send_or_edit_notification(
+                    message,
+                    error_state,
                     "Не удалось скачать файл по указанной ссылке. "
-                    "Пожалуйста, проверьте ссылку и попробуйте ещё раз."
+                    "Пожалуйста, проверьте ссылку и попробуйте ещё раз.",
                 )
                 return
             except OSError as exc:
                 self._logger.error(
                     "Failed to save downloaded file for track %s: %s", track_id, exc
                 )
-                await message.answer(
+                await self._send_or_edit_notification(
+                    message,
+                    error_state,
                     "Не удалось сохранить скачанный файл. "
-                    "Пожалуйста, попробуйте ещё раз позже."
+                    "Пожалуйста, попробуйте ещё раз позже.",
                 )
                 return
 
@@ -485,16 +501,20 @@ class KaraokeHandlers:
                     "Failed to update state file for track %s: %s", track_id, exc
                 )
 
-            await message.answer(
+            # Send notification (reply) and store its ID in pipeline_state_url
+            await self._send_or_edit_notification(
+                message,
+                pipeline_state_url,
                 "Файл скачан и принят.\n"
                 f"track_id: <code>{track_id}</code>\n"
                 f"track_name: <code>{track_name}</code>\n"
                 f"Путь к файлу: <code>{local_path}</code>",
                 parse_mode="HTML",
             )
+            # Update state.json with notification IDs (already done in _send_or_edit_notification)
 
             # Ask the user for the song language before starting the pipeline
-            await self._ask_for_lang(message, state, track_id, str(track_dir))
+            await self._ask_for_lang(message, state, track_id, str(track_dir), pipeline_state_url)
 
         @self.router.message()
         async def handle_non_audio(message: types.Message) -> None:  # type: ignore[unused-ignore]
@@ -512,6 +532,7 @@ class KaraokeHandlers:
 
     async def _notify_admin_of_unauthorized_access(
         self,
+        message: types.Message,
         user_id: int | None,
         user_name: str | None,
     ) -> None:
@@ -538,9 +559,7 @@ class KaraokeHandlers:
         )
 
         try:
-            from aiogram import Bot
-            bot = Bot(token=self._settings.telegram_bot_token)
-            await bot.send_message(
+            await message.bot.send_message(
                 chat_id=admin_id,
                 text=(
                     f"⚠️ *Запрос доступа от неавторизованного пользователя*\n\n"
@@ -586,6 +605,7 @@ class KaraokeHandlers:
         state: FSMContext,
         track_id: str,
         track_folder: str,
+        pipeline_state: PipelineState | None = None,
     ) -> None:
         """Enter FSM state waiting_for_lang and send an inline keyboard to select song language."""
         await state.set_state(TrackLangStates.waiting_for_lang)
@@ -600,11 +620,43 @@ class KaraokeHandlers:
                 ]
             ]
         )
-        await message.answer(
-            "🎵 На каком языке исполняется эта песня?\n\n"
-            "Выберите язык исполнения:",
-            reply_markup=keyboard,
-        )
+        text = "🎵 На каком языке исполняется эта песня?\n\nВыберите язык исполнения:"
+        
+        # If we have a pipeline_state with notification IDs, edit that notification
+        if pipeline_state and pipeline_state.notification_chat_id and pipeline_state.notification_message_id:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=pipeline_state.notification_chat_id,
+                    message_id=pipeline_state.notification_message_id,
+                    text=text,
+                    reply_markup=keyboard,
+                )
+                return
+            except Exception as exc:
+                self._logger.warning(
+                    "Failed to edit notification for language selection track_id=%s: %s. Sending new.",
+                    track_id,
+                    exc,
+                )
+                # Fall through to sending new message
+        
+        # Otherwise send a new reply message
+        sent = await message.reply(text, reply_markup=keyboard)
+        # If pipeline_state is provided, update it with new notification IDs
+        if pipeline_state:
+            pipeline_state.notification_chat_id = sent.chat.id
+            pipeline_state.notification_message_id = sent.message_id
+            # Update state.json
+            track_dir = Path(track_folder)
+            state_path = track_dir / "state.json"
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error(
+                    "Failed to update state.json with notification IDs for track_id=%s: %s",
+                    track_id,
+                    exc,
+                )
 
     # ------------------------------------------------------------------
     # Lyrics FSM helpers
@@ -616,6 +668,7 @@ class KaraokeHandlers:
         state: FSMContext,
         track_id: str,
         track_dir: Path,
+        pipeline_state: PipelineState | None = None,
     ) -> None:
         """Transition user to FSM state waiting_for_lyrics and ask to send lyrics."""
         await state.set_state(LyricsStates.waiting_for_lyrics)
@@ -623,10 +676,27 @@ class KaraokeHandlers:
         self._logger.info(
             "LyricsNotFoundError for track_id=%s — requesting lyrics from user", track_id
         )
-        await message.answer(
-            "🎵 Не удалось автоматически найти текст песни.\n\n"
-            "Пожалуйста, пришли полный текст песни в следующем сообщении."
-        )
+        text = "🎵 Не удалось автоматически найти текст песни.\n\nПожалуйста, пришли полный текст песни в следующем сообщении."
+        
+        # If we have a pipeline_state with notification IDs, edit that notification
+        if pipeline_state and pipeline_state.notification_chat_id and pipeline_state.notification_message_id:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=pipeline_state.notification_chat_id,
+                    message_id=pipeline_state.notification_message_id,
+                    text=text,
+                )
+                return
+            except Exception as exc:
+                self._logger.warning(
+                    "Failed to edit notification for lyrics request track_id=%s: %s. Sending new.",
+                    track_id,
+                    exc,
+                )
+                # Fall through to sending new message
+        
+        # Otherwise send a new reply message
+        await message.reply(text)
 
     def _find_track_dir_by_id(self, track_id: str) -> Path | None:
         """Scan tracks root for a track_dir whose state.json has matching track_id."""
@@ -747,26 +817,74 @@ class KaraokeHandlers:
         )
         pipeline = KaraokePipeline(request, self._settings)
 
-        # Send initial progress message and get its ID
-        initial_msg = await message.answer("⏳ Начинаю обработку...")
-        message_id = initial_msg.message_id
+        # If state already has notification IDs, edit that notification; otherwise send new reply
+        if state.notification_chat_id and state.notification_message_id:
+            # Edit existing notification to show pipeline start
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=state.notification_chat_id,
+                    message_id=state.notification_message_id,
+                    text="⏳ Начинаю обработку...",
+                )
+                # Use existing IDs for progress editing
+                notification_chat_id = state.notification_chat_id
+                notification_message_id = state.notification_message_id
+            except Exception as edit_err:
+                self._logger.warning(
+                    "Failed to edit existing notification for track_id=%s: %s. Sending new.",
+                    state.track_id,
+                    edit_err,
+                )
+                # Fallback: send new reply and store IDs
+                initial_msg = await message.reply("⏳ Начинаю обработку...")
+                notification_chat_id = initial_msg.chat.id
+                notification_message_id = initial_msg.message_id
+                state.notification_chat_id = notification_chat_id
+                state.notification_message_id = notification_message_id
+                # Update state.json
+                state_path = track_dir / "state.json"
+                try:
+                    state_path.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+                except OSError as exc:
+                    self._logger.error(
+                        "Failed to update state.json with notification IDs for track_id=%s: %s",
+                        state.track_id,
+                        exc,
+                    )
+        else:
+            # No existing notification, send new reply and store IDs
+            initial_msg = await message.reply("⏳ Начинаю обработку...")
+            notification_chat_id = initial_msg.chat.id
+            notification_message_id = initial_msg.message_id
+            state.notification_chat_id = notification_chat_id
+            state.notification_message_id = notification_message_id
+            # Update state.json
+            state_path = track_dir / "state.json"
+            try:
+                state_path.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error(
+                    "Failed to update state.json with notification IDs for track_id=%s: %s",
+                    state.track_id,
+                    exc,
+                )
 
         async def _step_progress(msg: str) -> None:
-            # Edit the initial message instead of sending new ones
+            # Edit the notification message stored in state
             try:
-                await message.bot.edit_message_text(  # type: ignore[union-attr]
+                await message.bot.edit_message_text(
+                    chat_id=notification_chat_id,
+                    message_id=notification_message_id,
                     text=msg,
-                    chat_id=message.chat.id,
-                    message_id=message_id,
                 )
             except Exception as edit_err:
-                self._logger.warning("Failed to edit message: %s", edit_err)
+                self._logger.warning("Failed to edit notification for track_id=%s: %s", state.track_id, edit_err)
                 await message.answer(msg)
 
         try:
             result = await pipeline.run(_step_progress, start_from_step=step)
         except LyricsNotFoundError:
-            await self._ask_for_lyrics(message, fsm_context, state.track_id, track_dir)
+            await self._ask_for_lyrics(message, fsm_context, state.track_id, track_dir, state)
             return
 
         if result.status == PipelineStatus.COMPLETED:
@@ -778,6 +896,93 @@ class KaraokeHandlers:
                 f"Причина: {result.error_message}",
                 parse_mode="HTML",
             )
+
+    # ------------------------------------------------------------------
+    # Notification editing helpers
+    # ------------------------------------------------------------------
+
+    async def _edit_notification(
+        self,
+        pipeline_state: PipelineState,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        parse_mode: str = "HTML",
+    ) -> None:
+        """Edit the notification message stored in pipeline_state.
+        
+        If pipeline_state does not have notification_chat_id and notification_message_id,
+        or editing fails, fall back to sending a new message (but we cannot know where to send).
+        In that case, log a warning and do nothing (caller should handle).
+        """
+        if not pipeline_state.notification_chat_id or not pipeline_state.notification_message_id:
+            self._logger.warning(
+                "Cannot edit notification for track_id=%s: missing chat_id or message_id",
+                pipeline_state.track_id,
+            )
+            return
+        
+        # We cannot edit without a message context; this method should be called only when
+        # we have access to a message object (e.g., from a handler). Since we don't have
+        # message here, we cannot edit. This method is currently unused; we should use
+        # _send_or_edit_notification instead.
+        self._logger.warning(
+            "_edit_notification called without message context for track_id=%s; cannot edit",
+            pipeline_state.track_id,
+        )
+        # Do nothing; caller should handle fallback
+
+    async def _send_or_edit_notification(
+        self,
+        message: types.Message,
+        pipeline_state: PipelineState,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        parse_mode: str = "HTML",
+    ) -> None:
+        """Send a new notification (reply to user's message) and store its ID in pipeline_state,
+        or edit existing notification if already present.
+        
+        Returns the sent/edited message (or None if failed).
+        """
+        # If we already have a notification message, edit it
+        if pipeline_state.notification_chat_id and pipeline_state.notification_message_id:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=pipeline_state.notification_chat_id,
+                    message_id=pipeline_state.notification_message_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                )
+                return
+            except Exception as exc:
+                self._logger.warning(
+                    "Failed to edit existing notification for track_id=%s: %s. Sending new.",
+                    pipeline_state.track_id,
+                    exc,
+                )
+                # Fall through to sending new message
+        
+        # Send new reply message
+        sent = await message.reply(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+        pipeline_state.notification_chat_id = sent.chat.id
+        pipeline_state.notification_message_id = sent.message_id
+        # Update state.json
+        track_dir = self._find_track_dir_by_id(pipeline_state.track_id)
+        if track_dir:
+            state_path = track_dir / "state.json"
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error(
+                    "Failed to update state.json with notification IDs for track_id=%s: %s",
+                    pipeline_state.track_id,
+                    exc,
+                )
 
     # ------------------------------------------------------------------
     # Video delivery helper
@@ -911,14 +1116,6 @@ class KaraokeHandlers:
 
         user_id: int = message.from_user.id if message.from_user else 0
 
-        await message.answer(
-            "Аудиофайл принят.\n"
-            f"track_id: <code>{track_id}</code>\n"
-            f"track_name: <code>{track_name}</code>\n"
-            f"Путь к файлу: <code>{final_path}</code>",
-            parse_mode="HTML",
-        )
-
         # Save preliminary PipelineState so that the language callback can find the track
         pipeline_state = PipelineState(
             track_id=track_id,
@@ -934,8 +1131,20 @@ class KaraokeHandlers:
         except OSError as exc:
             self._logger.error("Failed to write state.json for track_id=%s: %s", track_id, exc)
 
+        # Send notification (reply) and store its ID in pipeline_state
+        await self._send_or_edit_notification(
+            message,
+            pipeline_state,
+            "Аудиофайл принят.\n"
+            f"track_id: <code>{track_id}</code>\n"
+            f"track_name: <code>{track_name}</code>\n"
+            f"Путь к файлу: <code>{final_path}</code>",
+            parse_mode="HTML",
+        )
+        # Update state.json with notification IDs (already done in _send_or_edit_notification)
+
         # Ask the user for the song language before starting the pipeline
-        await self._ask_for_lang(message, state, track_id, str(track_dir))
+        await self._ask_for_lang(message, state, track_id, str(track_dir), pipeline_state)
 
     async def _probe_audio(self, path: Path) -> tuple[float | None, str | None, str | None]:
         cmd = [
@@ -1073,11 +1282,22 @@ class KaraokeHandlers:
         self._ensure_tracks_root()
 
         user_id: int = message.from_user.id if message.from_user else 0
+        track_id = uuid.uuid4().hex  # generate early for notification
 
-        await message.answer(
-            f"⏳ Загружаю трек с Яндекс Музыки...\n"
-            f"URL: {url}"
+        # Create preliminary PipelineState (without track details)
+        pipeline_state = PipelineState(
+            track_id=track_id,
+            user_id=user_id,
+            status=PipelineStatus.PENDING,
         )
+        # Send initial notification (reply) and store its ID
+        await self._send_or_edit_notification(
+            message,
+            pipeline_state,
+            f"⏳ Загружаю трек с Яндекс Музыки...\nURL: {url}",
+            parse_mode="HTML",
+        )
+        # Update state.json (will be created later when we have track_dir)
 
         # Initialize Yandex Music downloader
         downloader = YandexMusicDownloader(token=self._settings.yandex_music_token)
@@ -1089,8 +1309,12 @@ class KaraokeHandlers:
             self._logger.error(
                 "Failed to get track info from Yandex Music: %s", exc
             )
-            await message.answer(
-                f"❌ Не удалось получить информацию о треке: {exc}"
+            # Edit notification with error
+            await self._send_or_edit_notification(
+                message,
+                pipeline_state,
+                f"❌ Не удалось получить информацию о треке: {exc}",
+                parse_mode="HTML",
             )
             return
 
@@ -1112,25 +1336,29 @@ class KaraokeHandlers:
             self._logger.error(
                 "Failed to download track from Yandex Music: %s", exc
             )
-            await message.answer(
-                f"❌ Не удалось скачать трек с Яндекс Музыки: {exc}"
+            await self._send_or_edit_notification(
+                message,
+                pipeline_state,
+                f"❌ Не удалось скачать трек с Яндекс Музыки: {exc}",
+                parse_mode="HTML",
             )
             return
 
         # Check duration
         duration, _, _ = await self._probe_audio(track_info.local_path)
         if duration is None or duration < 60:
-            await message.answer(
+            await self._send_or_edit_notification(
+                message,
+                pipeline_state,
                 f"Полученный трек не является музыкальной композицией "
-                "(длительность менее 1 минуты или не удалось определить длительность)."
+                "(длительность менее 1 минуты или не удалось определить длительность).",
+                parse_mode="HTML",
             )
             return
 
-        # Generate track_id for PipelineState (UUID, not used for directory name)
-        track_id = uuid.uuid4().hex
-
         # Try to fetch lyrics/LRC from Yandex Music
         lyrics_saved = False
+        lyrics_path = None
         try:
             lyrics_result = await downloader.fetch_lyrics(track_info.track_id)
 
@@ -1160,15 +1388,10 @@ class KaraokeHandlers:
             )
             # Continue without lyrics - pipeline will request from user if needed
 
-        # Save PipelineState
-        pipeline_state = PipelineState(
-            track_id=track_id,
-            user_id=user_id,
-            status=PipelineStatus.PENDING,
-            track_file_name=track_info.local_path.name,
-            track_source=str(track_info.local_path),
-            track_stem=track_info.track_stem,
-        )
+        # Update PipelineState with track details
+        pipeline_state.track_file_name = track_info.local_path.name
+        pipeline_state.track_source = str(track_info.local_path)
+        pipeline_state.track_stem = track_info.track_stem
         if lyrics_saved:
             pipeline_state.source_lyrics_file = lyrics_path
 
@@ -1180,9 +1403,11 @@ class KaraokeHandlers:
                 "Failed to write state.json for track_id=%s: %s", track_id, exc
             )
 
-        # Notify user
+        # Edit notification with success message
         lyrics_msg = "\nТекст с таймкодами получен с Яндекс Музыки!" if lyrics_saved else ""
-        await message.answer(
+        await self._send_or_edit_notification(
+            message,
+            pipeline_state,
             f"✅ Трек загружен с Яндекс Музыки!\n"
             f"track_id: <code>{track_id}</code>\n"
             f"Название: <code>{track_info.track_stem}</code>\n"
@@ -1192,4 +1417,4 @@ class KaraokeHandlers:
         )
 
         # Ask for language and continue with pipeline
-        await self._ask_for_lang(message, state, track_id, str(track_dir))
+        await self._ask_for_lang(message, state, track_id, str(track_dir), pipeline_state)
