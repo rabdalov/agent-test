@@ -71,3 +71,8 @@ class LyricsStates(StatesGroup):
 
 class TrackLangStates(StatesGroup):
     waiting_for_lang = State()
+
+
+class SearchStates(StatesGroup):
+    waiting_for_query = State()
+    waiting_for_selection = State()

@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .config import Settings
-from .models import LyricsStates, PipelineResult, PipelineState, PipelineStatus, PipelineStep, TrackLangStates, UserRequest
+from .models import LyricsStates, PipelineResult, PipelineState, PipelineStatus, PipelineStep, SearchStates, TrackLangStates, UserRequest
 from .pipeline import KaraokePipeline, LyricsNotFoundError, _ORDERED_STEPS
 from .yandex_music_downloader import YandexMusicDownloader
 from .youtube_downloader import YouTubeDownloader
@@ -194,6 +194,200 @@ class KaraokeHandlers:
                 await self._reject_unauthorized(message)
                 return
             await self._handle_step_command(message, PipelineStep.RENDER_VIDEO, state)
+
+        @self.router.message(Command("search"))
+        async def handle_search(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+            await state.set_state(SearchStates.waiting_for_query)
+            await message.answer(
+                "🔍 Введите информацию для поиска в формате Артист - Песня.\n"
+                "Например: Полина Гагарина - Shallow"
+            )
+
+        # ----- FSM: waiting for search query -----
+        @self.router.message(SearchStates.waiting_for_query, F.text)
+        async def handle_search_query(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+            query = (message.text or "").strip()
+            if not query:
+                await message.answer("Запрос не может быть пустым. Пожалуйста, введите название трека.")
+                return
+
+            await message.answer("🔍 Ищу трек...")
+
+            # Парсим запрос: ожидаем формат "Артист - Песня"
+            artist = None
+            title = None
+            if " - " in query:
+                parts = query.split(" - ", 1)
+                artist = parts[0].strip()
+                title = parts[1].strip()
+            else:
+                # Если нет разделителя, считаем всё за title
+                title = query
+
+            # Сначала ищем в локальном хранилище
+            local_results = await self._search_local(artist, title)
+
+            # Если не найдено локально — ищем на Яндекс Музыке
+            yandex_results: list[dict[str, Any]] = []
+            if not local_results and self._settings.yandex_music_token:
+                yandex_results = await self._search_yandex(query)
+
+            # Объединяем результаты (локальные + яндекс)
+            all_results = local_results + yandex_results
+
+            if not all_results:
+                await message.answer(
+                    "🔍 Трек не найден ни в локальном хранилище, ни на Яндекс Музыке.\n"
+                    "Попробуйте изменить запрос или добавить трек другим способом."
+                )
+                await state.clear()
+                return
+
+            # Ограничиваем топ-5
+            all_results = all_results[:5]
+
+            # Сохраняем результаты в state
+            await state.update_data(search_results=all_results, search_query=query)
+            await state.set_state(SearchStates.waiting_for_selection)
+
+            # Формируем сообщение с результатами
+            result_text = "🎵 Найденные треки:\n\n"
+            for i, track in enumerate(all_results, 1):
+                source_label = "📁 Локально" if track.get("source") == "local" else "🎧 Яндекс Музыка"
+                artist_name = track.get("artist", "Unknown")
+                title_name = track.get("title", "Unknown")
+                result_text += f"{i}. {artist_name} - {title_name}\n   {source_label}\n\n"
+
+            result_text += "Выберите номер трека для обработки:"
+
+            # Создаём inline клавиатуру с номерами (горизонтально) + кнопка "Я" для Яндекс Музыки
+            keyboard_buttons = [
+                InlineKeyboardButton(text=str(i), callback_data=f"search_select:{i-1}")
+                for i in range(1, len(all_results) + 1)
+            ]
+            # Добавляем кнопку "Я" для поиска на Яндекс Музыке
+            keyboard_buttons.append(
+                InlineKeyboardButton(text="Я", callback_data=f"search_yandex:{query}")
+            )
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[keyboard_buttons])
+
+            await message.answer(result_text, reply_markup=keyboard)
+
+        # ----- FSM: waiting for search selection -----
+        @self.router.callback_query(SearchStates.waiting_for_selection, F.data.startswith("search_select:"))
+        async def handle_search_selection(callback: types.CallbackQuery, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            # Проверка доступа
+            caller_id = callback.from_user.id if callback.from_user else None
+            if caller_id is None:
+                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
+                return
+            if self._settings.is_user_denied(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+            if not self._settings.is_user_allowed(caller_id):
+                allowed = self._settings.tlg_allowed_id
+                if allowed and caller_id not in allowed:
+                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                    return
+
+            await callback.answer()
+
+            # Получаем индекс выбранного трека
+            try:
+                index = int(callback.data.split(":")[1])
+            except (IndexError, ValueError):
+                await callback.answer("❌ Неверный выбор.", show_alert=True)
+                return
+
+            # Получаем данные поиска
+            data = await state.get_data()
+            search_results: list[dict[str, Any]] = data.get("search_results", [])
+
+            if index < 0 or index >= len(search_results):
+                await callback.answer("❌ Неверный номер трека.", show_alert=True)
+                return
+
+            selected_track = search_results[index]
+            await state.clear()
+
+            # Обрабатываем выбранный трек
+            if selected_track.get("source") == "local":
+                # Локальный трек — запускаем пайплайн с шага SEPARATE
+                await self._handle_local_track(callback.message, selected_track, callback.from_user.id if callback.from_user else 0)  # type: ignore[union-attr]
+            else:
+                # Яндекс Музыка — запускаем полный пайплайн
+                await self._handle_yandex_track_search_result(callback.message, selected_track, state, callback.from_user.id if callback.from_user else 0)  # type: ignore[union-attr]
+
+        # Обработчик кнопки "Я" для поиска на Яндекс Музыке
+        @self.router.callback_query(SearchStates.waiting_for_selection, F.data.startswith("search_yandex:"))
+        async def handle_search_yandex(callback: types.CallbackQuery, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            # Проверка доступа
+            caller_id = callback.from_user.id if callback.from_user else None
+            if caller_id is None:
+                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
+                return
+            if self._settings.is_user_denied(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+            if not self._settings.is_user_allowed(caller_id):
+                allowed = self._settings.tlg_allowed_id
+                if allowed and caller_id not in allowed:
+                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                    return
+
+            await callback.answer()
+
+            # Получаем запрос из callback_data
+            query = callback.data.split(":", 1)[1] if ":" in callback.data else ""
+            if not query:
+                await callback.answer("❌ Не удалось получить запрос.", show_alert=True)
+                return
+
+            await state.clear()
+
+            # Ищем на Яндекс Музыке
+            if not self._settings.yandex_music_token:
+                await callback.message.answer("❌ Токен Яндекс Музыки не настроен.")  # type: ignore[union-attr]
+                return
+
+            await callback.message.answer("🔍 Ищу на Яндекс Музыке...")  # type: ignore[union-attr]
+
+            yandex_results = await self._search_yandex(query)
+
+            if not yandex_results:
+                await callback.message.answer("🔍 Трек не найден на Яндекс Музыке.")  # type: ignore[union-attr]
+                return
+
+            # Ограничиваем топ-5
+            yandex_results = yandex_results[:5]
+
+            # Сохраняем результаты в state
+            await state.update_data(search_results=yandex_results, search_query=query)
+            await state.set_state(SearchStates.waiting_for_selection)
+
+            # Формируем сообщение с результатами
+            result_text = "🎵 Найденные треки на Яндекс Музыке:\n\n"
+            for i, track in enumerate(yandex_results, 1):
+                artist_name = track.get("artist", "Unknown")
+                title_name = track.get("title", "Unknown")
+                result_text += f"{i}. {artist_name} - {title_name}\n   🎧 Яндекс Музыка\n\n"
+
+            result_text += "Выберите номер трека для обработки:"
+
+            # Создаём inline клавиатуру (горизонтально)
+            keyboard_buttons = [
+                InlineKeyboardButton(text=str(i), callback_data=f"search_select:{i-1}")
+                for i in range(1, len(yandex_results) + 1)
+            ]
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[keyboard_buttons])
+
+            await callback.message.answer(result_text, reply_markup=keyboard)  # type: ignore[union-attr]
 
         # ----- FSM: waiting for user to supply lyrics text -----
         @self.router.message(LyricsStates.waiting_for_lyrics, F.text)
@@ -1430,6 +1624,468 @@ class KaraokeHandlers:
 
         # Ask for language and continue with pipeline
         await self._ask_for_lang(message, state, track_id, str(track_dir), pipeline_state)
+
+    # ------------------------------------------------------------------
+    # Search functionality
+    # ------------------------------------------------------------------
+
+    async def _search_local(self, artist: str | None, title: str | None) -> list[dict[str, Any]]:
+        """Search for tracks in local storage (TRACKS_ROOT_DIR).
+
+        Scans the directory 1 level deep.
+        - Filters by extension (.mp3, .flac, .mp4, .avi)
+        - Excludes files containing (Instrumental) or (Vocal)
+        - Searches by simultaneous presence of BOTH artist AND title
+        - Normalizes text: removes punctuation, case-insensitive
+        - Only includes folders with state.json
+        - Returns track_source from state.json
+        - Sorts by creation date (descending), top-5
+        """
+        if not self._tracks_root_dir.exists():
+            return []
+
+        results: list[dict[str, Any]] = []
+        audio_extensions = (".mp3", ".flac", ".mp4", ".avi")
+        
+        # Нормализуем artist и title: убираем знаки препинания, приводим к нижнему регистру
+        def normalize(text: str) -> str:
+            # Удаляем знаки препинания и приводим к нижнему регистру
+            return re.sub(r'[^\w\s]', '', text).lower().strip()
+        
+        normalized_artist = normalize(artist) if artist else None
+        normalized_title = normalize(title) if title else None
+        
+        # Сканируем директорию 1 уровень вглубь
+        try:
+            for item in self._tracks_root_dir.iterdir():
+                if not item.is_dir():
+                    continue
+                
+                # Проверяем наличие state.json в папке
+                state_path = item / "state.json"
+                if not state_path.exists():
+                    continue
+                
+                # Читаем state.json
+                state_data = None
+                try:
+                    state_data = json.loads(state_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                
+                # Получаем track_source из state.json
+                track_source = state_data.get("track_source")
+                if not track_source:
+                    continue
+                
+                # Проверяем файл по расширению
+                source_path = Path(track_source)
+                if not source_path.exists() or source_path.suffix.lower() not in audio_extensions:
+                    continue
+                
+                # Исключаем файлы содержащие (Instrumental) или (Vocal)
+                filename_lower = source_path.name.lower()
+                if "(instrumental)" in filename_lower or "(vocal)" in filename_lower:
+                    continue
+                
+                # Получаем имя файла без расширения для анализа
+                file_stem = source_path.stem
+                
+                # Нормализуем имя файла для сравнения
+                normalized_stem = normalize(file_stem)
+                
+                # Проверяем строгое соответствие: и artist И title должны присутствовать
+                if normalized_artist and normalized_title:
+                    # Оба должны присутствовать в нормализованном имени файла
+                    if normalized_artist in normalized_stem and normalized_title in normalized_stem:
+                        # Извлекаем artist и title из state.json или из имени файла
+                        track_artist = state_data.get("track_artist") or state_data.get("artist") or ""
+                        track_title = state_data.get("track_title") or state_data.get("title") or file_stem
+                        
+                        # Пробуем получить дату создания файла
+                        try:
+                            ctime = source_path.stat().st_ctime
+                        except OSError:
+                            ctime = 0
+                        
+                        results.append({
+                            "source": "local",
+                            "file_path": str(source_path),
+                            "track_source": track_source,
+                            "artist": track_artist,
+                            "title": track_title,
+                            "ctime": ctime,
+                            "state": state_data,
+                            "track_dir": str(item),
+                        })
+        except OSError as exc:
+            self._logger.error("Error scanning local storage: %s", exc)
+
+        # Сортируем по времени создания (убывание) и берём топ-5
+        results.sort(key=lambda x: x.get("ctime", 0), reverse=True)
+        return results[:5]
+
+    async def _search_yandex(self, query: str) -> list[dict[str, Any]]:
+        """Search for tracks on Yandex Music.
+
+        Returns top-5 results with metadata (title, artist, album).
+        """
+        if not self._settings.yandex_music_token:
+            return []
+
+        try:
+            downloader = YandexMusicDownloader(token=self._settings.yandex_music_token)
+            client = downloader._get_client()
+
+            # Выполняем поиск
+            search_results = client.search(query=query)
+
+            results: list[dict[str, Any]] = []
+
+            # Обрабатываем результаты поиска
+            if search_results and hasattr(search_results, 'tracks'):
+                tracks = search_results.tracks
+                if tracks and hasattr(tracks, 'results'):
+                    for track in tracks.results[:5]:
+                        artists = ", ".join(artist.name for artist in track.artists) if track.artists else "Unknown"
+                        results.append({
+                            "source": "yandex",
+                            "track_id": track.id,
+                            "title": track.title,
+                            "artist": artists,
+                            "album": track.album.title if track.album else None,
+                        })
+
+            return results[:5]
+
+        except Exception as exc:
+            self._logger.error("Error searching Yandex Music: %s", exc)
+            return []
+
+    async def _handle_local_track(
+        self,
+        message: types.Message,
+        track_info: dict[str, Any],
+        user_id: int,
+    ) -> None:
+        """Handle a local track selection with smart resume logic.
+
+        Logic:
+        1. If state.json exists:
+           - If status=COMPLETED: restart from RENDER_VIDEO step only
+           - If status=FAILED: continue from last failed step (auto-resume)
+           - Otherwise: continue from current step
+        2. If no state.json:
+           - Copy file to target folder with normalization
+           - Check if file already exists in target folder
+           - Run full pipeline
+        """
+        file_path = track_info.get("file_path")
+        track_dir = track_info.get("track_dir")
+
+        if not file_path or not track_dir:
+            await message.answer("❌ Не удалось определить путь к файлу.")
+            return
+
+        track_dir_path = Path(track_dir)
+        file_path_obj = Path(file_path)
+
+        # Проверяем наличие state.json в папке с найденным треком
+        state_path = track_dir_path / "state.json"
+        pipeline_state: PipelineState | None = None
+        track_id: str
+
+        if state_path.exists():
+            try:
+                pipeline_state = PipelineState.model_validate_json(
+                    state_path.read_text(encoding="utf-8")
+                )
+                track_id = pipeline_state.track_id
+            except Exception:
+                track_id = uuid.uuid4().hex
+                pipeline_state = None
+        else:
+            track_id = uuid.uuid4().hex
+
+        # Логика обработки в зависимости от наличия и статуса state.json
+        if pipeline_state is not None and state_path.exists():
+            # === СЛУЧАЙ 1: Есть state.json - используем существующую логику ===
+            await self._handle_local_track_with_state(
+                message, track_dir_path, pipeline_state, track_id, user_id
+            )
+        else:
+            # === СЛУЧАЙ 2: Нет state.json - создаём с нуля ===
+            await self._handle_local_track_new(
+                message, file_path_obj, track_id, user_id
+            )
+
+    async def _handle_local_track_with_state(
+        self,
+        message: types.Message,
+        track_dir_path: Path,
+        pipeline_state: PipelineState,
+        track_id: str,
+        user_id: int,
+    ) -> None:
+        """Handle local track when state.json already exists."""
+        # Используем существующий track_dir из state.json
+        target_dir = track_dir_path
+
+        # Определяем стартовый шаг на основе статуса
+        start_step: PipelineStep | None = None
+        status = pipeline_state.status
+
+        # === ПРОВЕРКА: Если COMPLETED и output_file существует - отправляем ссылку без запуска пайплайна ===
+        if status == PipelineStatus.COMPLETED and pipeline_state.output_file:
+            output_file_path = Path(pipeline_state.output_file)
+            if output_file_path.exists():
+                # Файл существует - используем ту же логику формирования ссылки, что и в _send_result_video()
+                download_url: str | None = pipeline_state.download_url
+
+                # Если download_url не сохранён в state.json, формируем его по аналогии с pipeline.py
+                if not download_url:
+                    base_url = self._settings.content_external_url
+                    if not base_url.startswith("http://") and not base_url.startswith("https://"):
+                        base_url = f"https://{base_url}"
+                    base_url = base_url.rstrip("/")
+                    endpoint = "" if base_url.endswith("/music") else "/music"
+                    filepath = str(output_file_path)
+                    from urllib.parse import quote
+                    encoded_path = quote(filepath, safe="/")
+                    download_url = f"{base_url}{endpoint}?getfile={encoded_path}"
+
+                # Отправляем сообщение со ссылкой на готовый файл
+                download_url_msg = f"\n📥 Скачать: <a href='{download_url}'>ссылка</a>" if download_url else ""
+                await message.answer(
+                    f"🎉 Видео уже готово!\n"
+                    f"track_id: <code>{track_id}</code>\n"
+                    f"Файл: <code>{output_file_path.name}</code>"
+                    f"{download_url_msg}",
+                    parse_mode="HTML",
+                )
+                return
+            # Если файл не существует - продолжаем с обычной логикой (перезапуск RENDER_VIDEO)
+
+        if status == PipelineStatus.COMPLETED:
+            # Если пайплайн завершён - повторяем только RENDER_VIDEO
+            start_step = PipelineStep.RENDER_VIDEO
+            status_msg = f"▶️ Пайплайн уже завершён. Повторяю шаг RENDER_VIDEO..."
+        elif status == PipelineStatus.FAILED:
+            # Если пайплайн упал - продолжаем с последнего шага
+            # Pайплайн сам определит шаг на основе current_step
+            start_step = None  # Авто-продолжение
+            status_msg = f"▶️ Пайпайн был прерван. Продолжаю с последнего шага..."
+        else:
+            # Для других статусов - тоже авто-продолжение
+            start_step = None
+            status_msg = f"▶️ Продолжаю обработку локального трека..."
+
+        # Создаём UserRequest
+        source_file = pipeline_state.track_source or str(target_dir / pipeline_state.track_file_name) if pipeline_state.track_file_name else ""
+        request = UserRequest(
+            user_id=user_id,
+            track_id=track_id,
+            source_type="file",
+            source_url_or_file_path=source_file,
+            track_folder=str(target_dir),
+        )
+        pipeline = KaraokePipeline(request, self._settings)
+
+        await message.answer(
+            f"{status_msg}\n"
+            f"Папка: <code>{target_dir.name}</code>",
+            parse_mode="HTML",
+        )
+
+        # Отправляем начальное сообщение
+        initial_msg = await message.reply("⏳ Начинаю обработку...")
+        notification_chat_id = initial_msg.chat.id
+        notification_message_id = initial_msg.message_id
+
+        async def _step_progress(msg: str) -> None:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=notification_chat_id,
+                    message_id=notification_message_id,
+                    text=msg,
+                )
+            except Exception as edit_err:
+                self._logger.warning("Failed to edit notification: %s", edit_err)
+                await message.answer(msg)
+
+        try:
+            result = await pipeline.run(_step_progress, start_from_step=start_step)
+        except LyricsNotFoundError:
+            await message.answer(
+                "🎵 Не удалось автоматически найти текст песни.\n\n"
+                "Пожалуйста, пришлите полный текст песни в следующем сообщении."
+            )
+            pipeline_state.track_id = track_id
+            try:
+                state_path = target_dir / "state.json"
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error(
+                    "Failed to update state.json with track_id for track_id=%s: %s",
+                    track_id, exc,
+                )
+            return
+
+        if result.status == PipelineStatus.COMPLETED:
+            await self._send_result_video(message, result)
+        else:
+            await message.answer(
+                f"💔 Обработка завершена с ошибкой.\n"
+                f"Причина: {result.error_message}",
+                parse_mode="HTML",
+            )
+
+    async def _handle_local_track_new(
+        self,
+        message: types.Message,
+        file_path_obj: Path,
+        track_id: str,
+        user_id: int,
+    ) -> None:
+        """Handle local track when there's no existing state.json."""
+        # Используем нормализацию имени файла
+        track_stem = normalize_filename(file_path_obj.stem)
+
+        # Определяем целевую папку
+        target_dir = self._tracks_root_dir / track_stem
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Проверяем, находится ли файл уже в целевой папке
+        target_file = target_dir / file_path_obj.name
+
+        if file_path_obj.exists() and file_path_obj != target_file:
+            # Файл в другом месте - копируем в целевую папку
+            if not target_file.exists():
+                try:
+                    shutil.copy2(file_path_obj, target_file)
+                    self._logger.info(
+                        "Copied file from %s to %s", file_path_obj, target_file
+                    )
+                except OSError as exc:
+                    self._logger.error(
+                        "Failed to copy file from %s to %s: %s",
+                        file_path_obj, target_file, exc,
+                    )
+                    await message.answer(
+                        f"❌ Не удалось скопировать файл в целевую папку: {exc}"
+                    )
+                    return
+            actual_file_path = target_file
+        elif target_file.exists():
+            # Файл уже в целевой папке
+            actual_file_path = target_file
+        else:
+            # Файл не найден - используем исходный путь
+            actual_file_path = file_path_obj
+
+        # Создаём новый PipelineState
+        pipeline_state = PipelineState(
+            track_id=track_id,
+            user_id=user_id,
+            status=PipelineStatus.PENDING,
+            track_source=str(actual_file_path),
+            track_file_name=actual_file_path.name,
+            track_stem=track_stem,
+        )
+
+        # Сохраняем state.json
+        state_path = target_dir / "state.json"
+        try:
+            state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._logger.error(
+                "Failed to write state.json for track_id=%s: %s",
+                track_id, exc,
+            )
+
+        # Создаём UserRequest
+        request = UserRequest(
+            user_id=user_id,
+            track_id=track_id,
+            source_type="file",
+            source_url_or_file_path=str(actual_file_path),
+            track_folder=str(target_dir),
+        )
+        pipeline = KaraokePipeline(request, self._settings)
+
+        await message.answer(
+            f"▶️ Запускаю полный пайплайн для локального трека...\n"
+            f"Файл: <code>{actual_file_path.name}</code>\n"
+            f"Папка: <code>{target_dir.name}</code>",
+            parse_mode="HTML",
+        )
+
+        # Отправляем начальное сообщение
+        initial_msg = await message.reply("⏳ Начинаю обработку...")
+        notification_chat_id = initial_msg.chat.id
+        notification_message_id = initial_msg.message_id
+
+        async def _step_progress(msg: str) -> None:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=notification_chat_id,
+                    message_id=notification_message_id,
+                    text=msg,
+                )
+            except Exception as edit_err:
+                self._logger.warning("Failed to edit notification: %s", edit_err)
+                await message.answer(msg)
+
+        try:
+            # Запускаем полный пайплайн (без start_from_step)
+            result = await pipeline.run(_step_progress)
+        except LyricsNotFoundError:
+            await message.answer(
+                "🎵 Не удалось автоматически найти текст песни.\n\n"
+                "Пожалуйста, пришлите полный текст песни в следующем сообщении."
+            )
+            pipeline_state.track_id = track_id
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error(
+                    "Failed to update state.json with track_id for track_id=%s: %s",
+                    track_id, exc,
+                )
+            return
+
+        if result.status == PipelineStatus.COMPLETED:
+            await self._send_result_video(message, result)
+        else:
+            await message.answer(
+                f"💔 Обработка завершена с ошибкой.\n"
+                f"Причина: {result.error_message}",
+                parse_mode="HTML",
+            )
+
+    async def _handle_yandex_track_search_result(
+        self,
+        message: types.Message,
+        track_info: dict[str, Any],
+        state: FSMContext,
+        user_id: int,
+    ) -> None:
+        """Handle a Yandex Music track selection - download and run full pipeline."""
+        yandex_track_id = track_info.get("track_id")
+        if not yandex_track_id:
+            await message.answer("❌ Не удалось определить ID трека.")
+            return
+
+        # Создаём URL для скачивания
+        track_url = f"https://music.yandex.ru/track/{yandex_track_id}"
+
+        await message.answer(
+            f"⏳ Загружаю трек с Яндекс Музыки...\n"
+            f"{track_info.get('artist', '')} - {track_info.get('title', '')}",
+        )
+
+        # Запускаем загрузку через существующий обработчик
+        await self._handle_yandex_music_url(message, state, track_url)
 
     async def _handle_youtube_url(
         self,
