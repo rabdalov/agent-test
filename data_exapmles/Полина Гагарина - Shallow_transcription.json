@@ -1,0 +1,700 @@
+{
+  "duration": 295.0530625,
+  "language": "ru",
+  "text": "Tell me something, girl Are you happy and that's more than one? Or do you need more? Is there something else you're searching for? I've fallen In all the good times I find myself Tell me something, boy СПОКОЙНАЯ МУЗЫКА АМОБИЛЬНЫЙ In a shallow, shallow, shallow. In a shallow, shallow. We're far from a shallow now. Tell me something, girl. Are you happy in this modern world? Tell me something, boy. Aren't you tired trying to feel that way? In the shallow, shallow, shallow In the shallow, shallow We're far from the shallow",
+  "segments": [
+    {
+      "id": 1,
+      "avg_logprob": -0.2354934070081938,
+      "compression_ratio": 1.366412213740458,
+      "end": 44.87,
+      "no_speech_prob": 0.5225636959075928,
+      "seek": 1601,
+      "start": 16.01,
+      "temperature": 0.0,
+      "text": " Tell me something, girl Are you happy and that's more than one? Or do you need more? Is there something else you're searching for? I've fallen In all the good times I find myself",
+      "tokens": [
+        5115,
+        385,
+        746,
+        11,
+        2013,
+        2014,
+        291,
+        2055,
+        293,
+        300,
+        311,
+        544,
+        813,
+        472,
+        30,
+        1610,
+        360,
+        291,
+        643,
+        544,
+        30,
+        1119,
+        456,
+        746,
+        1646,
+        291,
+        434,
+        10808,
+        337,
+        30,
+        286,
+        600,
+        11547,
+        682,
+        439,
+        264,
+        665,
+        1413,
+        286,
+        915,
+        2059
+      ]
+    },
+    {
+      "id": 2,
+      "avg_logprob": -0.6637368102868398,
+      "compression_ratio": 0.7419354838709677,
+      "end": 68.87,
+      "no_speech_prob": 0.7760492563247681,
+      "seek": 4489,
+      "start": 64.21,
+      "temperature": 0.0,
+      "text": " Tell me something, boy",
+      "tokens": [
+        5115,
+        385,
+        746,
+        11,
+        3237
+      ]
+    },
+    {
+      "id": 3,
+      "avg_logprob": -0.644407590230306,
+      "compression_ratio": 0.8,
+      "end": 96.31,
+      "no_speech_prob": 0.43723851442337036,
+      "seek": 7121,
+      "start": 94.89,
+      "temperature": 0.0,
+      "text": " СПОКОЙНАЯ МУЗЫКА",
+      "tokens": [
+        2933,
+        9223,
+        7876,
+        8169,
+        7876,
+        37123,
+        28729,
+        25007
+      ]
+    },
+    {
+      "id": 4,
+      "avg_logprob": -0.9958249872381036,
+      "compression_ratio": 0.65625,
+      "end": 106.66,
+      "no_speech_prob": 0.3654196858406067,
+      "seek": 10068,
+      "start": 105.26,
+      "temperature": 0.0,
+      "text": " АМОБИЛЬНЫЙ",
+      "tokens": [
+        3450,
+        10626,
+        7876,
+        18172,
+        10276,
+        14854,
+        37796,
+        6371,
+        16214,
+        37123
+      ]
+    },
+    {
+      "id": 5,
+      "avg_logprob": -0.275691303046974,
+      "compression_ratio": 1.4174757281553398,
+      "end": 156.97,
+      "no_speech_prob": 0.49849042296409607,
+      "seek": 13099,
+      "start": 130.99,
+      "temperature": 0.0,
+      "text": " In a shallow, shallow, shallow. In a shallow, shallow. We're far from a shallow now. Tell me something, girl. Are you happy in this modern world?",
+      "tokens": [
+        682,
+        257,
+        20488,
+        11,
+        20488,
+        11,
+        20488,
+        13,
+        682,
+        257,
+        20488,
+        11,
+        20488,
+        13,
+        492,
+        434,
+        1400,
+        490,
+        257,
+        20488,
+        586,
+        13,
+        5115,
+        385,
+        746,
+        11,
+        2013,
+        13,
+        2014,
+        291,
+        2055,
+        294,
+        341,
+        4363,
+        1002,
+        30
+      ]
+    },
+    {
+      "id": 6,
+      "avg_logprob": -0.5158942727481618,
+      "compression_ratio": 0.9166666666666666,
+      "end": 167.61,
+      "no_speech_prob": 0.5526705980300903,
+      "seek": 15847,
+      "start": 158.47,
+      "temperature": 0.0,
+      "text": " Tell me something, boy. Aren't you tired trying to feel that way?",
+      "tokens": [
+        5115,
+        385,
+        746,
+        11,
+        3237,
+        13,
+        15464,
+        380,
+        291,
+        5868,
+        1382,
+        281,
+        841,
+        300,
+        636,
+        30
+      ]
+    },
+    {
+      "id": 7,
+      "avg_logprob": -0.46484847758945663,
+      "compression_ratio": 1.826086956521739,
+      "end": 222.25,
+      "no_speech_prob": 0.46092119812965393,
+      "seek": 21147,
+      "start": 211.47,
+      "temperature": 0.0,
+      "text": " In the shallow, shallow, shallow In the shallow, shallow We're far from the shallow",
+      "tokens": [
+        682,
+        264,
+        20488,
+        11,
+        20488,
+        11,
+        20488,
+        682,
+        264,
+        20488,
+        11,
+        20488,
+        492,
+        434,
+        1400,
+        490,
+        264,
+        20488
+      ]
+    }
+  ],
+  "usage": null,
+  "words": [
+    {
+      "end": 16.77,
+      "start": 16.01,
+      "word": " Tell"
+    },
+    {
+      "end": 17.13,
+      "start": 16.77,
+      "word": " me"
+    },
+    {
+      "end": 17.87,
+      "start": 17.13,
+      "word": " something,"
+    },
+    {
+      "end": 19.27,
+      "start": 18.93,
+      "word": " girl"
+    },
+    {
+      "end": 21.83,
+      "start": 19.27,
+      "word": " Are"
+    },
+    {
+      "end": 22.07,
+      "start": 21.83,
+      "word": " you"
+    },
+    {
+      "end": 22.73,
+      "start": 22.07,
+      "word": " happy"
+    },
+    {
+      "end": 23.09,
+      "start": 22.73,
+      "word": " and"
+    },
+    {
+      "end": 23.41,
+      "start": 23.09,
+      "word": " that's"
+    },
+    {
+      "end": 23.75,
+      "start": 23.41,
+      "word": " more"
+    },
+    {
+      "end": 24.41,
+      "start": 23.75,
+      "word": " than"
+    },
+    {
+      "end": 25.19,
+      "start": 24.41,
+      "word": " one?"
+    },
+    {
+      "end": 26.69,
+      "start": 26.47,
+      "word": " Or"
+    },
+    {
+      "end": 27.13,
+      "start": 26.69,
+      "word": " do"
+    },
+    {
+      "end": 27.41,
+      "start": 27.13,
+      "word": " you"
+    },
+    {
+      "end": 27.91,
+      "start": 27.41,
+      "word": " need"
+    },
+    {
+      "end": 29.33,
+      "start": 27.91,
+      "word": " more?"
+    },
+    {
+      "end": 31.83,
+      "start": 31.65,
+      "word": " Is"
+    },
+    {
+      "end": 32.11,
+      "start": 31.83,
+      "word": " there"
+    },
+    {
+      "end": 32.63,
+      "start": 32.11,
+      "word": " something"
+    },
+    {
+      "end": 33.05,
+      "start": 32.63,
+      "word": " else"
+    },
+    {
+      "end": 33.45,
+      "start": 33.05,
+      "word": " you're"
+    },
+    {
+      "end": 34.01,
+      "start": 33.45,
+      "word": " searching"
+    },
+    {
+      "end": 35.17,
+      "start": 34.01,
+      "word": " for?"
+    },
+    {
+      "end": 37.29,
+      "start": 36.21,
+      "word": " I've"
+    },
+    {
+      "end": 38.81,
+      "start": 37.29,
+      "word": " fallen"
+    },
+    {
+      "end": 41.35,
+      "start": 38.81,
+      "word": " In"
+    },
+    {
+      "end": 41.79,
+      "start": 41.35,
+      "word": " all"
+    },
+    {
+      "end": 42.11,
+      "start": 41.79,
+      "word": " the"
+    },
+    {
+      "end": 42.37,
+      "start": 42.11,
+      "word": " good"
+    },
+    {
+      "end": 42.99,
+      "start": 42.37,
+      "word": " times"
+    },
+    {
+      "end": 43.29,
+      "start": 42.99,
+      "word": " I"
+    },
+    {
+      "end": 43.87,
+      "start": 43.29,
+      "word": " find"
+    },
+    {
+      "end": 44.87,
+      "start": 43.87,
+      "word": " myself"
+    },
+    {
+      "end": 65.61,
+      "start": 64.21,
+      "word": " Tell"
+    },
+    {
+      "end": 67.01,
+      "start": 65.61,
+      "word": " me"
+    },
+    {
+      "end": 67.73,
+      "start": 67.01,
+      "word": " something,"
+    },
+    {
+      "end": 68.87,
+      "start": 68.87,
+      "word": " boy"
+    },
+    {
+      "end": 96.29,
+      "start": 94.89,
+      "word": " СПОКОЙНАЯ"
+    },
+    {
+      "end": 96.31,
+      "start": 96.29,
+      "word": " МУЗЫКА"
+    },
+    {
+      "end": 106.66,
+      "start": 105.25999999999999,
+      "word": " АМОБИЛЬНЫЙ"
+    },
+    {
+      "end": 131.81,
+      "start": 130.99,
+      "word": " In"
+    },
+    {
+      "end": 132.15,
+      "start": 131.81,
+      "word": " a"
+    },
+    {
+      "end": 132.53,
+      "start": 132.15,
+      "word": " shallow,"
+    },
+    {
+      "end": 133.29,
+      "start": 132.81,
+      "word": " shallow,"
+    },
+    {
+      "end": 134.95,
+      "start": 133.47,
+      "word": " shallow."
+    },
+    {
+      "end": 136.79,
+      "start": 136.55,
+      "word": " In"
+    },
+    {
+      "end": 137.19,
+      "start": 136.79,
+      "word": " a"
+    },
+    {
+      "end": 138.49,
+      "start": 137.19,
+      "word": " shallow,"
+    },
+    {
+      "end": 139.51,
+      "start": 138.49,
+      "word": " shallow."
+    },
+    {
+      "end": 140.95,
+      "start": 140.33,
+      "word": " We're"
+    },
+    {
+      "end": 141.09,
+      "start": 140.95,
+      "word": " far"
+    },
+    {
+      "end": 141.61,
+      "start": 141.09,
+      "word": " from"
+    },
+    {
+      "end": 141.89,
+      "start": 141.61,
+      "word": " a"
+    },
+    {
+      "end": 142.75,
+      "start": 141.89,
+      "word": " shallow"
+    },
+    {
+      "end": 144.67,
+      "start": 142.75,
+      "word": " now."
+    },
+    {
+      "end": 149.25,
+      "start": 148.81,
+      "word": " Tell"
+    },
+    {
+      "end": 149.59,
+      "start": 149.25,
+      "word": " me"
+    },
+    {
+      "end": 150.41,
+      "start": 149.59,
+      "word": " something,"
+    },
+    {
+      "end": 151.63,
+      "start": 151.63,
+      "word": " girl."
+    },
+    {
+      "end": 154.31,
+      "start": 153.99,
+      "word": " Are"
+    },
+    {
+      "end": 154.61,
+      "start": 154.31,
+      "word": " you"
+    },
+    {
+      "end": 155.19,
+      "start": 154.61,
+      "word": " happy"
+    },
+    {
+      "end": 155.57,
+      "start": 155.19,
+      "word": " in"
+    },
+    {
+      "end": 155.85,
+      "start": 155.57,
+      "word": " this"
+    },
+    {
+      "end": 156.59,
+      "start": 155.85,
+      "word": " modern"
+    },
+    {
+      "end": 156.97,
+      "start": 156.59,
+      "word": " world?"
+    },
+    {
+      "end": 159.25,
+      "start": 158.47,
+      "word": " Tell"
+    },
+    {
+      "end": 159.59,
+      "start": 159.25,
+      "word": " me"
+    },
+    {
+      "end": 160.41,
+      "start": 159.59,
+      "word": " something,"
+    },
+    {
+      "end": 162.21,
+      "start": 161.71,
+      "word": " boy."
+    },
+    {
+      "end": 164.35,
+      "start": 164.15,
+      "word": " Aren't"
+    },
+    {
+      "end": 164.81,
+      "start": 164.35,
+      "word": " you"
+    },
+    {
+      "end": 165.07,
+      "start": 164.81,
+      "word": " tired"
+    },
+    {
+      "end": 165.51,
+      "start": 165.07,
+      "word": " trying"
+    },
+    {
+      "end": 165.81,
+      "start": 165.51,
+      "word": " to"
+    },
+    {
+      "end": 166.31,
+      "start": 165.81,
+      "word": " feel"
+    },
+    {
+      "end": 166.85,
+      "start": 166.31,
+      "word": " that"
+    },
+    {
+      "end": 167.61,
+      "start": 166.85,
+      "word": " way?"
+    },
+    {
+      "end": 211.77,
+      "start": 211.47,
+      "word": " In"
+    },
+    {
+      "end": 212.11,
+      "start": 211.77,
+      "word": " the"
+    },
+    {
+      "end": 212.49,
+      "start": 212.11,
+      "word": " shallow,"
+    },
+    {
+      "end": 213.25,
+      "start": 212.75,
+      "word": " shallow,"
+    },
+    {
+      "end": 215.23,
+      "start": 215.23,
+      "word": " shallow"
+    },
+    {
+      "end": 216.73,
+      "start": 215.23,
+      "word": " In"
+    },
+    {
+      "end": 217.19,
+      "start": 216.73,
+      "word": " the"
+    },
+    {
+      "end": 218.37,
+      "start": 217.19,
+      "word": " shallow,"
+    },
+    {
+      "end": 220.25,
+      "start": 218.37,
+      "word": " shallow"
+    },
+    {
+      "end": 220.91,
+      "start": 220.25,
+      "word": " We're"
+    },
+    {
+      "end": 221.01,
+      "start": 220.91,
+      "word": " far"
+    },
+    {
+      "end": 221.47,
+      "start": 221.01,
+      "word": " from"
+    },
+    {
+      "end": 221.85,
+      "start": 221.47,
+      "word": " the"
+    },
+    {
+      "end": 222.25,
+      "start": 221.85,
+      "word": " shallow"
+    }
+  ]
+}

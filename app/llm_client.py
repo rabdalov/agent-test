@@ -1,18 +1,26 @@
 """LLM client for interacting with OpenRouter API."""
 
 import logging
+import os
 import socket
 from typing import Any
+from urllib.parse import urlparse
 
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
 
-def _log_network_diagnostics() -> None:
+def _log_network_diagnostics(api_url: str | None = None) -> None:
     """Log network diagnostics for debugging connection issues."""
     try:
-        hostname = "api.openrouter.ai"
+        # Extract hostname from URL or use default
+        if api_url:
+            parsed_url = urlparse(api_url)
+            hostname = parsed_url.hostname or "api.openrouter.ai"
+        else:
+            hostname = "api.openrouter.ai"
+            
         logger.debug("Network diagnostics: resolving %s", hostname)
         ip_address = socket.gethostbyname(hostname)
         logger.debug("Network diagnostics: %s resolved to %s", hostname, ip_address)
@@ -29,7 +37,7 @@ class LLMClient:
         self,
         api_key: str | None,
         model: str = "qwen/qwen3-next-80b-a3b-instruct:free",
-        api_url: str = "https://api.openrouter.ai/v1",
+        api_url: str = os.getenv("OPENROUTER_API", "https://api.openrouter.ai/v1"),
         timeout: int = 120,
     ) -> None:
         """Initialize LLM client.
@@ -60,13 +68,13 @@ class LLMClient:
             timeout,
         )
         # Log initial network diagnostics
-        _log_network_diagnostics()
+        _log_network_diagnostics(api_url)
 
     async def complete(
         self,
         prompt: str,
         system_prompt: str | None = None,
-        temperature: float = 0.3,
+        temperature: float = 0.1,
         max_tokens: int = 4096,
     ) -> str:
         """Send a completion request to the LLM.
@@ -153,14 +161,14 @@ class LLMClient:
                 self._model,
             )
             # Log network diagnostics
-            _log_network_diagnostics()
+            _log_network_diagnostics(self._api_url)
             raise RuntimeError(f"LLM request failed: {exc}") from exc
 
     async def complete_json(
         self,
         prompt: str,
         system_prompt: str | None = None,
-        temperature: float = 0.3,
+        temperature: float = 0.1,
     ) -> dict[str, Any]:
         """Send a completion request and parse JSON response.
 

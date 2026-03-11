@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -398,6 +399,10 @@ class KaraokePipeline:
         )
 
         self._state.transcribe_json_file = str(output_json)
+        
+        # Clean up the transcription file to remove unnecessary information
+        self._cleanup_transcription(output_json)
+        
         self._save_state()
 
     async def _step_correct_transcribe(self) -> None:
@@ -681,4 +686,42 @@ class KaraokePipeline:
             self._request.track_id,
             output_path,
             self._state.download_url,
+        )
+
+    def _cleanup_transcription(self, transcription_path: Path) -> None:
+        """Clean up transcription JSON to remove unnecessary information.
+        
+        Keeps only required fields: duration, language, segments, words
+        Segments are cleaned to keep only id, start, end, text fields.
+        Words section is kept as is without changes.
+        """
+        # Read the transcription file
+        with open(transcription_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Create cleaned data with only required fields
+        cleaned_data = {
+            "duration": data.get("duration"),
+            "language": data.get("language"),
+            "segments": [],
+            "words": data.get("words", [])
+        }
+        
+        # Clean up segments to keep only required fields
+        for segment in data.get("segments", []):
+            cleaned_segment = {
+                "id": segment.get("id"),
+                "start": segment.get("start"),
+                "end": segment.get("end"),
+                "text": segment.get("text")
+            }
+            cleaned_data["segments"].append(cleaned_segment)
+        
+        # Write cleaned data back to file
+        with open(transcription_path, 'w', encoding='utf-8') as f:
+            json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
+        
+        logger.info(
+            "Transcription cleaned up for track_id=%s: kept only required fields",
+            self._request.track_id
         )

@@ -94,7 +94,7 @@ class CorrectTranscriptService:
             corrected_json_str = await self._llm_client.complete_json(
                 prompt=prompt,
                 system_prompt=_SYSTEM_PROMPT,
-                temperature=0.3,
+                temperature=0.1,
             )
 
             # Validate the response has the expected structure
