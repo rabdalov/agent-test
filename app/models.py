@@ -17,8 +17,18 @@ class UserRequest(BaseModel):
     track_folder: str
 
 
+class SourceType(str, Enum):
+    """Тип источника трека для шага DOWNLOAD."""
+    TELEGRAM_FILE = "telegram_file"   # Файл, загруженный через Telegram
+    LOCAL_FILE = "local_file"         # Локальный файл (из поиска или файловой системы)
+    HTTP_URL = "http_url"             # Произвольный HTTP(S) URL
+    YANDEX_MUSIC = "yandex_music"     # Ссылка на Яндекс Музыку
+    YOUTUBE = "youtube"               # Ссылка на YouTube
+
+
 class PipelineStep(str, Enum):
     DOWNLOAD = "DOWNLOAD"
+    ASK_LANGUAGE = "ASK_LANGUAGE"
     GET_LYRICS = "GET_LYRICS"
     SEPARATE = "SEPARATE"
     TRANSCRIBE = "TRANSCRIBE"
@@ -26,11 +36,13 @@ class PipelineStep(str, Enum):
     ALIGN = "ALIGN"
     GENERATE_ASS = "GENERATE_ASS"
     RENDER_VIDEO = "RENDER_VIDEO"
+    SEND_VIDEO = "SEND_VIDEO"
 
 
 class PipelineStatus(str, Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
+    WAITING_FOR_INPUT = "WAITING_FOR_INPUT"  # Ожидание ввода от пользователя (например, выбор языка)
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
@@ -41,6 +53,12 @@ class PipelineState(BaseModel):
     current_step: PipelineStep | None = None
     status: PipelineStatus = PipelineStatus.PENDING
     error_message: str | None = None
+    # Тип источника трека (для унифицированного шага DOWNLOAD)
+    source_type: SourceType | None = None
+    # Исходный URL или путь к файлу (для шага DOWNLOAD)
+    source_url: str | None = None
+    # Telegram file_id (для source_type=TELEGRAM_FILE)
+    telegram_file_id: str | None = None
     track_file_name: str | None = None
     track_source: str | None = None
     track_stem: str | None = None

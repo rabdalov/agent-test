@@ -1,10 +1,13 @@
 import asyncio
 import json
 import logging
+import shutil
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import quote
 
+import httpx
 from aiogram import Bot
 
 from .alignment_service import AlignmentService, save_aligned_result
@@ -21,6 +24,7 @@ from .models import (
     PipelineState,
     PipelineStatus,
     PipelineStep,
+    SourceType,
     UserRequest,
 )
 from .utils import normalize_filename
@@ -30,10 +34,17 @@ class LyricsNotFoundError(Exception):
     """Raised when lyrics cannot be found automatically."""
     pass
 
+
+class WaitingForInputError(Exception):
+    """Raised when pipeline needs to pause and wait for user input (e.g., language selection)."""
+    pass
+
+
 logger = logging.getLogger(__name__)
 
 _STEP_LABELS: dict[PipelineStep, str] = {
     PipelineStep.DOWNLOAD: "скачивание",
+    PipelineStep.ASK_LANGUAGE: "выбор языка",
     PipelineStep.GET_LYRICS: "получение текста",
     PipelineStep.SEPARATE: "разделение дорожек",
     PipelineStep.TRANSCRIBE: "транскрипция",
@@ -41,10 +52,12 @@ _STEP_LABELS: dict[PipelineStep, str] = {
     PipelineStep.ALIGN: "выравнивание",
     PipelineStep.GENERATE_ASS: "генерация субтитров",
     PipelineStep.RENDER_VIDEO: "рендеринг видео",
+    PipelineStep.SEND_VIDEO: "отправка результата",
 }
 
 _ORDERED_STEPS: list[PipelineStep] = [
     PipelineStep.DOWNLOAD,
+    PipelineStep.ASK_LANGUAGE,
     PipelineStep.GET_LYRICS,
     PipelineStep.SEPARATE,
     PipelineStep.TRANSCRIBE,
@@ -52,11 +65,13 @@ _ORDERED_STEPS: list[PipelineStep] = [
     PipelineStep.ALIGN,
     PipelineStep.GENERATE_ASS,
     PipelineStep.RENDER_VIDEO,
+    PipelineStep.SEND_VIDEO,
 ]
 
 # Required artifact fields that must be set before a given step can run.
 # If a step is absent, no prerequisite artifacts are needed.
 _STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
+    PipelineStep.ASK_LANGUAGE: ["track_source", "track_stem"],
     PipelineStep.GET_LYRICS: ["track_file_name", "track_stem"],
     PipelineStep.SEPARATE: ["track_source"],
     PipelineStep.TRANSCRIBE: ["vocal_file"],
@@ -64,19 +79,23 @@ _STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
     PipelineStep.ALIGN: ["source_lyrics_file", "transcribe_json_file"],
     PipelineStep.GENERATE_ASS: ["aligned_lyrics_file"],
     PipelineStep.RENDER_VIDEO: ["ass_file", "vocal_file", "instrumental_file"],
+    PipelineStep.SEND_VIDEO: ["output_file"],
 }
 
 
 class KaraokePipeline:
-    def __init__(self, request: UserRequest, settings: Settings) -> None:
-        self._request = request
+    def __init__(
+        self,
+        settings: Settings,
+        state: PipelineState,
+        track_folder: str,
+        bot: Bot | None = None,
+    ) -> None:
         self._settings = settings
-        self._state = PipelineState(
-            track_id=request.track_id,
-            user_id=request.user_id,
-            status=PipelineStatus.PENDING,
-        )
-        demucs_output_dir = str(Path(request.track_folder).parent)
+        self._state = state
+        self._track_folder = Path(track_folder)
+        self._bot = bot
+        demucs_output_dir = str(self._track_folder.parent)
         self._demucs_service = DemucsService(
             model=settings.demucs_model,
             output_format=settings.demucs_output_format,
@@ -88,66 +107,85 @@ class KaraokePipeline:
     # Public API
     # ------------------------------------------------------------------
 
+    @classmethod
+    def create_new(
+        cls,
+        settings: Settings,
+        user_id: int,
+        source_type: SourceType,
+        source_url: str,
+        track_folder: str,
+        bot: Bot | None = None,
+        telegram_file_id: str | None = None,
+    ) -> "KaraokePipeline":
+        """Create a new pipeline with a fresh PipelineState."""
+        track_id = uuid.uuid4().hex
+        state = PipelineState(
+            track_id=track_id,
+            user_id=user_id,
+            status=PipelineStatus.PENDING,
+            source_type=source_type,
+            source_url=source_url,
+            telegram_file_id=telegram_file_id,
+        )
+        pipeline = cls(settings=settings, state=state, track_folder=track_folder, bot=bot)
+        pipeline._save_state()
+        return pipeline
+
+    @classmethod
+    def from_state(
+        cls,
+        settings: Settings,
+        state: PipelineState,
+        track_folder: str,
+        bot: Bot | None = None,
+    ) -> "KaraokePipeline":
+        """Create a pipeline from an existing PipelineState."""
+        return cls(settings=settings, state=state, track_folder=track_folder, bot=bot)
+
     async def run(
         self,
         progress_callback: Callable[[str], Awaitable[None]],
         start_from_step: PipelineStep | None = None,
-        chat_id: int | None = None,
-        message_id: int | None = None,
     ) -> PipelineResult:
         """Run the pipeline.
 
         Resolution order for the starting step:
         1. If *start_from_step* is explicitly provided — use it (after
            validating prerequisite artifacts).
-        2. Else if a ``state.json`` exists for this track with
-           ``status == FAILED`` — resume from ``current_step``.
+        2. Else if state has ``status == FAILED`` — resume from ``current_step``.
         3. Otherwise — run from the very beginning (DOWNLOAD).
 
-        If chat_id and message_id are provided, the progress messages will be
-        edited in-place instead of sending new messages.
+        Pipeline can pause at ASK_LANGUAGE step (raises WaitingForInputError).
+        After user provides input, call resume() to continue.
         """
-        # Store for edit-in-place
-        self._chat_id = chat_id
-        self._current_message_id = message_id
         first_step: PipelineStep
 
         logger.info(
-            "Pipeline.run called for track_id=%s with start_from_step=%s, request.source=%s",
-            self._request.track_id,
+            "Pipeline.run called for track_id=%s with start_from_step=%s",
+            self._state.track_id,
             start_from_step,
-            self._request.source_url_or_file_path,
         )
 
         if start_from_step is not None:
             # Mode 3: explicit start_from_step
-            saved = self._load_state()
             logger.info(
-                "Pipeline mode 3: explicit start_from_step=%s, saved state exists=%s",
+                "Pipeline mode 3: explicit start_from_step=%s",
                 start_from_step,
-                saved is not None,
             )
-            if saved is not None:
-                # Restore artefacts accumulated in previous runs
-                self._state = saved
-                # Always keep user_id from the current request
-                self._state.user_id = self._request.user_id
-                # Also restore track_source if not set in request
-                if not self._state.track_source and self._request.source_url_or_file_path:
-                    self._state.track_source = self._request.source_url_or_file_path
             validation_error = self._validate_artifacts_for_step(start_from_step)
             if validation_error:
                 logger.error(
                     "Cannot start from step %s for track_id=%s: %s",
                     start_from_step.value,
-                    self._request.track_id,
+                    self._state.track_id,
                     validation_error,
                 )
                 self._state.status = PipelineStatus.FAILED
                 self._state.error_message = validation_error
                 self._save_state()
                 return PipelineResult(
-                    track_id=self._request.track_id,
+                    track_id=self._state.track_id,
                     status=PipelineStatus.FAILED,
                     error_message=validation_error,
                 )
@@ -155,53 +193,70 @@ class KaraokePipeline:
             logger.info(
                 "Pipeline starting from explicit step %s for track_id=%s",
                 first_step.value,
-                self._request.track_id,
+                self._state.track_id,
+            )
+        elif self._state.status == PipelineStatus.FAILED and self._state.current_step is not None:
+            # Mode 2: resume from last failed step
+            first_step = self._state.current_step
+            logger.info(
+                "Pipeline resuming from step %s for track_id=%s",
+                first_step.value,
+                self._state.track_id,
+            )
+            await progress_callback(
+                f"🔄 Возобновление с шага {first_step.value}: {_STEP_LABELS[first_step]}..."
+            )
+        elif self._state.status == PipelineStatus.WAITING_FOR_INPUT and self._state.current_step is not None:
+            # Resume after waiting for input — continue from NEXT step after ASK_LANGUAGE
+            current_index = _ORDERED_STEPS.index(self._state.current_step)
+            if current_index + 1 < len(_ORDERED_STEPS):
+                first_step = _ORDERED_STEPS[current_index + 1]
+            else:
+                first_step = _ORDERED_STEPS[0]
+            logger.info(
+                "Pipeline resuming after WAITING_FOR_INPUT from step %s for track_id=%s",
+                first_step.value,
+                self._state.track_id,
             )
         else:
-            saved = self._load_state()
-            if saved is not None and saved.status == PipelineStatus.FAILED and saved.current_step is not None:
-                # Mode 2: resume from last failed step
-                self._state = saved
-                # Always keep user_id from the current request
-                self._state.user_id = self._request.user_id
-                first_step = saved.current_step
-                logger.info(
-                    "Pipeline resuming from step %s for track_id=%s",
-                    first_step.value,
-                    self._request.track_id,
-                )
-                await progress_callback(
-                    f"🔄 Возобновление с шага {first_step.value}: {_STEP_LABELS[first_step]}..."
-                )
-            else:
-                # Mode 1: fresh start — but preserve any fields already saved (e.g. lang chosen by the user)
-                # Copy all available artifacts from saved state for fresh start
-                if saved is not None:
-                    if saved.lang is not None:
-                        self._state.lang = saved.lang
-                    # Copy all artifact paths that exist in saved state
-                    if saved.source_lyrics_file is not None:
-                        self._state.source_lyrics_file = saved.source_lyrics_file
-                    if saved.track_file_name is not None:
-                        self._state.track_file_name = saved.track_file_name
-                    if saved.track_stem is not None:
-                        self._state.track_stem = saved.track_stem
-                    if saved.track_source is not None:
-                        self._state.track_source = saved.track_source
-                    # Copy other artifacts that might exist
-                    for field in ['vocal_file', 'instrumental_file', 'transcribe_json_file',
-                                  'corrected_transcribe_json_file', 'aligned_lyrics_file', 'ass_file', 'output_file']:
-                        saved_value = getattr(saved, field, None)
-                        if saved_value is not None:
-                            setattr(self._state, field, saved_value)
-                first_step = PipelineStep.DOWNLOAD
-                logger.info(
-                    "Pipeline starting fresh for track_id=%s (lang=%s)",
-                    self._request.track_id,
-                    self._state.lang,
-                )
+            # Mode 1: fresh start
+            first_step = PipelineStep.DOWNLOAD
+            logger.info(
+                "Pipeline starting fresh for track_id=%s (lang=%s)",
+                self._state.track_id,
+                self._state.lang,
+            )
 
         return await self._execute_from(first_step, progress_callback)
+
+    async def resume(
+        self,
+        progress_callback: Callable[[str], Awaitable[None]],
+    ) -> PipelineResult:
+        """Resume pipeline after WAITING_FOR_INPUT (e.g., after user selected language)."""
+        if self._state.status != PipelineStatus.WAITING_FOR_INPUT:
+            logger.warning(
+                "Pipeline.resume called but status is %s (expected WAITING_FOR_INPUT) for track_id=%s",
+                self._state.status,
+                self._state.track_id,
+            )
+
+        # Continue from next step after the waiting step
+        if self._state.current_step is not None:
+            current_index = _ORDERED_STEPS.index(self._state.current_step)
+            if current_index + 1 < len(_ORDERED_STEPS):
+                next_step = _ORDERED_STEPS[current_index + 1]
+            else:
+                next_step = _ORDERED_STEPS[0]
+        else:
+            next_step = PipelineStep.GET_LYRICS
+
+        logger.info(
+            "Pipeline.resume: continuing from step %s for track_id=%s",
+            next_step.value,
+            self._state.track_id,
+        )
+        return await self._execute_from(next_step, progress_callback)
 
     # ------------------------------------------------------------------
     # Internal execution
@@ -220,6 +275,7 @@ class KaraokePipeline:
 
         step_methods: dict[PipelineStep, Callable[[], Awaitable[None]]] = {
             PipelineStep.DOWNLOAD: self._step_download,
+            PipelineStep.ASK_LANGUAGE: self._step_ask_language,
             PipelineStep.GET_LYRICS: self._step_get_lyrics,
             PipelineStep.SEPARATE: self._step_separate,
             PipelineStep.TRANSCRIBE: self._step_transcribe,
@@ -227,6 +283,7 @@ class KaraokePipeline:
             PipelineStep.ALIGN: self._step_align,
             PipelineStep.GENERATE_ASS: self._step_generate_ass,
             PipelineStep.RENDER_VIDEO: self._step_render_video,
+            PipelineStep.SEND_VIDEO: self._step_send_video,
         }
 
         start_index = _ORDERED_STEPS.index(first_step)
@@ -238,11 +295,16 @@ class KaraokePipeline:
             self._state.status = PipelineStatus.IN_PROGRESS
             self._save_state()
 
-            logger.info("Step %s started for track_id=%s", step.value, self._request.track_id)
+            logger.info("Step %s started for track_id=%s", step.value, self._state.track_id)
             await progress_callback(f"⏳ Шаг {step.value}: {label}...")
 
             try:
                 await step_methods[step]()
+            except WaitingForInputError:
+                # Pipeline paused waiting for user input
+                self._state.status = PipelineStatus.WAITING_FOR_INPUT
+                self._save_state()
+                raise
             except LyricsNotFoundError:
                 # Let this propagate — the handler will request lyrics from the user.
                 self._state.status = PipelineStatus.FAILED
@@ -256,7 +318,7 @@ class KaraokePipeline:
                     logger.warning(
                         "Step %s failed for track_id=%s: %s. Continuing to next step.",
                         step.value,
-                        self._request.track_id,
+                        self._state.track_id,
                         exc,
                     )
                     await progress_callback(f"⚠️ Шаг {step.value} завершился с ошибкой: {exc}. Продолжаю...")
@@ -267,7 +329,7 @@ class KaraokePipeline:
                 logger.error(
                     "Step %s failed for track_id=%s: %s",
                     step.value,
-                    self._request.track_id,
+                    self._state.track_id,
                     exc,
                 )
                 self._state.status = PipelineStatus.FAILED
@@ -275,21 +337,21 @@ class KaraokePipeline:
                 self._save_state()
                 await progress_callback(f"❌ Шаг {step.value} завершился с ошибкой: {exc}")
                 return PipelineResult(
-                    track_id=self._request.track_id,
+                    track_id=self._state.track_id,
                     status=PipelineStatus.FAILED,
                     error_message=error_msg,
                 )
 
-            logger.info("Step %s completed for track_id=%s", step.value, self._request.track_id)
+            logger.info("Step %s completed for track_id=%s", step.value, self._state.track_id)
             await progress_callback(f"✅ Шаг {step.value}: {_STEP_LABELS[step]}...завершён")
 
         self._state.status = PipelineStatus.COMPLETED
         self._state.error_message = None
         self._save_state()
-        logger.info("Pipeline completed for track_id=%s", self._request.track_id)
+        logger.info("Pipeline completed for track_id=%s", self._state.track_id)
 
         return PipelineResult(
-            track_id=self._request.track_id,
+            track_id=self._state.track_id,
             status=PipelineStatus.COMPLETED,
             final_video_path=self._state.output_file,
         )
@@ -299,26 +361,28 @@ class KaraokePipeline:
     # ------------------------------------------------------------------
 
     def _save_state(self) -> None:
-        state_path = Path(self._request.track_folder) / "state.json"
+        state_path = self._track_folder / "state.json"
         try:
             state_path.write_text(self._state.model_dump_json(indent=2), encoding="utf-8")
         except OSError as exc:
             logger.warning(
                 "Failed to save state.json for track_id=%s: %s",
-                self._request.track_id,
+                self._state.track_id,
                 exc,
             )
 
-    def _load_state(self) -> PipelineState | None:
-        state_path = Path(self._request.track_folder) / "state.json"
+    @staticmethod
+    def load_state(track_folder: Path) -> PipelineState | None:
+        """Load PipelineState from state.json in the given folder."""
+        state_path = track_folder / "state.json"
         if not state_path.exists():
             return None
         try:
             return PipelineState.model_validate_json(state_path.read_text(encoding="utf-8"))
         except Exception as exc:
             logger.warning(
-                "Failed to load state.json for track_id=%s: %s",
-                self._request.track_id,
+                "Failed to load state.json from %s: %s",
+                track_folder,
                 exc,
             )
             return None
@@ -348,21 +412,377 @@ class KaraokePipeline:
         return None
 
     # ------------------------------------------------------------------
-    # Stub step methods — no real logic yet
+    # Step: DOWNLOAD — унифицированная загрузка из любого источника
     # ------------------------------------------------------------------
 
     async def _step_download(self) -> None:
-        source = self._request.source_url_or_file_path
-        stem = Path(source).stem
-        self._state.track_source = source
-        self._state.track_file_name = Path(source).name
-        self._state.track_stem = normalize_filename(stem)
+        """Unified download step supporting all source types."""
+        source_type = self._state.source_type
+        source_url = self._state.source_url or ""
+
+        if source_type == SourceType.TELEGRAM_FILE:
+            await self._download_telegram_file()
+        elif source_type == SourceType.YANDEX_MUSIC:
+            await self._download_yandex_music(source_url)
+        elif source_type == SourceType.YOUTUBE:
+            await self._download_youtube(source_url)
+        elif source_type == SourceType.HTTP_URL:
+            await self._download_http_url(source_url)
+        elif source_type == SourceType.LOCAL_FILE:
+            await self._use_local_file(source_url)
+        else:
+            # Fallback: treat source_url as local file path
+            await self._use_local_file(source_url)
+
+    async def _download_telegram_file(self) -> None:
+        """Download file from Telegram using bot API."""
+        file_id = self._state.telegram_file_id
+        if not file_id:
+            raise RuntimeError("telegram_file_id не задан для source_type=TELEGRAM_FILE")
+        if not self._bot:
+            raise RuntimeError("Bot instance not provided to pipeline for Telegram file download")
+
+        # Get file info from Telegram
+        file_info = await self._bot.get_file(file_id)
+        file_path = file_info.file_path
+        if not file_path:
+            raise RuntimeError(f"Не удалось получить путь к файлу для file_id={file_id}")
+
+        # Determine filename from source_url (original filename stored there)
+        original_name = self._state.source_url or f"audio_{file_id}.mp3"
+        original_name = Path(original_name).name
+
+        # Normalize track name
+        track_stem = normalize_filename(Path(original_name).stem)
+        suffix = Path(original_name).suffix or ".mp3"
+
+        # Ensure track folder matches track_stem
+        target_dir = self._track_folder.parent / track_stem
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self._track_folder = target_dir
+
+        final_path = target_dir / f"{track_stem}{suffix}"
+
+        # Download file
+        await self._bot.download_file(file_path, destination=final_path)
+
+        self._state.track_file_name = final_path.name
+        self._state.track_source = str(final_path)
+        self._state.track_stem = track_stem
         self._save_state()
-        await asyncio.sleep(0)
+
+        logger.info(
+            "DOWNLOAD (telegram_file) completed for track_id=%s: file='%s'",
+            self._state.track_id,
+            final_path,
+        )
+
+    async def _download_yandex_music(self, url: str) -> None:
+        """Download track from Yandex Music."""
+        from .yandex_music_downloader import YandexMusicDownloader
+
+        downloader = YandexMusicDownloader(token=self._settings.yandex_music_token)
+
+        # Get track info first to build directory name
+        track_info = await downloader.get_track_info(url)
+
+        # Build track name
+        track_stem = normalize_filename(
+            f"{track_info.artist} - {track_info.title}" if track_info.artist and track_info.title
+            else track_info.title or "track"
+        )
+
+        # Ensure track folder matches track_stem
+        target_dir = self._track_folder.parent / track_stem
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self._track_folder = target_dir
+
+        # Download track
+        track_info = await downloader.download(url, target_dir)
+
+        # Validate duration
+        duration = await self._probe_audio_duration(track_info.local_path)
+        if duration is None or duration < 60:
+            raise RuntimeError(
+                "Полученный трек не является музыкальной композицией "
+                "(длительность менее 1 минуты или не удалось определить длительность)."
+            )
+
+        # Try to fetch lyrics/LRC from Yandex Music
+        try:
+            lyrics_result = await downloader.fetch_lyrics(track_info.track_id)
+            stem = track_info.track_stem
+            if lyrics_result.lrc_text:
+                lrc_file = target_dir / f"{stem}_lyrics.txt"
+                lrc_file.write_text(lyrics_result.lrc_text, encoding="utf-8")
+                self._state.source_lyrics_file = str(lrc_file)
+                logger.info("Saved LRC lyrics for track_id=%s to %s", self._state.track_id, lrc_file)
+            elif lyrics_result.plain_text:
+                txt_file = target_dir / f"{stem}_lyrics.txt"
+                txt_file.write_text(lyrics_result.plain_text, encoding="utf-8")
+                self._state.source_lyrics_file = str(txt_file)
+                logger.info("Saved plain text lyrics for track_id=%s to %s", self._state.track_id, txt_file)
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch lyrics from Yandex Music for track_id=%s: %s",
+                self._state.track_id,
+                exc,
+            )
+
+        self._state.track_file_name = track_info.local_path.name
+        self._state.track_source = str(track_info.local_path)
+        self._state.track_stem = track_info.track_stem
+        self._save_state()
+
+        logger.info(
+            "DOWNLOAD (yandex_music) completed for track_id=%s: file='%s'",
+            self._state.track_id,
+            track_info.local_path,
+        )
+
+    async def _download_youtube(self, url: str) -> None:
+        """Download audio from YouTube."""
+        from .youtube_downloader import YouTubeDownloader
+
+        downloader = YouTubeDownloader(quality=self._settings.youtube_download_quality)
+
+        # Get video metadata first
+        meta = await downloader.get_track_info(url)
+
+        # Validate duration
+        if meta.duration < 60:
+            raise RuntimeError(
+                "Полученное видео не является музыкальной композицией "
+                "(длительность менее 1 минуты)."
+            )
+
+        # Build track name
+        track_stem = normalize_filename(
+            f"{meta.artist} - {meta.title}" if meta.artist and meta.title
+            else meta.title or "video"
+        )
+
+        # Ensure track folder matches track_stem
+        target_dir = self._track_folder.parent / track_stem
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self._track_folder = target_dir
+
+        # Download audio
+        track_info = await downloader.download(url, target_dir)
+
+        # Verify duration using ffprobe
+        duration = await self._probe_audio_duration(track_info.local_path)
+        if duration is None or duration < 60:
+            raise RuntimeError(
+                "Полученный аудиофайл не является музыкальной композицией "
+                "(длительность менее 1 минуты или не удалось определить длительность)."
+            )
+
+        self._state.track_file_name = track_info.local_path.name
+        self._state.track_source = str(track_info.local_path)
+        self._state.track_stem = track_info.track_stem
+        self._save_state()
+
+        logger.info(
+            "DOWNLOAD (youtube) completed for track_id=%s: file='%s'",
+            self._state.track_id,
+            track_info.local_path,
+        )
+
+    async def _download_http_url(self, url: str) -> None:
+        """Download file from arbitrary HTTP(S) URL."""
+        from urllib.parse import unquote, urlparse
+
+        parsed = urlparse(url)
+        url_basename = unquote(parsed.path.rstrip("/").split("/")[-1]) if parsed.path.rstrip("/") else ""
+        filename = normalize_filename(url_basename) if url_basename else "source_file"
+        track_stem = normalize_filename(Path(url_basename).stem) if url_basename else "source_file"
+
+        # Ensure track folder matches track_stem
+        target_dir = self._track_folder.parent / track_stem
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self._track_folder = target_dir
+
+        local_path = target_dir / filename
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                with local_path.open("wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=65536):
+                        f.write(chunk)
+
+        # Validate duration
+        duration = await self._probe_audio_duration(local_path)
+        if duration is None or duration < 60:
+            raise RuntimeError(
+                f'Полученный файл "{filename}" не является музыкальной композицией '
+                "(длительность менее 1 минуты или не удалось определить длительность)."
+            )
+
+        self._state.track_file_name = local_path.name
+        self._state.track_source = str(local_path)
+        self._state.track_stem = track_stem
+        self._save_state()
+
+        logger.info(
+            "DOWNLOAD (http_url) completed for track_id=%s: file='%s'",
+            self._state.track_id,
+            local_path,
+        )
+
+    async def _use_local_file(self, file_path_str: str) -> None:
+        """Use an existing local file as track source."""
+        file_path = Path(file_path_str)
+
+        if not file_path.exists():
+            raise RuntimeError(f"Локальный файл не найден: {file_path}")
+
+        track_stem = normalize_filename(file_path.stem)
+
+        # Ensure track folder matches track_stem
+        target_dir = self._track_folder.parent / track_stem
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy file to target dir if not already there
+        target_file = target_dir / file_path.name
+        if file_path != target_file and not target_file.exists():
+            shutil.copy2(file_path, target_file)
+            logger.info("Copied local file from %s to %s", file_path, target_file)
+        elif target_file.exists():
+            pass  # Already in place
+        else:
+            target_file = file_path  # Use original path
+
+        self._track_folder = target_dir
+
+        self._state.track_file_name = target_file.name
+        self._state.track_source = str(target_file)
+        self._state.track_stem = track_stem
+        self._save_state()
+
+        logger.info(
+            "DOWNLOAD (local_file) completed for track_id=%s: file='%s'",
+            self._state.track_id,
+            target_file,
+        )
+
+    async def _probe_audio_duration(self, path: Path) -> float | None:
+        """Probe audio file duration using ffprobe."""
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            str(path),
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            logger.error("Failed to start ffprobe for %s: %s", path, exc)
+            return None
+
+        stdout, _ = await process.communicate()
+        if process.returncode != 0:
+            return None
+
+        try:
+            payload = json.loads(stdout.decode("utf-8"))
+            fmt = payload.get("format") or {}
+            duration_raw = fmt.get("duration")
+            if duration_raw is not None:
+                return float(duration_raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return None
+
+    # ------------------------------------------------------------------
+    # Step: ASK_LANGUAGE — запрос языка у пользователя
+    # ------------------------------------------------------------------
+
+    async def _step_ask_language(self) -> None:
+        """Ask user to select song language. Pauses pipeline until user responds."""
+        # Skip if language already set
+        if self._state.lang:
+            logger.info(
+                "ASK_LANGUAGE step skipped for track_id=%s: lang already set to '%s'",
+                self._state.track_id,
+                self._state.lang,
+            )
+            return
+
+        # Pause pipeline — handler will resume after user selects language
+        logger.info(
+            "ASK_LANGUAGE step: pausing pipeline for track_id=%s to wait for language selection",
+            self._state.track_id,
+        )
+        raise WaitingForInputError("Ожидание выбора языка от пользователя")
+
+    # ------------------------------------------------------------------
+    # Step: GET_LYRICS
+    # ------------------------------------------------------------------
+
+    async def _step_get_lyrics(self) -> None:
+        # Проверяем, есть ли уже файл с текстом песни в state
+        existing_lyrics_file = self._state.source_lyrics_file
+        if existing_lyrics_file:
+            lyrics_path = Path(existing_lyrics_file)
+            if lyrics_path.exists() and lyrics_path.stat().st_size > 0:
+                logger.info(
+                    "GET_LYRICS step skipped for track_id=%s: lyrics loaded from existing file '%s'",
+                    self._state.track_id,
+                    lyrics_path,
+                )
+                self._state.source_lyrics_file = str(lyrics_path)
+                self._save_state()
+                return
+
+        raw_stem = self._state.track_stem or "track"
+        stem = normalize_filename(raw_stem)
+        track_dir = self._track_folder
+
+        lyrics_service = LyricsService(
+            genius_token=self._settings.genius_token,
+            enable_genius=self._settings.lyrics_enable_genius,
+            enable_lyrica=self._settings.lyrics_enable_lyrica,
+            enable_lyricslib=self._settings.lyrics_enable_lyricslib,
+            lyrica_base_url=self._settings.lyrica_base_url,
+        )
+        lyrics = await lyrics_service.find_lyrics(
+            track_stem=stem,
+            track_file_name=self._state.track_file_name,
+        )
+
+        if lyrics is None:
+            raise LyricsNotFoundError(
+                f"Не удалось автоматически найти текст для трека '{stem}'"
+            )
+
+        lyrics_file = track_dir / f"{stem}_lyrics.txt"
+        lyrics_file.write_text(lyrics, encoding="utf-8")
+
+        self._state.source_lyrics_file = str(lyrics_file)
+        self._save_state()
+        logger.info(
+            "GET_LYRICS step completed for track_id=%s: lyrics saved to '%s'",
+            self._state.track_id,
+            lyrics_file,
+        )
+
+    # ------------------------------------------------------------------
+    # Step: SEPARATE
+    # ------------------------------------------------------------------
 
     async def _step_separate(self) -> None:
-        audio_path = self._request.source_url_or_file_path
-        track_dir = self._request.track_folder
+        audio_path = self._state.track_source
+        if not audio_path:
+            raise RuntimeError("track_source не задан — шаг DOWNLOAD не был выполнен")
+
+        track_dir = str(self._track_folder)
 
         vocals_path, accompaniment_path = await self._demucs_service.separate(
             audio_path=audio_path,
@@ -374,11 +794,15 @@ class KaraokePipeline:
 
         logger.info(
             "SEPARATE step completed for track_id=%s: vocals='%s', accompaniment='%s'",
-            self._request.track_id,
+            self._state.track_id,
             vocals_path,
             accompaniment_path,
         )
         self._save_state()
+
+    # ------------------------------------------------------------------
+    # Step: TRANSCRIBE
+    # ------------------------------------------------------------------
 
     async def _step_transcribe(self) -> None:
         vocal_file_str = self._state.vocal_file
@@ -386,9 +810,9 @@ class KaraokePipeline:
             raise RuntimeError("vocal_file не задан — шаг SEPARATE не был выполнен")
 
         vocal_file = Path(vocal_file_str)
-        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        raw_stem = self._state.track_stem or "track"
         stem = normalize_filename(raw_stem)
-        track_dir = Path(self._request.track_folder)
+        track_dir = self._track_folder
         output_json = track_dir / f"{stem}_transcription.json"
 
         # Передаём язык из состояния (выбранный пользователем) или None (SpeechesClient использует lang_default)
@@ -399,18 +823,22 @@ class KaraokePipeline:
         )
 
         self._state.transcribe_json_file = str(output_json)
-        
+
         # Clean up the transcription file to remove unnecessary information
         self._cleanup_transcription(output_json)
-        
+
         self._save_state()
+
+    # ------------------------------------------------------------------
+    # Step: CORRECT_TRANSCRIPT
+    # ------------------------------------------------------------------
 
     async def _step_correct_transcribe(self) -> None:
         # Check if step is enabled in config
         if not self._settings.correct_transcript_enabled:
             logger.info(
                 "CORRECT_TRANSCRIPT step skipped (disabled in config) for track_id=%s",
-                self._request.track_id,
+                self._state.track_id,
             )
             return
 
@@ -418,7 +846,7 @@ class KaraokePipeline:
         if not self._settings.openrouter_api_key:
             logger.warning(
                 "CORRECT_TRANSCRIPT step skipped (no API key) for track_id=%s",
-                self._request.track_id,
+                self._state.track_id,
             )
             return
 
@@ -452,11 +880,9 @@ class KaraokePipeline:
             )
 
             # Save corrected transcription
-            import json
-
-            raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+            raw_stem = self._state.track_stem or "track"
             stem = normalize_filename(raw_stem)
-            track_dir = Path(self._request.track_folder)
+            track_dir = self._track_folder
             output_json = track_dir / f"{stem}_transcription_corrected.json"
 
             output_json.write_text(
@@ -469,59 +895,15 @@ class KaraokePipeline:
 
             logger.info(
                 "CORRECT_TRANSCRIPT step completed for track_id=%s: corrected_file='%s'",
-                self._request.track_id,
+                self._state.track_id,
                 output_json,
             )
         finally:
             await llm_client.close()
 
-    async def _step_get_lyrics(self) -> None:
-        # Проверяем, есть ли уже файл с текстом песни в state
-        existing_lyrics_file = self._state.source_lyrics_file
-        if existing_lyrics_file:
-            lyrics_path = Path(existing_lyrics_file)
-            if lyrics_path.exists() and lyrics_path.stat().st_size > 0:
-                lyrics = lyrics_path.read_text(encoding="utf-8")
-                logger.info(
-                    "GET_LYRICS step skipped for track_id=%s: lyrics loaded from existing file '%s'",
-                    self._request.track_id,
-                    lyrics_path,
-                )
-                self._state.source_lyrics_file = str(lyrics_path)
-                self._save_state()
-                return
-
-        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
-        stem = normalize_filename(raw_stem)
-        track_dir = Path(self._request.track_folder)
-
-        lyrics_service = LyricsService(
-            genius_token=self._settings.genius_token,
-            enable_genius=self._settings.lyrics_enable_genius,
-            enable_lyrica=self._settings.lyrics_enable_lyrica,
-            enable_lyricslib=self._settings.lyrics_enable_lyricslib,
-            lyrica_base_url=self._settings.lyrica_base_url,
-        )
-        lyrics = await lyrics_service.find_lyrics(
-            track_stem=stem,
-            track_file_name=self._state.track_file_name,
-        )
-
-        if lyrics is None:
-            raise LyricsNotFoundError(
-                f"Не удалось автоматически найти текст для трека '{stem}'"
-            )
-
-        lyrics_file = track_dir / f"{stem}_lyrics.txt"
-        lyrics_file.write_text(lyrics, encoding="utf-8")
-
-        self._state.source_lyrics_file = str(lyrics_file)
-        self._save_state()
-        logger.info(
-            "GET_LYRICS step completed for track_id=%s: lyrics saved to '%s'",
-            self._request.track_id,
-            lyrics_file,
-        )
+    # ------------------------------------------------------------------
+    # Step: ALIGN
+    # ------------------------------------------------------------------
 
     async def _step_align(self) -> None:
         # Use corrected transcription if available and exists, otherwise use original
@@ -543,9 +925,9 @@ class KaraokePipeline:
         if not lyrics_path:
             raise RuntimeError("source_lyrics_file не задан — шаг GET_LYRICS не был выполнен")
 
-        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        raw_stem = self._state.track_stem or "track"
         stem = normalize_filename(raw_stem)
-        track_dir = Path(self._request.track_folder)
+        track_dir = self._track_folder
         output_path = track_dir / f"{stem}.aligned.json"
 
         vocal_file = Path(self._state.vocal_file) if self._state.vocal_file else None
@@ -567,9 +949,13 @@ class KaraokePipeline:
         self._save_state()
         logger.info(
             "ALIGN step completed for track_id=%s: aligned_lyrics saved to '%s'",
-            self._request.track_id,
+            self._state.track_id,
             output_path,
         )
+
+    # ------------------------------------------------------------------
+    # Step: GENERATE_ASS
+    # ------------------------------------------------------------------
 
     async def _step_generate_ass(self) -> None:
         aligned_path_str = self._state.aligned_lyrics_file
@@ -577,9 +963,9 @@ class KaraokePipeline:
             raise RuntimeError("aligned_lyrics_file не задан — шаг ALIGN не был выполнен")
 
         aligned_path = Path(aligned_path_str)
-        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        raw_stem = self._state.track_stem or "track"
         stem = normalize_filename(raw_stem)
-        track_dir = Path(self._request.track_folder)
+        track_dir = self._track_folder
         output_ass = track_dir / f"{stem}.ass"
 
         track_title = stem.replace("_", " ")
@@ -598,9 +984,13 @@ class KaraokePipeline:
         self._save_state()
         logger.info(
             "GENERATE_ASS step completed for track_id=%s: ass_file='%s'",
-            self._request.track_id,
+            self._state.track_id,
             output_ass,
         )
+
+    # ------------------------------------------------------------------
+    # Step: RENDER_VIDEO
+    # ------------------------------------------------------------------
 
     async def _step_render_video(self) -> None:
         ass_file_str = self._state.ass_file
@@ -623,9 +1013,9 @@ class KaraokePipeline:
         instrumental_path = Path(instrumental_file_str)
         original_path = Path(track_source_str)
         vocal_path = Path(vocal_file_str)
-        raw_stem = self._state.track_stem or Path(self._request.source_url_or_file_path).stem
+        raw_stem = self._state.track_stem or "track"
         stem = normalize_filename(raw_stem)
-        track_dir = Path(self._request.track_folder)
+        track_dir = self._track_folder
         output_path = track_dir / f"{stem}.mp4"
 
         renderer = VideoRenderer(
@@ -649,26 +1039,19 @@ class KaraokePipeline:
 
         # Формируем ссылку на скачивание, если задан CONTENT_EXTERNAL_URL
         if self._settings.content_external_url:
-            # Формат ссылки: https://{external_url}/music?getfile={encoded_path}
-            # content_external_url может быть задан как с https://, так и без
             base_url = self._settings.content_external_url
             if not base_url.startswith("http://") and not base_url.startswith("https://"):
                 base_url = f"https://{base_url}"
-            
-            # Убираем trailing slash из base_url, если он есть
+
             base_url = base_url.rstrip("/")
-            
-            # Проверяем, заканчивается ли base_url на '/music' и при необходимости не добавляем его снова
+
             if base_url.endswith("/music"):
                 endpoint = ""
             else:
                 endpoint = "/music"
-            
-            # track_dir всегда равен track_stem (нормализованному)
+
             track_dir_name = stem
-            
             output_filename = output_path.name
-            # Кодируем путь для URL
             filepath = f"{track_dir_name}/{output_filename}"
             encoded_path = quote(filepath, safe="/")
             self._state.download_url = (
@@ -676,38 +1059,111 @@ class KaraokePipeline:
             )
             logger.info(
                 "RENDER_VIDEO step: download URL formed for track_id=%s: %s",
-                self._request.track_id,
+                self._state.track_id,
                 self._state.download_url,
             )
 
         self._save_state()
         logger.info(
             "RENDER_VIDEO step completed for track_id=%s: output_file='%s', download_url=%s",
-            self._request.track_id,
+            self._state.track_id,
             output_path,
             self._state.download_url,
         )
 
+    # ------------------------------------------------------------------
+    # Step: SEND_VIDEO — отправка результата пользователю
+    # ------------------------------------------------------------------
+
+    async def _step_send_video(self) -> None:
+        """Send the rendered video to the user via Telegram bot."""
+        output_file_str = self._state.output_file
+        if not output_file_str:
+            raise RuntimeError("output_file не задан — шаг RENDER_VIDEO не был выполнен")
+
+        if not self._settings.send_video_to_user:
+            logger.info(
+                "SEND_VIDEO step skipped (disabled in config) for track_id=%s. "
+                "Video available at: %s",
+                self._state.track_id,
+                output_file_str,
+            )
+            return
+
+        if not self._bot:
+            logger.warning(
+                "SEND_VIDEO step: bot instance not provided for track_id=%s, skipping send",
+                self._state.track_id,
+            )
+            return
+
+        user_id = self._state.user_id
+        if not user_id:
+            logger.warning(
+                "SEND_VIDEO step: user_id not set for track_id=%s, skipping send",
+                self._state.track_id,
+            )
+            return
+
+        output_path = Path(output_file_str)
+        if not output_path.exists():
+            logger.warning(
+                "SEND_VIDEO step: output file not found for track_id=%s: %s",
+                self._state.track_id,
+                output_file_str,
+            )
+            return
+
+        download_url = self._state.download_url
+        caption = (
+            f"🎉 Обработка завершена успешно!\n"
+            f"track_id: <code>{self._state.track_id}</code>"
+            + (f"\n📥 Скачать: <a href='{download_url}'>ссылка</a>" if download_url else "")
+        )
+
+        try:
+            from aiogram.types import FSInputFile
+            video_file = FSInputFile(output_path, filename=output_path.name)
+            await self._bot.send_video(
+                chat_id=user_id,
+                video=video_file,
+                caption=caption,
+                parse_mode="HTML",
+            )
+            logger.info(
+                "SEND_VIDEO step completed for track_id=%s: video sent to user_id=%s",
+                self._state.track_id,
+                user_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "SEND_VIDEO step failed for track_id=%s: %s",
+                self._state.track_id,
+                exc,
+            )
+            raise
+
+    # ------------------------------------------------------------------
+    # Utility methods
+    # ------------------------------------------------------------------
+
     def _cleanup_transcription(self, transcription_path: Path) -> None:
         """Clean up transcription JSON to remove unnecessary information.
-        
+
         Keeps only required fields: duration, language, segments, words
         Segments are cleaned to keep only id, start, end, text fields.
         Words section is kept as is without changes.
         """
-        # Read the transcription file
         with open(transcription_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
-        # Create cleaned data with only required fields
+
         cleaned_data = {
             "duration": data.get("duration"),
             "language": data.get("language"),
             "segments": [],
             "words": data.get("words", [])
         }
-        
-        # Clean up segments to keep only required fields
+
         for segment in data.get("segments", []):
             cleaned_segment = {
                 "id": segment.get("id"),
@@ -716,12 +1172,21 @@ class KaraokePipeline:
                 "text": segment.get("text")
             }
             cleaned_data["segments"].append(cleaned_segment)
-        
-        # Write cleaned data back to file
+
         with open(transcription_path, 'w', encoding='utf-8') as f:
             json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
-        
+
         logger.info(
             "Transcription cleaned up for track_id=%s: kept only required fields",
-            self._request.track_id
+            self._state.track_id
         )
+
+    @property
+    def state(self) -> PipelineState:
+        """Access the current pipeline state."""
+        return self._state
+
+    @property
+    def track_folder(self) -> Path:
+        """Access the current track folder."""
+        return self._track_folder

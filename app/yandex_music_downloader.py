@@ -311,7 +311,10 @@ class YandexMusicDownloader:
                 return YandexMusicLyricsResult(plain_text=None, lrc_text=None)
 
             # Use client.tracks_lyrics to get the TrackLyrics object with download URL
-            track_lyrics = client.tracks_lyrics(track_id)
+            track_lyrics=None
+            track_lyrics = client.tracks_lyrics(track_id,format='LRC')
+            if not track_lyrics:
+                track_lyrics = client.tracks_lyrics(track_id,format='TEXT')
 
             if not track_lyrics:
                 logger.info(
