@@ -423,7 +423,18 @@ class KaraokeHandlers:
             for i, track in enumerate(yandex_results, 1):
                 artist_name = track.get("artist", "Unknown")
                 title_name = track.get("title", "Unknown")
-                result_text += f"{i}. {artist_name} - {title_name}\n   🎧 Яндекс Музыка\n\n"
+                lyrics_info=track.get("lyrics_info","Unknown")
+                lrc_exists=False
+                txt_exists=False
+                lrc=""
+                if lyrics_info!="Unknown":
+                    lrc_exists=lyrics_info.get("has_available_sync_lyrics",False)
+                    if lrc_exists:
+                        lrc="lrc,"
+                    txt_exists=lyrics_info.get("has_available_text_lyrics",False)
+                    if txt_exists:
+                        lrc+="txt"
+                result_text += f"{i}. {artist_name} - {title_name}\n   🎧 Яндекс Музыка {lrc}\n\n"
 
             result_text += "Выберите номер трека для обработки:"
 
