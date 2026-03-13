@@ -76,6 +76,21 @@ class Settings(BaseModel):
     env_reload_interval_sec: int = 30
     # Enable/disable hot-reload of .env (default: true)
     env_reload_enabled: bool = True
+    # MIX_AUDIO step settings (back-vocal effect)
+    # Enable/disable the MIX_AUDIO step entirely (default: true)
+    mix_audio_enabled: bool = True
+    # Volume of vocal in chorus segments for back-vocal effect (0.0–1.0, default: 0.3 = 30%)
+    chorus_backvocal_volume: float = 0.3
+    # Enable reverb effect on vocal (placeholder, default: false)
+    vocal_reverb_enabled: bool = False
+    # Enable echo effect on vocal (placeholder, default: false)
+    vocal_echo_enabled: bool = False
+    # ChorusDetector backend: "msaf" | "librosa" | "hybrid" (default: "hybrid")
+    chorus_detector_backend: str = "hybrid"
+    # Minimum duration (seconds) for a chorus segment candidate (default: 15)
+    chorus_min_duration_sec: float = 15.0
+    # Maximum duration (seconds) for a chorus segment candidate (default: 60)
+    chorus_max_duration_sec: float = 60.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -124,6 +139,13 @@ class Settings(BaseModel):
             "correct_transcript_enabled": os.getenv("CORRECT_TRANSCRIPT_ENABLED", "true").lower() in ("true", "1", "yes"),
             "env_reload_interval_sec": int(os.getenv("ENV_RELOAD_INTERVAL_SEC", "30")),
             "env_reload_enabled": os.getenv("ENV_RELOAD_ENABLED", "true").lower() in ("true", "1", "yes"),
+            "mix_audio_enabled": os.getenv("MIX_AUDIO_ENABLED", "true").lower() in ("true", "1", "yes"),
+            "chorus_backvocal_volume": float(os.getenv("CHORUS_BACKVOCAL_VOLUME", "0.3")),
+            "vocal_reverb_enabled": os.getenv("VOCAL_REVERB_ENABLED", "false").lower() in ("true", "1", "yes"),
+            "vocal_echo_enabled": os.getenv("VOCAL_ECHO_ENABLED", "false").lower() in ("true", "1", "yes"),
+            "chorus_detector_backend": os.getenv("CHORUS_DETECTOR_BACKEND", "hybrid"),
+            "chorus_min_duration_sec": float(os.getenv("CHORUS_MIN_DURATION_SEC", "15.0")),
+            "chorus_max_duration_sec": float(os.getenv("CHORUS_MAX_DURATION_SEC", "60.0")),
         }
 
         settings = cls(**data)

@@ -74,8 +74,9 @@ class VideoRenderer:
         vocal_path: Path,
         ass_path: Path,
         output_path: Path,
+        backvocal_mix_path: Path | None = None,
     ) -> Path:
-        """Render the karaoke video with three audio tracks.
+        """Render the karaoke video with three (or four) audio tracks.
 
         Parameters
         ----------
@@ -89,6 +90,9 @@ class VideoRenderer:
             Path to the ``.ass`` subtitle file with karaoke highlights.
         output_path:
             Destination path for the resulting ``.mp4`` file.
+        backvocal_mix_path:
+            Optional path to the back-vocal mix file (Instrumental + BackVocal).
+            If provided, a fourth audio track is added to the output MP4.
 
         Returns
         -------
@@ -113,7 +117,11 @@ class VideoRenderer:
         if len(ass_for_filter) >= 2 and ass_for_filter[1] == ":":
             ass_for_filter = ass_for_filter[0] + "\\:" + ass_for_filter[2:]
 
+        # Determine if we have a 4th audio track (BackVocal mix)
+        has_backvocal = backvocal_mix_path is not None and backvocal_mix_path.exists()
+
         # Audio inputs: [0:v] = lavfi color, [1:a] = instrumental, [2:a] = original, [3:a] = vocal
+        # Optional [4:a] = backvocal_mix (if provided)
         # Mix instrumental + vocal (at reduced volume) for third track
         # amix weights: instrumental=1, vocal=mix_voice_volume
         filter_complex = (
@@ -133,12 +141,25 @@ class VideoRenderer:
             "-i", str(original_path.resolve()),
             # Audio input 3: Vocal → [3:a]
             "-i", str(vocal_path.resolve()),
+        ]
+
+        # Optional 4th audio input: BackVocal mix → [4:a]
+        if has_backvocal:
+            cmd += ["-i", str(backvocal_mix_path.resolve())]  # type: ignore[union-attr]
+
+        cmd += [
             # Filter: burn ASS subtitles + mix instrumental+voice
             "-filter_complex", filter_complex,
             "-map", "[vout]",
             "-map", "1:a",                    # First audio track: Instrumental
             "-map", "2:a",                    # Second audio track: Original
             "-map", "[a3]",                   # Third audio track: Instrumental+Voice mix
+        ]
+
+        if has_backvocal:
+            cmd += ["-map", "4:a"]            # Fourth audio track: Instrumental+BackVocal
+
+        cmd += [
             # Video codec settings
             "-c:v", "libx264",
             "-preset", self._ffmpeg_preset,
@@ -154,19 +175,30 @@ class VideoRenderer:
             "-metadata:s:a:0", "title=Instrumental",
             "-metadata:s:a:1", "title=Original",
             "-metadata:s:a:2", "title=Instrumental+Voice",
+        ]
+
+        if has_backvocal:
+            cmd += ["-metadata:s:a:3", "title=Instrumental+BackVocal"]
+
+        cmd += [
             # Disposition: first track is default, others are not
             "-disposition:a:0", "default",
             "-disposition:a:1", "0",
             "-disposition:a:2", "0",
-            str(output_path.resolve()),
         ]
 
+        if has_backvocal:
+            cmd += ["-disposition:a:3", "0"]
+
+        cmd += [str(output_path.resolve())]
+
         logger.info(
-            "VideoRenderer: starting ffmpeg render\n  instrumental='%s'\n  original='%s'\n  vocal='%s'\n  ass='%s'\n  output='%s'",
+            "VideoRenderer: starting ffmpeg render\n  instrumental='%s'\n  original='%s'\n  vocal='%s'\n  ass='%s'\n  backvocal_mix='%s'\n  output='%s'",
             instrumental_path,
             original_path,
             vocal_path,
             ass_path,
+            backvocal_mix_path,
             output_path,
         )
         

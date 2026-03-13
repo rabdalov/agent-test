@@ -12,6 +12,7 @@ from aiogram import Bot
 
 from .alignment_service import AlignmentService, save_aligned_result
 from .ass_generator import AssGenerator
+from .chorus_detector import ChorusDetector
 from .config import Settings
 from .correct_transcript_service import CorrectTranscriptService
 from .demucs_service import DemucsService
@@ -19,6 +20,7 @@ from .llm_client import LLMClient
 from .lyrics_service import LyricsService
 from .speeches_client import SpeechesClient
 from .video_renderer import VideoRenderer
+from .vocal_processor import VocalProcessor, VolumeSegment
 from .models import (
     PipelineResult,
     PipelineState,
@@ -48,6 +50,7 @@ _STEP_LABELS: dict[PipelineStep, str] = {
     PipelineStep.GET_LYRICS: "получение текста",
     PipelineStep.SEPARATE: "разделение дорожек",
     PipelineStep.TRANSCRIBE: "транскрипция",
+    PipelineStep.MIX_AUDIO: "обработка вокала (бэк-вокал)",
     PipelineStep.CORRECT_TRANSCRIPT: "корректировка транскрипции",
     PipelineStep.ALIGN: "выравнивание",
     PipelineStep.GENERATE_ASS: "генерация субтитров",
@@ -61,6 +64,7 @@ _ORDERED_STEPS: list[PipelineStep] = [
     PipelineStep.GET_LYRICS,
     PipelineStep.SEPARATE,
     PipelineStep.TRANSCRIBE,
+    PipelineStep.MIX_AUDIO,
     PipelineStep.CORRECT_TRANSCRIPT,
     PipelineStep.ALIGN,
     PipelineStep.GENERATE_ASS,
@@ -75,6 +79,7 @@ _STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
     PipelineStep.GET_LYRICS: ["track_file_name", "track_stem"],
     PipelineStep.SEPARATE: ["track_source"],
     PipelineStep.TRANSCRIBE: ["vocal_file"],
+    PipelineStep.MIX_AUDIO: ["vocal_file", "instrumental_file"],
     PipelineStep.CORRECT_TRANSCRIPT: ["transcribe_json_file", "source_lyrics_file"],
     PipelineStep.ALIGN: ["source_lyrics_file", "transcribe_json_file"],
     PipelineStep.GENERATE_ASS: ["aligned_lyrics_file"],
@@ -279,6 +284,7 @@ class KaraokePipeline:
             PipelineStep.GET_LYRICS: self._step_get_lyrics,
             PipelineStep.SEPARATE: self._step_separate,
             PipelineStep.TRANSCRIBE: self._step_transcribe,
+            PipelineStep.MIX_AUDIO: self._step_mix_audio,
             PipelineStep.CORRECT_TRANSCRIPT: self._step_correct_transcribe,
             PipelineStep.ALIGN: self._step_align,
             PipelineStep.GENERATE_ASS: self._step_generate_ass,
@@ -828,6 +834,182 @@ class KaraokePipeline:
         self._save_state()
 
     # ------------------------------------------------------------------
+    # Step: MIX_AUDIO — обработка вокала с эффектом бэк-вокала
+    # ------------------------------------------------------------------
+
+    async def _step_mix_audio(self) -> None:
+        """Apply back-vocal effect: reduce vocal volume outside choruses, boost in choruses.
+
+        Steps:
+        1. Detect chorus segments via ChorusDetector (msaf/librosa/hybrid).
+        2. Build volume_segments based on chorus positions.
+        3. Apply volume segments to vocal track via VocalProcessor (ffmpeg).
+        4. Create backvocal_mix_file: instrumental + processed_vocal.
+        """
+        # Check if step is enabled in config
+        if not self._settings.mix_audio_enabled:
+            logger.info(
+                "MIX_AUDIO step skipped (disabled in config) for track_id=%s",
+                self._state.track_id,
+            )
+            return
+
+        vocal_file_str = self._state.vocal_file
+        instrumental_file_str = self._state.instrumental_file
+        full_file_str = self._state.track_source
+        if not vocal_file_str:
+            raise RuntimeError("vocal_file не задан — шаг SEPARATE не был выполнен")
+        if not instrumental_file_str:
+            raise RuntimeError("instrumental_file не задан — шаг SEPARATE не был выполнен")
+
+        raw_stem = self._state.track_stem or "track"
+        stem = normalize_filename(raw_stem)
+        track_dir = self._track_folder
+
+        # Step 1: Detect chorus segments
+        logger.info(
+            "MIX_AUDIO step: detecting chorus segments for track_id=%s (backend=%s)",
+            self._state.track_id,
+            self._settings.chorus_detector_backend,
+        )
+        detector = ChorusDetector(
+            backend=self._settings.chorus_detector_backend,
+            min_duration_sec=self._settings.chorus_min_duration_sec,
+            max_duration_sec=self._settings.chorus_max_duration_sec,
+        )
+        chorus_segments = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: detector.detect(full_file_str),
+        )
+        logger.info(
+            "MIX_AUDIO step: found %d chorus segment(s) for track_id=%s",
+            len(chorus_segments),
+            self._state.track_id,
+        )
+
+        # Step 2: Probe audio duration for building full volume_segments coverage
+        vocal_path = Path(full_file_str)
+        audio_duration = await self._probe_audio_duration(vocal_path)
+        if audio_duration is None:
+            logger.warning(
+                "MIX_AUDIO step: could not probe audio duration for '%s', using 0.0",
+                full_file_str,
+            )
+            audio_duration = 0.0
+
+        # Step 3: Build volume segments
+        volume_segments = VocalProcessor.build_volume_segments(
+            chorus_segments=chorus_segments,
+            audio_duration=audio_duration,
+            chorus_volume=self._settings.chorus_backvocal_volume,
+            default_volume=self._settings.audio_mix_voice_volume,
+        )
+
+        # Save volume segments to JSON
+        volume_segments_file = track_dir / f"{stem}_volume_segments.json"
+        VocalProcessor.save_volume_segments(volume_segments, volume_segments_file)
+        self._state.volume_segments_file = str(volume_segments_file)
+
+        # Step 4: Apply volume segments to vocal track
+        processed_vocal_file = track_dir / f"{stem}_processed_vocal.mp3"
+        processor = VocalProcessor(
+            reverb_enabled=self._settings.vocal_reverb_enabled,
+            echo_enabled=self._settings.vocal_echo_enabled,
+        )
+        await processor.process(
+            vocal_file=vocal_file_str,
+            volume_segments=volume_segments,
+            output_file=str(processed_vocal_file),
+        )
+        self._state.processed_vocal_file = str(processed_vocal_file)
+
+        # Step 5: Create backvocal_mix_file: instrumental + processed_vocal
+        backvocal_mix_file = track_dir / f"{stem}_backvocal_mix.mp3"
+        await self._mix_instrumental_and_vocal(
+            instrumental_path=Path(instrumental_file_str),
+            vocal_path=processed_vocal_file,
+            output_path=backvocal_mix_file,
+        )
+        self._state.backvocal_mix_file = str(backvocal_mix_file)
+
+        self._save_state()
+        logger.info(
+            "MIX_AUDIO step completed for track_id=%s: "
+            "processed_vocal='%s', backvocal_mix='%s'",
+            self._state.track_id,
+            processed_vocal_file,
+            backvocal_mix_file,
+        )
+
+    async def _mix_instrumental_and_vocal(
+        self,
+        instrumental_path: Path,
+        vocal_path: Path,
+        output_path: Path,
+    ) -> None:
+        """Mix instrumental and processed vocal tracks into a single MP3 file.
+
+        Uses ffmpeg amix filter to combine the two audio streams.
+        The vocal is already at the correct volume (applied in VocalProcessor).
+        """
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # amix with weights 1:1 — vocal volume is already adjusted
+        filter_complex = "[0:a][1:a]amix=inputs=2:duration=longest:weights=1 1[aout]"
+
+        cmd: list[str] = [
+            "ffmpeg",
+            "-y",
+            "-i", str(instrumental_path.resolve()),
+            "-i", str(vocal_path.resolve()),
+            "-filter_complex", filter_complex,
+            "-map", "[aout]",
+            "-c:a", "libmp3lame",
+            "-b:a", "320k",
+            "-ar", "44100",
+            str(output_path.resolve()),
+        ]
+
+        logger.debug(
+            "MIX_AUDIO: mixing instrumental + processed_vocal → '%s'",
+            output_path,
+        )
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Не удалось запустить ffmpeg для микширования: {exc}"
+            ) from exc
+
+        stdout, stderr = await process.communicate()
+        stderr_text = stderr.decode("utf-8", errors="replace")
+
+        if stderr_text:
+            logger.debug("MIX_AUDIO ffmpeg stderr:\n%s", stderr_text)
+
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg завершился с кодом {process.returncode} при микшировании. "
+                f"Детали: {stderr_text[-500:]}"
+            )
+
+        if not output_path.exists():
+            raise RuntimeError(
+                f"ffmpeg завершился успешно, но файл микса не найден: {output_path}"
+            )
+
+        logger.info(
+            "MIX_AUDIO: backvocal mix created → '%s' (size=%d bytes)",
+            output_path,
+            output_path.stat().st_size,
+        )
+
+    # ------------------------------------------------------------------
     # Step: TRANSCRIBE
     # ------------------------------------------------------------------
 
@@ -1054,12 +1236,29 @@ class KaraokePipeline:
             mix_voice_volume=self._settings.audio_mix_voice_volume,
         )
 
+        # Pass backvocal_mix_path if available (from MIX_AUDIO step)
+        backvocal_mix_path: Path | None = None
+        if self._state.backvocal_mix_file:
+            candidate = Path(self._state.backvocal_mix_file)
+            if candidate.exists():
+                backvocal_mix_path = candidate
+                logger.info(
+                    "RENDER_VIDEO step: using backvocal_mix_file='%s' for 4th audio track",
+                    backvocal_mix_path,
+                )
+            else:
+                logger.warning(
+                    "RENDER_VIDEO step: backvocal_mix_file set but not found: '%s'",
+                    self._state.backvocal_mix_file,
+                )
+
         await renderer.render(
             instrumental_path=instrumental_path,
             original_path=original_path,
             vocal_path=vocal_path,
             ass_path=ass_path,
             output_path=output_path,
+            backvocal_mix_path=backvocal_mix_path,
         )
 
         self._state.output_file = str(output_path)

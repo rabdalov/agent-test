@@ -32,6 +32,7 @@ class PipelineStep(str, Enum):
     GET_LYRICS = "GET_LYRICS"
     SEPARATE = "SEPARATE"
     TRANSCRIBE = "TRANSCRIBE"
+    MIX_AUDIO = "MIX_AUDIO"
     CORRECT_TRANSCRIPT = "CORRECT_TRANSCRIPT"
     ALIGN = "ALIGN"
     GENERATE_ASS = "GENERATE_ASS"
@@ -74,6 +75,10 @@ class PipelineState(BaseModel):
     download_url: str | None = None
     notification_chat_id: int | None = None  # ID чата для редактирования уведомлений
     notification_message_id: int | None = None  # ID сообщения для редактирования уведомлений
+    # MIX_AUDIO step artifacts
+    volume_segments_file: str | None = None   # JSON с разметкой громкости вокала по сегментам
+    processed_vocal_file: str | None = None   # Обработанная вокальная дорожка (с применённой громкостью)
+    backvocal_mix_file: str | None = None     # MP3 микс: instrumental + processed_vocal
 
 
 class PipelineResult(BaseModel):

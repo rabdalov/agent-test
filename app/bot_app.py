@@ -171,25 +171,25 @@ class LoggingSession(AiohttpSession):
     ) -> Any:
         method_name = type(method).__name__
         log_parts = [f"[OUT] method={method_name}"]
+        if method_name!="GetUpdates":
+            # Извлекаем chat_id из параметров метода
+            chat_id = getattr(method, "chat_id", None)
+            if chat_id is not None:
+                log_parts.append(f"chat_id={chat_id}")
 
-        # Извлекаем chat_id из параметров метода
-        chat_id = getattr(method, "chat_id", None)
-        if chat_id is not None:
-            log_parts.append(f"chat_id={chat_id}")
+            # Извлекаем текст из параметров метода (первые 200 символов)
+            text = getattr(method, "text", None)
+            if text:
+                text_preview = str(text)[:200]
+                log_parts.append(f'text="{text_preview}"')
 
-        # Извлекаем текст из параметров метода (первые 200 символов)
-        text = getattr(method, "text", None)
-        if text:
-            text_preview = str(text)[:200]
-            log_parts.append(f'text="{text_preview}"')
+            # Для sendVideo/sendDocument — логируем без текста
+            caption = getattr(method, "caption", None)
+            if caption and not text:
+                caption_preview = str(caption)[:200]
+                log_parts.append(f'caption="{caption_preview}"')
 
-        # Для sendVideo/sendDocument — логируем без текста
-        caption = getattr(method, "caption", None)
-        if caption and not text:
-            caption_preview = str(caption)[:200]
-            log_parts.append(f'caption="{caption_preview}"')
-
-        self._logger.debug(" ".join(log_parts))
+            self._logger.debug(" ".join(log_parts))
 
         return await super().make_request(bot, method, timeout)
 
