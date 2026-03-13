@@ -298,18 +298,27 @@ class KaraokePipeline:
             logger.info("Step %s started for track_id=%s", step.value, self._state.track_id)
             await progress_callback(f"⏳ Шаг {step.value}: {label}...")
 
+            # Remember track folder before step (may change during DOWNLOAD)
+            folder_before_step = self._track_folder
+
             try:
                 await step_methods[step]()
             except WaitingForInputError:
                 # Pipeline paused waiting for user input
                 self._state.status = PipelineStatus.WAITING_FOR_INPUT
                 self._save_state()
+                # Clean up temporary folder if track folder changed during DOWNLOAD
+                if step == PipelineStep.DOWNLOAD and self._track_folder != folder_before_step:
+                    self._cleanup_tmp_folder(folder_before_step)
                 raise
             except LyricsNotFoundError:
                 # Let this propagate — the handler will request lyrics from the user.
                 self._state.status = PipelineStatus.FAILED
                 self._state.error_message = "Требуется ручной ввод текста песни"
                 self._save_state()
+                # Clean up temporary folder if track folder changed during DOWNLOAD
+                if step == PipelineStep.DOWNLOAD and self._track_folder != folder_before_step:
+                    self._cleanup_tmp_folder(folder_before_step)
                 raise
             except Exception as exc:
                 # Check if this is CORRECT_TRANSCRIPT step - continue to next step on error
@@ -335,12 +344,19 @@ class KaraokePipeline:
                 self._state.status = PipelineStatus.FAILED
                 self._state.error_message = error_msg
                 self._save_state()
+                # Clean up temporary folder if track folder changed during DOWNLOAD
+                if step == PipelineStep.DOWNLOAD and self._track_folder != folder_before_step:
+                    self._cleanup_tmp_folder(folder_before_step)
                 await progress_callback(f"❌ Шаг {step.value} завершился с ошибкой: {exc}")
                 return PipelineResult(
                     track_id=self._state.track_id,
                     status=PipelineStatus.FAILED,
                     error_message=error_msg,
                 )
+
+            # Clean up temporary folder if track folder changed during DOWNLOAD
+            if step == PipelineStep.DOWNLOAD and self._track_folder != folder_before_step:
+                self._cleanup_tmp_folder(folder_before_step)
 
             logger.info("Step %s completed for track_id=%s", step.value, self._state.track_id)
             await progress_callback(f"✅ Шаг {step.value}: {_STEP_LABELS[step]}...завершён")
@@ -463,8 +479,19 @@ class KaraokePipeline:
 
         final_path = target_dir / f"{track_stem}{suffix}"
 
-        # Download file
-        await self._bot.download_file(file_path, destination=final_path)
+        # Download file with extended timeout for large audio files (default 30s is not enough)
+        logger.info(
+            "DOWNLOAD (telegram_file): downloading file_id=%s to '%s'",
+            file_id,
+            final_path,
+        )
+        try:
+            await self._bot.download_file(file_path, destination=final_path, timeout=300)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ошибка при скачивании файла из Telegram (file_id={file_id}): "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
         self._state.track_file_name = final_path.name
         self._state.track_source = str(final_path)
@@ -1146,6 +1173,34 @@ class KaraokePipeline:
     # ------------------------------------------------------------------
     # Utility methods
     # ------------------------------------------------------------------
+
+    def _cleanup_tmp_folder(self, tmp_folder: Path) -> None:
+        """Remove a temporary track folder (e.g. _tmp_<uuid>) after DOWNLOAD renamed it.
+
+        Only removes folders whose name starts with '_tmp_' to avoid accidental deletion.
+        """
+        if not tmp_folder.name.startswith("_tmp_"):
+            logger.warning(
+                "Skipping cleanup of non-temporary folder '%s' for track_id=%s",
+                tmp_folder,
+                self._state.track_id,
+            )
+            return
+        try:
+            if tmp_folder.exists():
+                shutil.rmtree(tmp_folder)
+                logger.info(
+                    "Removed temporary folder '%s' for track_id=%s",
+                    tmp_folder,
+                    self._state.track_id,
+                )
+        except OSError as exc:
+            logger.warning(
+                "Failed to remove temporary folder '%s' for track_id=%s: %s",
+                tmp_folder,
+                self._state.track_id,
+                exc,
+            )
 
     def _cleanup_transcription(self, transcription_path: Path) -> None:
         """Clean up transcription JSON to remove unnecessary information.

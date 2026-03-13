@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Any
 
@@ -10,6 +11,7 @@ from aiogram.methods import TelegramMethod
 from aiogram.types import Update
 
 from .config import Settings
+from .config_watcher import ConfigWatcher
 from .handlers_karaoke import KaraokeHandlers
 
 
@@ -193,8 +195,9 @@ class LoggingSession(AiohttpSession):
 
 
 class BotApp:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, config_watcher: ConfigWatcher | None = None) -> None:
         self._settings = settings
+        self._config_watcher = config_watcher
         self._bot = Bot(
             token=settings.telegram_bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -203,9 +206,26 @@ class BotApp:
         self._dispatcher = Dispatcher(storage=MemoryStorage())
         # Регистрируем middleware для логирования входящих обновлений
         self._dispatcher.update.middleware(UpdateLoggingMiddleware())
+        self._watch_task: asyncio.Task | None = None
 
     def register_handlers(self, handlers: KaraokeHandlers) -> None:
         self._dispatcher.include_router(handlers.router)
 
     async def run_polling(self) -> None:
-        await self._dispatcher.start_polling(self._bot)
+        # Запускаем фоновую задачу мониторинга .env, если ConfigWatcher передан и включён
+        if self._config_watcher is not None:
+            settings = self._config_watcher.get_settings()
+            if settings.env_reload_enabled:
+                self._watch_task = asyncio.create_task(
+                    self._config_watcher.watch_loop(settings.env_reload_interval_sec),
+                    name="config_watcher",
+                )
+        try:
+            await self._dispatcher.start_polling(self._bot)
+        finally:
+            if self._watch_task is not None and not self._watch_task.done():
+                self._watch_task.cancel()
+                try:
+                    await self._watch_task
+                except asyncio.CancelledError:
+                    pass

@@ -71,6 +71,11 @@ class Settings(BaseModel):
     openrouter_api_url: str = "https://api.openrouter.ai/v1"
     # Enable/disable CORRECT_TRANSCRIPT step (uses LLM to correct transcription)
     correct_transcript_enabled: bool = True
+    # Hot-reload of .env configuration without bot restart
+    # Interval in seconds between .env modification checks (default: 30)
+    env_reload_interval_sec: int = 30
+    # Enable/disable hot-reload of .env (default: true)
+    env_reload_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -117,6 +122,8 @@ class Settings(BaseModel):
             "openrouter_model": os.getenv("OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free"),
             "openrouter_api_url": os.getenv("OPENROUTER_API", "https://api.openrouter.ai/v1"),
             "correct_transcript_enabled": os.getenv("CORRECT_TRANSCRIPT_ENABLED", "true").lower() in ("true", "1", "yes"),
+            "env_reload_interval_sec": int(os.getenv("ENV_RELOAD_INTERVAL_SEC", "30")),
+            "env_reload_enabled": os.getenv("ENV_RELOAD_ENABLED", "true").lower() in ("true", "1", "yes"),
         }
 
         settings = cls(**data)

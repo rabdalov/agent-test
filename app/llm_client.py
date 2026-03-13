@@ -75,7 +75,7 @@ class LLMClient:
         prompt: str,
         system_prompt: str | None = None,
         temperature: float = 0.1,
-        max_tokens: int = 4096,
+        max_tokens: int = 16000,
     ) -> str:
         """Send a completion request to the LLM.
 
@@ -83,7 +83,7 @@ class LLMClient:
             prompt: User prompt
             system_prompt: Optional system prompt
             temperature: Sampling temperature (0.0 - 2.0)
-            max_tokens: Maximum tokens in response
+            max_tokens: Maximum tokens in response (default 16000 to handle large transcriptions)
 
         Returns:
             LLM response text
@@ -132,16 +132,34 @@ class LLMClient:
                     choice.finish_reason,
                 )
 
+            finish_reason = response.choices[0].finish_reason
             content = response.choices[0].message.content
-            if content is None:
+
+            # Warn if response was truncated due to token limit
+            if finish_reason == "length":
+                logger.warning(
+                    "LLM response truncated (finish_reason=length): response_id=%s, model=%s, "
+                    "usage_completion=%d, max_tokens=%d. Consider reducing input size or increasing max_tokens.",
+                    response.id,
+                    response.model,
+                    response.usage.completion_tokens if response.usage else 0,
+                    max_tokens,
+                )
+
+            if not content:
                 # Log full response for debugging empty content
                 logger.error(
                     "LLM returned empty content: response_id=%s, model=%s, finish_reason=%s, choices=%s",
                     response.id,
                     response.model,
-                    response.choices[0].finish_reason,
+                    finish_reason,
                     [({"role": c.message.role, "content": repr(c.message.content)}) for c in response.choices],
                 )
+                if finish_reason == "length":
+                    raise RuntimeError(
+                        f"LLM response was truncated (finish_reason=length, max_tokens={max_tokens}). "
+                        "Input is too large for a single request. Try reducing input size."
+                    )
                 raise RuntimeError("LLM returned empty response")
 
             logger.debug(

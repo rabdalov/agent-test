@@ -14,6 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .config import Settings
+from .config_watcher import ConfigWatcher
 from .models import (
     LyricsStates,
     PipelineResult,
@@ -30,12 +31,32 @@ from .utils import normalize_filename
 
 
 class KaraokeHandlers:
-    def __init__(self, settings: Settings) -> None:
-        self._settings = settings
+    def __init__(self, settings: Settings, config_watcher: ConfigWatcher | None = None) -> None:
+        self._config_watcher = config_watcher
+        self._settings_obj = settings
         self._tracks_root_dir: Path = settings.tracks_root_dir
         self._logger = logging.getLogger(__name__)
         self.router = Router()
         self._register_handlers()
+
+        # Регистрируем callback для обновления _tracks_root_dir при перезагрузке конфигурации
+        if config_watcher is not None:
+            config_watcher.add_reload_callback(self._on_settings_reloaded)
+
+    @property
+    def _settings(self) -> Settings:
+        """Возвращает актуальные настройки через ConfigWatcher (если задан) или исходный объект."""
+        if self._config_watcher is not None:
+            return self._config_watcher.get_settings()
+        return self._settings_obj
+
+    def _on_settings_reloaded(self, new_settings: Settings) -> None:
+        """Callback, вызываемый при перезагрузке конфигурации."""
+        self._tracks_root_dir = new_settings.tracks_root_dir
+        self._logger.info(
+            "KaraokeHandlers: конфигурация обновлена, tracks_root_dir=%s",
+            self._tracks_root_dir,
+        )
 
     # ------------------------------------------------------------------
     # Access control
@@ -174,6 +195,20 @@ class KaraokeHandlers:
                 await message.answer(
                     "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
                 )
+
+        @self.router.message(Command("step_download"))
+        async def handle_step_download(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+            await self._handle_step_command(message, PipelineStep.DOWNLOAD, state)
+
+        @self.router.message(Command("step_language"))
+        async def handle_step_language(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+            await self._handle_step_command(message, PipelineStep.ASK_LANGUAGE, state)
 
         @self.router.message(Command("step_lyrics"))
         async def handle_step_lyrics(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
