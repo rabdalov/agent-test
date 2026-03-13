@@ -159,10 +159,12 @@ class VocalProcessor:
         return output_file
 
     def _build_volume_filter(self, volume_segments: list[VolumeSegment]) -> str:
-        """Построить строку ffmpeg-фильтра `volume` с временными сегментами.
+        """Построить строку ffmpeg-фильтра ``volume`` с временными сегментами.
 
-        Использует выражение ``enable='between(t,start,end)'`` для каждого сегмента.
-        Между сегментами применяется базовая громкость (последнее значение).
+        Использует вложенное выражение ``if(between(t,start,end),vol,...)``
+        для каждого сегмента. Параметр ``eval=frame`` обязателен — без него
+        ffmpeg вычисляет выражение **один раз** (при ``t=0``) и применяет
+        одну громкость ко всему файлу.
 
         Parameters
         ----------
@@ -172,8 +174,9 @@ class VocalProcessor:
         Returns
         -------
         str
-            Строка ffmpeg-фильтра, например:
-            ``volume=volume='if(between(t,10,30),0.3,if(between(t,60,90),0.3,0.4))'``
+            Строка ffmpeg-фильтра, например::
+
+                volume=volume='if(between(t,10,30),1.0,if(between(t,60,90),1.0,0.4))':eval=frame
         """
         if not volume_segments:
             return "volume=1.0"
@@ -181,16 +184,20 @@ class VocalProcessor:
         # Sort segments by start time
         sorted_segments = sorted(volume_segments, key=lambda s: s.start)
 
-        # Determine default volume (volume outside all segments)
-        # Use the volume of the first segment as default (typically AUDIO_MIX_VOICE_VOLUME)
-        # The last segment's volume is used as the "else" fallback
-        default_volume = sorted_segments[0].volume
+        # Determine default volume (volume outside all segments).
+        # When segments cover the whole track (normal case from build_volume_segments),
+        # this fallback is never reached. When only chorus segments are passed,
+        # the fallback should be the non-chorus (lower) volume — use the last
+        # segment's volume as a safe default (typically AUDIO_MIX_VOICE_VOLUME).
+        default_volume = sorted_segments[-1].volume
 
-        # Build nested if expression for ffmpeg volume filter
+        # Build nested if expression for ffmpeg volume filter.
         # Format: if(between(t,start,end),vol,if(between(t,...),vol,...,default))
-        # We build from the inside out (last segment first)
+        # We build from the inside out (last segment first).
         expr = str(default_volume)
         for seg in reversed(sorted_segments):
             expr = f"if(between(t,{seg.start:.3f},{seg.end:.3f}),{seg.volume},{expr})"
 
-        return f"volume=volume='{expr}'"
+        # eval=frame is REQUIRED: without it ffmpeg evaluates the expression only
+        # once (at t=0) and applies a single constant volume to the whole file.
+        return f"volume=volume='{expr}':eval=frame"
