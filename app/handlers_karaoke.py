@@ -224,6 +224,13 @@ class KaraokeHandlers:
                 return
             await self._handle_step_command(message, PipelineStep.SEPARATE, state)
 
+        @self.router.message(Command("step_chorus"))
+        async def handle_step_chorus(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+            await self._handle_step_command(message, PipelineStep.DETECT_CHORUS, state)
+
         @self.router.message(Command("step_mix"))
         async def handle_step_mix(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             if not self._is_user_allowed(message):

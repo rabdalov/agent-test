@@ -12,7 +12,13 @@ from aiogram import Bot
 
 from .alignment_service import AlignmentService, save_aligned_result
 from .ass_generator import AssGenerator
-from .chorus_detector import ChorusDetector
+from .chorus_detector import (
+    ChorusDetector,
+    VolumeSegment,
+    build_volume_segments,
+    load_volume_segments,
+    save_volume_segments,
+)
 from .config import Settings
 from .correct_transcript_service import CorrectTranscriptService
 from .demucs_service import DemucsService
@@ -20,7 +26,7 @@ from .llm_client import LLMClient
 from .lyrics_service import LyricsService
 from .speeches_client import SpeechesClient
 from .video_renderer import VideoRenderer
-from .vocal_processor import VocalProcessor, VolumeSegment
+from .vocal_processor import VocalProcessor
 from .models import (
     PipelineResult,
     PipelineState,
@@ -50,9 +56,10 @@ _STEP_LABELS: dict[PipelineStep, str] = {
     PipelineStep.GET_LYRICS: "получение текста",
     PipelineStep.SEPARATE: "разделение дорожек",
     PipelineStep.TRANSCRIBE: "транскрипция",
-    PipelineStep.MIX_AUDIO: "обработка вокала (бэк-вокал)",
+    PipelineStep.DETECT_CHORUS: "определение припевов",
     PipelineStep.CORRECT_TRANSCRIPT: "корректировка транскрипции",
     PipelineStep.ALIGN: "выравнивание",
+    PipelineStep.MIX_AUDIO: "обработка вокала (бэк-вокал)",
     PipelineStep.GENERATE_ASS: "генерация субтитров",
     PipelineStep.RENDER_VIDEO: "рендеринг видео",
     PipelineStep.SEND_VIDEO: "отправка результата",
@@ -64,9 +71,10 @@ _ORDERED_STEPS: list[PipelineStep] = [
     PipelineStep.GET_LYRICS,
     PipelineStep.SEPARATE,
     PipelineStep.TRANSCRIBE,
-    PipelineStep.MIX_AUDIO,
+    PipelineStep.DETECT_CHORUS,
     PipelineStep.CORRECT_TRANSCRIPT,
     PipelineStep.ALIGN,
+    PipelineStep.MIX_AUDIO,
     PipelineStep.GENERATE_ASS,
     PipelineStep.RENDER_VIDEO,
     PipelineStep.SEND_VIDEO,
@@ -79,9 +87,10 @@ _STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
     PipelineStep.GET_LYRICS: ["track_file_name", "track_stem"],
     PipelineStep.SEPARATE: ["track_source"],
     PipelineStep.TRANSCRIBE: ["vocal_file"],
-    PipelineStep.MIX_AUDIO: ["vocal_file", "instrumental_file"],
+    PipelineStep.DETECT_CHORUS: ["vocal_file", "instrumental_file"],
     PipelineStep.CORRECT_TRANSCRIPT: ["transcribe_json_file", "source_lyrics_file"],
     PipelineStep.ALIGN: ["source_lyrics_file", "transcribe_json_file"],
+    PipelineStep.MIX_AUDIO: ["vocal_file", "instrumental_file", "volume_segments_file"],
     PipelineStep.GENERATE_ASS: ["aligned_lyrics_file"],
     PipelineStep.RENDER_VIDEO: ["ass_file", "vocal_file", "instrumental_file"],
     PipelineStep.SEND_VIDEO: ["output_file"],
@@ -284,9 +293,10 @@ class KaraokePipeline:
             PipelineStep.GET_LYRICS: self._step_get_lyrics,
             PipelineStep.SEPARATE: self._step_separate,
             PipelineStep.TRANSCRIBE: self._step_transcribe,
-            PipelineStep.MIX_AUDIO: self._step_mix_audio,
+            PipelineStep.DETECT_CHORUS: self._step_detect_chorus,
             PipelineStep.CORRECT_TRANSCRIPT: self._step_correct_transcribe,
             PipelineStep.ALIGN: self._step_align,
+            PipelineStep.MIX_AUDIO: self._step_mix_audio,
             PipelineStep.GENERATE_ASS: self._step_generate_ass,
             PipelineStep.RENDER_VIDEO: self._step_render_video,
             PipelineStep.SEND_VIDEO: self._step_send_video,
@@ -834,17 +844,99 @@ class KaraokePipeline:
         self._save_state()
 
     # ------------------------------------------------------------------
-    # Step: MIX_AUDIO — обработка вокала с эффектом бэк-вокала
+    # Step: DETECT_CHORUS — определение припевов и формирование volume_segments
     # ------------------------------------------------------------------
 
-    async def _step_mix_audio(self) -> None:
-        """Apply back-vocal effect: reduce vocal volume outside choruses, boost in choruses.
+    async def _step_detect_chorus(self) -> None:
+        """Detect chorus segments and build volume_segments_file.
 
         Steps:
         1. Detect chorus segments via ChorusDetector (msaf/librosa/hybrid).
         2. Build volume_segments based on chorus positions.
-        3. Apply volume segments to vocal track via VocalProcessor (ffmpeg).
-        4. Create backvocal_mix_file: instrumental + processed_vocal.
+        3. Save volume_segments to JSON file (volume_segments_file).
+        """
+        # Check if step is enabled in config
+        if not self._settings.detect_chorus_enabled:
+            logger.info(
+                "DETECT_CHORUS step skipped (DETECT_CHORUS_ENABLED=false in config) for track_id=%s",
+                self._state.track_id,
+            )
+            return
+
+        full_file_str = self._state.track_source
+        if not full_file_str:
+            raise RuntimeError("track_source не задан — шаг DOWNLOAD не был выполнен")
+
+        raw_stem = self._state.track_stem or "track"
+        stem = normalize_filename(raw_stem)
+        track_dir = self._track_folder
+
+        # Step 1: Detect chorus segments with extended info
+        logger.info(
+            "DETECT_CHORUS step: detecting chorus segments for track_id=%s (backend=%s)",
+            self._state.track_id,
+            self._settings.chorus_detector_backend,
+        )
+        detector = ChorusDetector(
+            backend=self._settings.chorus_detector_backend,
+            min_duration_sec=self._settings.chorus_min_duration_sec,
+            max_duration_sec=self._settings.chorus_max_duration_sec,
+        )
+        segment_infos = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: detector.detect_with_info(full_file_str),
+        )
+        # Извлекаем только chorus-сегменты для построения volume_segments
+        chorus_segments = [
+            (s.start, s.end) for s in segment_infos if s.segment_type == "chorus"
+        ]
+        logger.info(
+            "DETECT_CHORUS step: found %d chorus segment(s) for track_id=%s",
+            len(chorus_segments),
+            self._state.track_id,
+        )
+
+        # Step 2: Probe audio duration for building full volume_segments coverage
+        audio_duration = await self._probe_audio_duration(Path(full_file_str))
+        if audio_duration is None:
+            logger.warning(
+                "DETECT_CHORUS step: could not probe audio duration for '%s', using 0.0",
+                full_file_str,
+            )
+            audio_duration = 0.0
+
+        # Step 3: Build volume segments (с передачей расширенной информации о сегментах)
+        volume_segments = build_volume_segments(
+            chorus_segments=chorus_segments,
+            audio_duration=audio_duration,
+            chorus_volume=self._settings.chorus_backvocal_volume,
+            default_volume=self._settings.audio_mix_voice_volume,
+            segment_infos=segment_infos,
+        )
+
+        # Save volume segments to JSON
+        volume_segments_file = track_dir / f"{stem}_volume_segments.json"
+        save_volume_segments(volume_segments, volume_segments_file)
+        self._state.volume_segments_file = str(volume_segments_file)
+
+        self._save_state()
+        logger.info(
+            "DETECT_CHORUS step completed for track_id=%s: volume_segments_file='%s'",
+            self._state.track_id,
+            volume_segments_file,
+        )
+
+    # ------------------------------------------------------------------
+    # Step: MIX_AUDIO — обработка вокала с эффектом бэк-вокала
+    # ------------------------------------------------------------------
+
+    async def _step_mix_audio(self) -> None:
+        """Apply back-vocal effect using pre-built volume_segments_file.
+
+        Steps:
+        1. Load volume_segments from volume_segments_file (built in DETECT_CHORUS step).
+        2. Apply volume segments to vocal track via VocalProcessor (ffmpeg).
+        3. Create backvocal_mix_file: instrumental + processed_vocal.
         """
         # Check if step is enabled in config
         if not self._settings.mix_audio_enabled:
@@ -856,61 +948,30 @@ class KaraokePipeline:
 
         vocal_file_str = self._state.vocal_file
         instrumental_file_str = self._state.instrumental_file
-        full_file_str = self._state.track_source
+        volume_segments_file_str = self._state.volume_segments_file
         if not vocal_file_str:
             raise RuntimeError("vocal_file не задан — шаг SEPARATE не был выполнен")
         if not instrumental_file_str:
             raise RuntimeError("instrumental_file не задан — шаг SEPARATE не был выполнен")
+        if not volume_segments_file_str:
+            raise RuntimeError(
+                "volume_segments_file не задан — шаг DETECT_CHORUS не был выполнен"
+            )
 
         raw_stem = self._state.track_stem or "track"
         stem = normalize_filename(raw_stem)
         track_dir = self._track_folder
 
-        # Step 1: Detect chorus segments
+        # Step 1: Load volume segments from file
+        volume_segments = load_volume_segments(Path(volume_segments_file_str))
         logger.info(
-            "MIX_AUDIO step: detecting chorus segments for track_id=%s (backend=%s)",
-            self._state.track_id,
-            self._settings.chorus_detector_backend,
-        )
-        detector = ChorusDetector(
-            backend=self._settings.chorus_detector_backend,
-            min_duration_sec=self._settings.chorus_min_duration_sec,
-            max_duration_sec=self._settings.chorus_max_duration_sec,
-        )
-        chorus_segments = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: detector.detect(full_file_str),
-        )
-        logger.info(
-            "MIX_AUDIO step: found %d chorus segment(s) for track_id=%s",
-            len(chorus_segments),
+            "MIX_AUDIO step: loaded %d volume segment(s) from '%s' for track_id=%s",
+            len(volume_segments),
+            volume_segments_file_str,
             self._state.track_id,
         )
 
-        # Step 2: Probe audio duration for building full volume_segments coverage
-        vocal_path = Path(full_file_str)
-        audio_duration = await self._probe_audio_duration(vocal_path)
-        if audio_duration is None:
-            logger.warning(
-                "MIX_AUDIO step: could not probe audio duration for '%s', using 0.0",
-                full_file_str,
-            )
-            audio_duration = 0.0
-
-        # Step 3: Build volume segments
-        volume_segments = VocalProcessor.build_volume_segments(
-            chorus_segments=chorus_segments,
-            audio_duration=audio_duration,
-            chorus_volume=self._settings.chorus_backvocal_volume,
-            default_volume=self._settings.audio_mix_voice_volume,
-        )
-
-        # Save volume segments to JSON
-        volume_segments_file = track_dir / f"{stem}_volume_segments.json"
-        VocalProcessor.save_volume_segments(volume_segments, volume_segments_file)
-        self._state.volume_segments_file = str(volume_segments_file)
-
-        # Step 4: Apply volume segments to vocal track
+        # Step 2: Apply volume segments to vocal track
         processed_vocal_file = track_dir / f"{stem}_processed_vocal.mp3"
         processor = VocalProcessor(
             reverb_enabled=self._settings.vocal_reverb_enabled,
@@ -923,7 +984,7 @@ class KaraokePipeline:
         )
         self._state.processed_vocal_file = str(processed_vocal_file)
 
-        # Step 5: Create backvocal_mix_file: instrumental + processed_vocal
+        # Step 3: Create backvocal_mix_file: instrumental + processed_vocal
         backvocal_mix_file = track_dir / f"{stem}_backvocal_mix.mp3"
         await self._mix_instrumental_and_vocal(
             instrumental_path=Path(instrumental_file_str),

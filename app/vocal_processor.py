@@ -6,30 +6,12 @@
 """
 
 import asyncio
-import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 
+from .chorus_detector import VolumeSegment  # noqa: F401 — re-exported for convenience
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class VolumeSegment:
-    """Временной сегмент с заданной громкостью вокала.
-
-    Attributes
-    ----------
-    start:
-        Начало сегмента в секундах.
-    end:
-        Конец сегмента в секундах.
-    volume:
-        Громкость вокала в данном сегменте (0.0–1.0, где 1.0 = 100%).
-    """
-    start: float
-    end: float
-    volume: float
 
 
 class VocalProcessorError(Exception):
@@ -212,82 +194,3 @@ class VocalProcessor:
             expr = f"if(between(t,{seg.start:.3f},{seg.end:.3f}),{seg.volume},{expr})"
 
         return f"volume=volume='{expr}'"
-
-    @staticmethod
-    def build_volume_segments(
-        chorus_segments: list[tuple[float, float]],
-        audio_duration: float,
-        chorus_volume: float,
-        default_volume: float,
-    ) -> list[VolumeSegment]:
-        """Построить список сегментов громкости на основе найденных припевов.
-
-        Parameters
-        ----------
-        chorus_segments:
-            Список кортежей ``(start_sec, end_sec)`` для каждого припева.
-        audio_duration:
-            Общая длительность аудиофайла в секундах.
-        chorus_volume:
-            Громкость вокала в припевах (``CHORUS_BACKVOCAL_VOLUME``).
-        default_volume:
-            Громкость вокала вне припевов (``AUDIO_MIX_VOICE_VOLUME``).
-
-        Returns
-        -------
-        list[VolumeSegment]
-            Полный список сегментов, покрывающий весь трек.
-        """
-        if not chorus_segments:
-            # No chorus detected — use default volume for the whole track
-            return [VolumeSegment(start=0.0, end=audio_duration, volume=default_volume)]
-
-        sorted_chorus = sorted(chorus_segments, key=lambda s: s[0])
-        segments: list[VolumeSegment] = []
-
-        current_pos = 0.0
-        for start, end in sorted_chorus:
-            # Non-chorus segment before this chorus
-            if start > current_pos:
-                segments.append(
-                    VolumeSegment(start=current_pos, end=start, volume=default_volume)
-                )
-            # Chorus segment
-            segments.append(VolumeSegment(start=start, end=end, volume=chorus_volume))
-            current_pos = end
-
-        # Non-chorus segment after the last chorus
-        if current_pos < audio_duration:
-            segments.append(
-                VolumeSegment(start=current_pos, end=audio_duration, volume=default_volume)
-            )
-
-        return segments
-
-    @staticmethod
-    def save_volume_segments(
-        segments: list[VolumeSegment],
-        output_path: Path,
-    ) -> None:
-        """Сохранить разметку громкости в JSON-файл.
-
-        Parameters
-        ----------
-        segments:
-            Список сегментов громкости.
-        output_path:
-            Путь к выходному JSON-файлу.
-        """
-        data = [
-            {"start": seg.start, "end": seg.end, "volume": seg.volume}
-            for seg in segments
-        ]
-        output_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        logger.debug(
-            "VocalProcessor: saved %d volume segments to '%s'",
-            len(segments),
-            output_path,
-        )

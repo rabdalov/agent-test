@@ -76,6 +76,9 @@ class Settings(BaseModel):
     env_reload_interval_sec: int = 30
     # Enable/disable hot-reload of .env (default: true)
     env_reload_enabled: bool = True
+    # DETECT_CHORUS step settings
+    # Enable/disable the DETECT_CHORUS step entirely (default: true)
+    detect_chorus_enabled: bool = True
     # MIX_AUDIO step settings (back-vocal effect)
     # Enable/disable the MIX_AUDIO step entirely (default: true)
     mix_audio_enabled: bool = True
@@ -139,6 +142,7 @@ class Settings(BaseModel):
             "correct_transcript_enabled": os.getenv("CORRECT_TRANSCRIPT_ENABLED", "true").lower() in ("true", "1", "yes"),
             "env_reload_interval_sec": int(os.getenv("ENV_RELOAD_INTERVAL_SEC", "30")),
             "env_reload_enabled": os.getenv("ENV_RELOAD_ENABLED", "true").lower() in ("true", "1", "yes"),
+            "detect_chorus_enabled": os.getenv("DETECT_CHORUS_ENABLED", "true").lower() in ("true", "1", "yes"),
             "mix_audio_enabled": os.getenv("MIX_AUDIO_ENABLED", "true").lower() in ("true", "1", "yes"),
             "chorus_backvocal_volume": float(os.getenv("CHORUS_BACKVOCAL_VOLUME", "0.3")),
             "vocal_reverb_enabled": os.getenv("VOCAL_REVERB_ENABLED", "false").lower() in ("true", "1", "yes"),

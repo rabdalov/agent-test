@@ -58,6 +58,40 @@ def print_segments(label: str, segments: list[tuple[float, float]]) -> None:
         print(f"  [{i}] {format_time(start)} → {format_time(end)}  ({duration:.1f} сек)")
 
 
+def print_segments_with_info(label: str, segments: list) -> None:
+    """Вывести найденные сегменты с расширенной информацией (SegmentInfo)."""
+    from app.chorus_detector import SegmentInfo
+
+    print(f"\n{'='*60}")
+    print(f"  {label}")
+    print(f"{'='*60}")
+    if not segments:
+        print("  ⚠️  Сегменты не найдены (пустой список)")
+        return
+
+    chorus_segs = [s for s in segments if isinstance(s, SegmentInfo) and s.segment_type == "chorus"]
+    non_chorus_segs = [s for s in segments if isinstance(s, SegmentInfo) and s.segment_type != "chorus"]
+
+    total_chorus_dur = sum(s.duration for s in chorus_segs)
+    print(f"  Всего сегментов: {len(segments)}  (припевов: {len(chorus_segs)}, не-припевов: {len(non_chorus_segs)})")
+    if chorus_segs:
+        print(f"  Суммарная длительность припевов: {total_chorus_dur:.1f} сек ({format_time(total_chorus_dur)})")
+    print()
+
+    for i, seg in enumerate(segments, 1):
+        if not isinstance(seg, SegmentInfo):
+            continue
+        marker = "🎵" if seg.segment_type == "chorus" else "  "
+        print(f"  {marker} [{i}] {format_time(seg.start)} → {format_time(seg.end)}  "
+              f"({seg.duration:.1f} сек)  [{seg.segment_type}]  backend={seg.backend}")
+        if seg.scores:
+            scores_str = "  ".join(
+                f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in seg.scores.items()
+            )
+            print(f"         scores: {scores_str}")
+
+
 def compare_results(
     results: dict[str, list[tuple[float, float]]],
 ) -> None:
@@ -140,21 +174,28 @@ def compare_backends(
 
 def run_single_backend(backend: str, test_files: dict[str, Path]) -> None:
     """Запустить тест для одного бэкенда на всех файлах."""
-    from app.chorus_detector import ChorusDetector
+    from app.chorus_detector import ChorusDetector, SegmentInfo
 
     print(f"\n{'#'*60}")
     print(f"  БЭКЕНД: {backend.upper()}")
     print(f"{'#'*60}")
 
     detector = ChorusDetector(backend=backend, min_duration_sec=15.0, max_duration_sec=60.0)
+    # Для сравнения используем только chorus-сегменты (tuple)
     results: dict[str, list[tuple[float, float]]] = {}
 
     for label, path in test_files.items():
         print(f"\n[...] Анализирую: {label} ({path.name}) [backend={backend}]...")
         try:
-            segments = detector.detect(str(path))
-            results[label] = segments
-            print_segments(f"{label} [{backend}]", segments)
+            segment_infos = detector.detect_with_info(str(path))
+            # Выводим расширенную информацию
+            print_segments_with_info(f"{label} [{backend}]", segment_infos)
+            # Для сравнения сохраняем только chorus-сегменты
+            chorus_segs = [
+                (s.start, s.end) for s in segment_infos
+                if isinstance(s, SegmentInfo) and s.segment_type == "chorus"
+            ]
+            results[label] = chorus_segs
         except Exception as exc:
             print(f"  [!!] Ошибка при анализе '{label}': {exc}")
             results[label] = []
@@ -175,7 +216,7 @@ def run_single_backend(backend: str, test_files: dict[str, Path]) -> None:
 
 def run_all_backends(test_files: dict[str, Path]) -> None:
     """Запустить тест для всех бэкендов и сравнить результаты."""
-    from app.chorus_detector import ChorusDetector
+    from app.chorus_detector import ChorusDetector, SegmentInfo
 
     # Собираем результаты по всем бэкендам для каждого файла
     all_results: dict[str, dict[str, list[tuple[float, float]]]] = {
@@ -192,9 +233,15 @@ def run_all_backends(test_files: dict[str, Path]) -> None:
         for label, path in test_files.items():
             print(f"\n[...] Анализирую: {label} ({path.name}) [backend={backend}]...")
             try:
-                segments = detector.detect(str(path))
-                all_results[label][backend] = segments
-                print_segments(f"{label} [{backend}]", segments)
+                segment_infos = detector.detect_with_info(str(path))
+                # Выводим расширенную информацию
+                print_segments_with_info(f"{label} [{backend}]", segment_infos)
+                # Для сравнения сохраняем только chorus-сегменты
+                chorus_segs = [
+                    (s.start, s.end) for s in segment_infos
+                    if isinstance(s, SegmentInfo) and s.segment_type == "chorus"
+                ]
+                all_results[label][backend] = chorus_segs
             except Exception as exc:
                 print(f"  [!!] Ошибка при анализе '{label}': {exc}")
                 all_results[label][backend] = []
