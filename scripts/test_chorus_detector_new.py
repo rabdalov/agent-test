@@ -8,6 +8,8 @@
 5. Сводную таблицу по типам сегментов
 
 Пути к файлам прописаны хардкодом для конкретного трека.
+Запуск:
+uv run -m scripts.test_chorus_detector_new
 """
 
 from __future__ import annotations

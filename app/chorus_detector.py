@@ -158,6 +158,68 @@ def _boundaries_to_segments(
     return [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
 
 
+def _merge_short_segments(
+    segments: list[tuple[float, float]],
+    min_duration_sec: float,
+) -> list[tuple[float, float]]:
+    """Объединить короткие сегменты с соседними, не удаляя их.
+
+    Алгоритм: проходим по сегментам слева направо. Если текущий сегмент
+    короче ``min_duration_sec`` — объединяем его с предыдущим (расширяем
+    конец предыдущего до конца текущего). Если предыдущего нет — объединяем
+    со следующим (расширяем начало следующего до начала текущего).
+    Повторяем до тех пор, пока все сегменты не будут >= min_duration_sec
+    или пока не останется один сегмент.
+
+    Parameters
+    ----------
+    segments:
+        Список кортежей ``(start, end)`` в хронологическом порядке.
+    min_duration_sec:
+        Минимальная допустимая длительность сегмента в секундах.
+
+    Returns
+    -------
+    list[tuple[float, float]]
+        Список сегментов, каждый из которых >= min_duration_sec.
+        Временно́е пространство полностью покрыто без пробелов.
+    """
+    if not segments:
+        return []
+
+    result = list(segments)
+    changed = True
+    while changed and len(result) > 1:
+        changed = False
+        new_result: list[tuple[float, float]] = []
+        i = 0
+        while i < len(result):
+            start, end = result[i]
+            duration = end - start
+            if duration < min_duration_sec:
+                # Объединяем с предыдущим, если он есть
+                if new_result:
+                    prev_start, _ = new_result[-1]
+                    new_result[-1] = (prev_start, end)
+                    changed = True
+                elif i + 1 < len(result):
+                    # Нет предыдущего — объединяем со следующим
+                    next_start, next_end = result[i + 1]
+                    new_result.append((start, next_end))
+                    i += 2
+                    changed = True
+                    continue
+                else:
+                    # Единственный сегмент — оставляем как есть
+                    new_result.append((start, end))
+            else:
+                new_result.append((start, end))
+            i += 1
+        result = new_result
+
+    return result
+
+
 def _compute_vocal_energy_per_segment(
     vocal_file: str,
     segments: list[tuple[float, float]],
@@ -287,10 +349,21 @@ def build_volume_segments(
     list[VolumeSegment]
         Полный список сегментов, покрывающий весь трек.
     """
-    # Если переданы расширенные данные детектора — используем их напрямую.
+    # Если переданы расширенные данные детектора — используем их с заполнением пробелов.
     if segment_infos:
         result: list[VolumeSegment] = []
-        for info in sorted(segment_infos, key=lambda s: s.start):
+        sorted_infos = sorted(segment_infos, key=lambda s: s.start)
+        current_pos = 0.0
+        for info in sorted_infos:
+            # Заполнить пробел перед сегментом (если есть)
+            if info.start > current_pos + 0.01:
+                result.append(
+                    VolumeSegment(
+                        start=current_pos,
+                        end=info.start,
+                        volume=default_volume,
+                    )
+                )
             volume = _get_volume_for_segment_type(
                 info.segment_type, chorus_volume, default_volume
             )
@@ -302,6 +375,16 @@ def build_volume_segments(
                     segment_type=info.segment_type,
                     backend=info.backend,
                     scores=dict(info.scores),
+                )
+            )
+            current_pos = info.end
+        # Заполнить пробел после последнего сегмента (если есть)
+        if current_pos < audio_duration - 0.01:
+            result.append(
+                VolumeSegment(
+                    start=current_pos,
+                    end=audio_duration,
+                    volume=default_volume,
                 )
             )
         return result
@@ -551,12 +634,13 @@ class ChorusDetector:
             tolerance_sec=self._boundary_merge_tolerance,
         )
         segments = _boundaries_to_segments(merged_boundaries)
-        # Фильтрация по минимальной длительности
-        segments = [(s, e) for s, e in segments if (e - s) >= self._min_duration]
+        # Объединяем короткие сегменты с соседними (не удаляем — это создаёт пробелы)
+        segments = _merge_short_segments(segments, self._min_duration)
 
         if not segments:
             logger.warning(
-                "ChorusDetector: no segments after filtering by min_duration=%.1f for '%s'",
+                "ChorusDetector: no segments after merging short segments "
+                "(min_duration=%.1f) for '%s'",
                 self._min_duration,
                 audio_file,
             )
