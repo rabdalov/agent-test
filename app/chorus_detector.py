@@ -1,16 +1,14 @@
-"""ChorusDetector — определение временных отрезков припевов в аудиофайле.
+"""ChorusDetector — определение временных отрезков сегментов в аудиофайле.
 
-Поддерживает три бэкенда (управляется через конфигурацию `CHORUS_DETECTOR_BACKEND`):
+Поддерживает два режима работы:
 
-- ``msaf``    — текущий подход через `msaf.process()` (spectral clustering).
-- ``librosa`` — новый подход на основе признаков `librosa`:
-                chroma, self-similarity matrix, tempogram stability, HPSS energy.
-- ``hybrid``  — объединяет результаты обоих подходов для повышения точности.
+- **Двухфайловый** (``vocal_file`` передан): объединяет границы из ``track_source``
+  и ``vocal_file`` через msaf, обогащает признаками librosa, классифицирует сегменты
+  по расширенному набору типов.
+- **Однофайловый** (``vocal_file`` не передан): работает только через msaf на
+  ``track_source``, без детектирования ``"instrumental"``.
 
-Метод :meth:`detect` возвращает список кортежей ``(start_sec, end_sec)``
-для каждого найденного припева.
-
-Метод :meth:`detect_with_info` возвращает список :class:`SegmentInfo` с расширенной
+Метод :meth:`ChorusDetector.detect` возвращает список :class:`SegmentInfo` с расширенной
 информацией о каждом сегменте: тип сегмента и характеристики детекторов.
 """
 
@@ -20,17 +18,16 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 
-if TYPE_CHECKING:
-    pass
-
 logger = logging.getLogger(__name__)
 
-# Тип для сегмента с меткой
-_Segment = tuple[float, float, int]
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -44,24 +41,20 @@ class SegmentInfo:
     end:
         Конец сегмента в секундах.
     segment_type:
-        Тип сегмента: ``"chorus"`` — припев, ``"non-chorus"`` — не припев.
+        Тип сегмента: ``"chorus"`` | ``"verse"`` | ``"bridge"`` |
+        ``"intro"`` | ``"outro"`` | ``"instrumental"``.
     backend:
-        Бэкенд, которым был найден сегмент: ``"msaf"``, ``"librosa"`` или ``"hybrid"``.
+        Бэкенд, которым был найден сегмент: ``"dual_file"`` или ``"single_file"``.
     scores:
         Словарь с характеристиками детектора для данного сегмента.
-        Набор ключей зависит от бэкенда:
-
-        - ``msaf``: ``{"label": int, "label_count": int, "label_duration": float}``
-        - ``librosa``: ``{"sim_score": float, "hpss_score": float,
-          "tempo_score": float, "total_score": float}``
-        - ``hybrid``: ``{"confirmed_by": str}`` — источник подтверждения
-          (``"librosa"``, ``"msaf"`` или ``"librosa_fallback"``).
+        Возможные ключи: ``vocal_energy``, ``chroma_variance``,
+        ``sim_score``, ``hpss_score``, ``tempo_score``.
     """
 
     start: float
     end: float
-    segment_type: str  # "chorus" | "non-chorus"
-    backend: str       # "msaf" | "librosa" | "hybrid"
+    segment_type: str  # "chorus" | "verse" | "bridge" | "intro" | "outro" | "instrumental"
+    backend: str       # "dual_file" | "single_file"
     scores: dict[str, float | int | str] = field(default_factory=dict)
 
     @property
@@ -86,11 +79,12 @@ class VolumeSegment:
     volume:
         Громкость вокала в данном сегменте (0.0–1.0, где 1.0 = 100%).
     segment_type:
-        Тип сегмента из детектора: ``"chorus"``, ``"non-chorus"`` или ``None``
+        Тип сегмента из детектора: ``"chorus"``, ``"verse"``, ``"bridge"``,
+        ``"intro"``, ``"outro"``, ``"instrumental"`` или ``None``
         (если информация о типе недоступна).
     backend:
-        Бэкенд детектора, которым был найден сегмент: ``"msaf"``, ``"librosa"``,
-        ``"hybrid"`` или ``None``.
+        Бэкенд детектора, которым был найден сегмент: ``"dual_file"``,
+        ``"single_file"`` или ``None``.
     scores:
         Характеристики детектора для данного сегмента (зависят от бэкенда).
         Пустой словарь, если информация недоступна.
@@ -103,6 +97,164 @@ class VolumeSegment:
     scores: dict[str, Any] = field(default_factory=dict)
 
 
+# ---------------------------------------------------------------------------
+# Module-level helper functions
+# ---------------------------------------------------------------------------
+
+
+def _merge_boundaries(
+    boundaries_a: list[float],
+    boundaries_b: list[float],
+    tolerance_sec: float = 2.0,
+) -> list[float]:
+    """Объединить два списка границ с допуском.
+
+    Алгоритм: объединить, отсортировать, удалить дубликаты
+    (если разница между соседними < tolerance_sec — оставить первый).
+
+    Parameters
+    ----------
+    boundaries_a:
+        Первый список временных меток границ.
+    boundaries_b:
+        Второй список временных меток границ.
+    tolerance_sec:
+        Допуск в секундах для объединения близких границ.
+
+    Returns
+    -------
+    list[float]
+        Отсортированный список объединённых границ без дубликатов.
+    """
+    combined = sorted(set(boundaries_a) | set(boundaries_b))
+    if not combined:
+        return []
+
+    merged: list[float] = [combined[0]]
+    for b in combined[1:]:
+        if b - merged[-1] >= tolerance_sec:
+            merged.append(b)
+
+    return merged
+
+
+def _boundaries_to_segments(
+    boundaries: list[float],
+) -> list[tuple[float, float]]:
+    """Построить сегменты (start, end) из отсортированного списка границ.
+
+    Parameters
+    ----------
+    boundaries:
+        Отсортированный список временных меток границ.
+
+    Returns
+    -------
+    list[tuple[float, float]]
+        Список кортежей ``(start, end)`` для каждого сегмента.
+    """
+    if len(boundaries) < 2:
+        return []
+    return [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
+
+
+def _compute_vocal_energy_per_segment(
+    vocal_file: str,
+    segments: list[tuple[float, float]],
+) -> list[float]:
+    """Вычислить среднюю RMS-энергию вокала для каждого сегмента.
+
+    Использует librosa.load() + librosa.feature.rms().
+    Возвращает нормализованные значения в [0, 1].
+
+    Parameters
+    ----------
+    vocal_file:
+        Путь к файлу вокальной дорожки.
+    segments:
+        Список кортежей ``(start, end)`` для каждого сегмента.
+
+    Returns
+    -------
+    list[float]
+        Список нормализованных значений RMS-энергии для каждого сегмента.
+        При ошибке загрузки возвращает список из единиц (вокал везде).
+    """
+    try:
+        import librosa  # type: ignore[import]
+    except ImportError:
+        logger.error(
+            "_compute_vocal_energy_per_segment: librosa is not installed. "
+            "Install it with: uv add librosa"
+        )
+        return [1.0] * len(segments)
+
+    try:
+        y, sr = librosa.load(vocal_file, sr=22050, mono=True)
+    except Exception as exc:
+        logger.warning(
+            "_compute_vocal_energy_per_segment: failed to load vocal file '%s': %s",
+            vocal_file,
+            exc,
+        )
+        return [1.0] * len(segments)
+
+    hop_length = 512
+    frame_length = 2048
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    frames_per_sec = sr / hop_length
+
+    energies: list[float] = []
+    for start, end in segments:
+        f_start = int(start * frames_per_sec)
+        f_end = int(end * frames_per_sec)
+        f_start = max(0, min(f_start, len(rms) - 1))
+        f_end = max(f_start + 1, min(f_end, len(rms)))
+        seg_rms = float(np.mean(rms[f_start:f_end]))
+        energies.append(seg_rms)
+
+    # Нормализуем в [0, 1]
+    max_energy = max(energies) if energies else 0.0
+    if max_energy > 0:
+        energies = [e / max_energy for e in energies]
+
+    return energies
+
+
+def _get_volume_for_segment_type(
+    segment_type: str,
+    chorus_volume: float,
+    default_volume: float,
+) -> float:
+    """Определить громкость вокала для типа сегмента.
+
+    Parameters
+    ----------
+    segment_type:
+        Тип сегмента: ``"chorus"``, ``"instrumental"``, ``"verse"``, и т.д.
+    chorus_volume:
+        Громкость для припевов.
+    default_volume:
+        Громкость по умолчанию (для всех остальных типов).
+
+    Returns
+    -------
+    float
+        Громкость вокала для данного типа сегмента.
+    """
+    if segment_type == "chorus":
+        return chorus_volume
+    elif segment_type == "instrumental":
+        return default_volume  # инструментал — вокал на стандартной громкости
+    else:
+        return default_volume  # verse, bridge, intro, outro
+
+
+# ---------------------------------------------------------------------------
+# Volume segments functions
+# ---------------------------------------------------------------------------
+
+
 def build_volume_segments(
     chorus_segments: list[tuple[float, float]],
     audio_duration: float,
@@ -110,7 +262,7 @@ def build_volume_segments(
     default_volume: float,
     segment_infos: list[SegmentInfo] | None = None,
 ) -> list[VolumeSegment]:
-    """Построить список сегментов громкости на основе найденных припевов.
+    """Построить список сегментов громкости на основе найденных сегментов.
 
     Parameters
     ----------
@@ -125,7 +277,7 @@ def build_volume_segments(
         Громкость вокала вне припевов (``AUDIO_MIX_VOICE_VOLUME``).
     segment_infos:
         Опциональный список :class:`SegmentInfo` — расширенная информация
-        о **всех** сегментах от детектора (chorus + non-chorus).
+        о **всех** сегментах от детектора.
         Если передан, используется напрямую для построения :class:`VolumeSegment`
         с полными данными детектора (``segment_type``, ``backend``, ``scores``).
         Если не передан — используется ``chorus_segments`` (fallback).
@@ -136,11 +288,12 @@ def build_volume_segments(
         Полный список сегментов, покрывающий весь трек.
     """
     # Если переданы расширенные данные детектора — используем их напрямую.
-    # segment_infos содержит ВСЕ сегменты (chorus + non-chorus) с характеристиками.
     if segment_infos:
         result: list[VolumeSegment] = []
         for info in sorted(segment_infos, key=lambda s: s.start):
-            volume = chorus_volume if info.segment_type == "chorus" else default_volume
+            volume = _get_volume_for_segment_type(
+                info.segment_type, chorus_volume, default_volume
+            )
             result.append(
                 VolumeSegment(
                     start=info.start,
@@ -286,48 +439,70 @@ def load_volume_segments(input_path: Path) -> list[VolumeSegment]:
     return segments
 
 
+# ---------------------------------------------------------------------------
+# ChorusDetector class
+# ---------------------------------------------------------------------------
+
+
 class ChorusDetector:
-    """Определяет временные отрезки припевов в аудиофайле.
+    """Определяет временные отрезки сегментов в аудиофайле.
+
+    Поддерживает два режима:
+
+    - **Двухфайловый** (``vocal_file`` передан в :meth:`detect`): объединяет
+      границы из ``audio_file`` и ``vocal_file`` через msaf, обогащает признаками
+      librosa, классифицирует сегменты по расширенному набору типов.
+    - **Однофайловый** (``vocal_file`` не передан): работает только через msaf
+      на ``audio_file``, без детектирования ``"instrumental"``.
 
     Parameters
     ----------
-    backend:
-        Бэкенд детектирования: ``"msaf"``, ``"librosa"`` или ``"hybrid"``.
-        По умолчанию ``"hybrid"``.
     min_duration_sec:
-        Минимальная длительность сегмента-кандидата в секундах (по умолчанию 15).
-    max_duration_sec:
-        Максимальная длительность сегмента-кандидата в секундах (по умолчанию 60).
+        Минимальная длительность сегмента-кандидата в секундах (по умолчанию 5.0).
+    vocal_silence_threshold:
+        Порог энергии вокала для определения инструментального сегмента
+        (по умолчанию 0.05).
+    boundary_merge_tolerance_sec:
+        Допуск в секундах при объединении границ из двух файлов (по умолчанию 2.0).
     """
 
     def __init__(
         self,
-        backend: str = "hybrid",
-        min_duration_sec: float = 15.0,
-        max_duration_sec: float = 60.0,
+        min_duration_sec: float = 5.0,
+        vocal_silence_threshold: float = 0.05,
+        boundary_merge_tolerance_sec: float = 2.0,
     ) -> None:
-        self._backend = backend.lower()
         self._min_duration = min_duration_sec
-        self._max_duration = max_duration_sec
+        self._vocal_silence_threshold = vocal_silence_threshold
+        self._boundary_merge_tolerance = boundary_merge_tolerance_sec
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def detect_with_info(self, audio_file: str) -> list[SegmentInfo]:
-        """Определить временные отрезки припевов с расширенной информацией.
+    def detect(
+        self,
+        audio_file: str,
+        vocal_file: str | None = None,
+    ) -> list[SegmentInfo]:
+        """Определить сегменты с расширенной информацией.
+
+        Если ``vocal_file`` передан — использует двухфайловый подход:
+        объединяет границы из обоих файлов и детектирует ``"instrumental"``.
+        Если ``vocal_file`` не передан — использует только ``audio_file``
+        через msaf, без детектирования ``"instrumental"``.
 
         Parameters
         ----------
         audio_file:
-            Путь к аудиофайлу (MP3, FLAC, WAV и т.д.).
+            Путь к основному аудиофайлу (полный трек).
+        vocal_file:
+            Путь к файлу вокальной дорожки (опционально).
 
         Returns
         -------
         list[SegmentInfo]
-            Список объектов :class:`SegmentInfo` для каждого найденного припева.
-            Каждый объект содержит временные границы, тип сегмента и
-            характеристики детектора.
+            Список объектов :class:`SegmentInfo` для каждого найденного сегмента.
             Возвращает пустой список, если определить структуру не удалось.
         """
         audio_path = Path(audio_file)
@@ -335,40 +510,138 @@ class ChorusDetector:
             logger.warning("ChorusDetector: audio file not found: '%s'", audio_file)
             return []
 
+        backend_name = "dual_file" if vocal_file else "single_file"
         logger.debug(
-            "ChorusDetector: backend=%s, min_dur=%.1f, max_dur=%.1f, file='%s'",
-            self._backend,
+            "ChorusDetector: mode=%s, min_dur=%.1f, file='%s'",
+            backend_name,
             self._min_duration,
-            self._max_duration,
             audio_file,
         )
 
-        if self._backend == "msaf":
-            return self._detect_msaf_with_info(audio_file)
-        elif self._backend == "librosa":
-            result = self._detect_librosa_with_info(audio_file)
-            if not result:
-                logger.warning(
-                    "ChorusDetector: librosa backend returned no segments for '%s'",
-                    audio_file,
-                )
-            return result
-        elif self._backend == "hybrid":
-            return self._detect_hybrid_with_info(audio_file)
-        else:
+        # Шаг 1: Получить границы через msaf
+        boundaries_full = self._get_msaf_boundaries(audio_file)
+        if not boundaries_full:
             logger.warning(
-                "ChorusDetector: unknown backend '%s', falling back to hybrid",
-                self._backend,
+                "ChorusDetector: msaf returned no boundaries for '%s'", audio_file
             )
-            return self._detect_hybrid_with_info(audio_file)
+            return []
 
+        boundaries_vocal: list[float] = []
+        if vocal_file:
+            vocal_path = Path(vocal_file)
+            if vocal_path.exists():
+                boundaries_vocal = self._get_msaf_boundaries(vocal_file)
+                if not boundaries_vocal:
+                    logger.warning(
+                        "ChorusDetector: msaf returned no boundaries for vocal file '%s', "
+                        "using only track boundaries",
+                        vocal_file,
+                    )
+            else:
+                logger.warning(
+                    "ChorusDetector: vocal file not found: '%s', "
+                    "using only track boundaries",
+                    vocal_file,
+                )
+
+        # Шаг 2: Объединить границы
+        merged_boundaries = _merge_boundaries(
+            boundaries_full,
+            boundaries_vocal,
+            tolerance_sec=self._boundary_merge_tolerance,
+        )
+        segments = _boundaries_to_segments(merged_boundaries)
+        # Фильтрация по минимальной длительности
+        segments = [(s, e) for s, e in segments if (e - s) >= self._min_duration]
+
+        if not segments:
+            logger.warning(
+                "ChorusDetector: no segments after filtering by min_duration=%.1f for '%s'",
+                self._min_duration,
+                audio_file,
+            )
+            return []
+
+        logger.debug(
+            "ChorusDetector: %d segments after merging and filtering: %s",
+            len(segments),
+            [(f"{s:.1f}", f"{e:.1f}") for s, e in segments],
+        )
+
+        # Шаг 3: Вычислить vocal_energy для каждого сегмента
+        if vocal_file and Path(vocal_file).exists():
+            vocal_energy_list = _compute_vocal_energy_per_segment(vocal_file, segments)
+        else:
+            # Нет данных о вокале — считаем вокал везде
+            vocal_energy_list = [1.0] * len(segments)
+
+        # Шаг 4: Обогатить сегменты признаками librosa
+        features_list = self._enrich_segments_with_librosa(
+            audio_file, segments, vocal_energy_list
+        )
+
+        # Шаг 5: Классифицировать сегменты
+        total_segments = len(segments)
+        result: list[SegmentInfo] = []
+        for i, ((start, end), features) in enumerate(zip(segments, features_list)):
+            seg_type = self._classify_segment(
+                features=features,
+                segment_index=i,
+                total_segments=total_segments,
+                all_features=features_list,
+                has_vocal_data=(vocal_file is not None),
+            )
+            result.append(
+                SegmentInfo(
+                    start=start,
+                    end=end,
+                    segment_type=seg_type,
+                    backend=backend_name,
+                    scores={
+                        "vocal_energy": round(features.get("vocal_energy", 1.0), 4),
+                        "chroma_variance": round(features.get("chroma_variance", 0.0), 4),
+                        "sim_score": round(features.get("sim_score", 0.0), 4),
+                        "hpss_score": round(features.get("hpss_score", 0.0), 4),
+                        "tempo_score": round(features.get("tempo_score", 0.0), 4),
+                    },
+                )
+            )
+
+        chorus_result = [s for s in result if s.segment_type == "chorus"]
+        logger.info(
+            "ChorusDetector[%s]: detected %d chorus segment(s) for '%s': %s",
+            backend_name,
+            len(chorus_result),
+            audio_file,
+            [(s.start, s.end) for s in chorus_result],
+        )
+        logger.debug(
+            "ChorusDetector[%s]: total %d segment(s) for '%s': %s",
+            backend_name,
+            len(result),
+            audio_file,
+            [(s.start, s.end, s.segment_type) for s in result],
+        )
+        return result
 
     # ------------------------------------------------------------------
-    # Backend: msaf
+    # Private: msaf boundary extraction
     # ------------------------------------------------------------------
 
-    def _detect_msaf_with_info(self, audio_file: str) -> list[SegmentInfo]:
-        """Детектирование через msaf (spectral clustering) с расширенной информацией."""
+    def _get_msaf_boundaries(self, audio_file: str) -> list[float]:
+        """Получить границы сегментов через msaf.
+
+        Parameters
+        ----------
+        audio_file:
+            Путь к аудиофайлу.
+
+        Returns
+        -------
+        list[float]
+            Список временных меток границ в секундах.
+            Пустой список при ошибке.
+        """
         try:
             import scipy
             if not hasattr(scipy, "inf"):
@@ -388,9 +661,9 @@ class ChorusDetector:
                 labels_id="scluster",
             )
             logger.debug(
-                "ChorusDetector[msaf]: %d boundaries, labels=%s",
+                "ChorusDetector[msaf]: %d boundaries for '%s'",
                 len(boundaries) if boundaries is not None else 0,
-                labels,
+                audio_file,
             )
         except Exception as exc:
             logger.warning(
@@ -400,82 +673,63 @@ class ChorusDetector:
             )
             return []
 
-        if boundaries is None or labels is None:
+        if boundaries is None or len(boundaries) == 0:
             logger.warning(
-                "ChorusDetector[msaf]: returned None boundaries or labels for '%s'",
+                "ChorusDetector[msaf]: returned None or empty boundaries for '%s'",
                 audio_file,
             )
             return []
 
-        segments = self._build_segments_from_boundaries(list(boundaries), list(labels))
-        if not segments:
-            return []
-
-        # Собираем статистику по меткам для передачи в SegmentInfo
-        label_count: dict[int, int] = {}
-        label_duration: dict[int, float] = {}
-        for start, end, label in segments:
-            label_count[label] = label_count.get(label, 0) + 1
-            label_duration[label] = label_duration.get(label, 0.0) + (end - start)
-
-        chorus_segments = self._pick_chorus_segments(segments)
-        chorus_segments = self._filter_by_duration(chorus_segments)
-
-        # Определяем chorus_label для пометки типа сегмента
-        chorus_set = set(chorus_segments)
-
-        result: list[SegmentInfo] = []
-        for start, end, label in segments:
-            seg_type = "chorus" if (start, end) in chorus_set else "non-chorus"
-            result.append(
-                SegmentInfo(
-                    start=start,
-                    end=end,
-                    segment_type=seg_type,
-                    backend="msaf",
-                    scores={
-                        "label": label,
-                        "label_count": label_count.get(label, 0),
-                        "label_duration": round(label_duration.get(label, 0.0), 3),
-                    },
-                )
-            )
-
-        chorus_result = [s for s in result if s.segment_type == "chorus"]
-        logger.info(
-            "ChorusDetector[msaf]: detected %d chorus segment(s) for '%s': %s",
-            len(chorus_result),
-            audio_file,
-            [(s.start, s.end) for s in chorus_result],
-        )
-        return result
+        return [float(b) for b in boundaries]
 
     # ------------------------------------------------------------------
-    # Backend: librosa
+    # Private: librosa feature enrichment
     # ------------------------------------------------------------------
 
-    def _detect_librosa_with_info(self, audio_file: str) -> list[SegmentInfo]:
-        """Детектирование на основе признаков librosa с расширенной информацией.
+    def _enrich_segments_with_librosa(
+        self,
+        audio_file: str,
+        segments: list[tuple[float, float]],
+        vocal_energy_list: list[float],
+    ) -> list[dict]:
+        """Вычислить librosa-признаки для каждого сегмента.
 
-        Алгоритм:
-        1. Загружает аудио через librosa.
-        2. Вычисляет хроматограмму (chroma_cqt).
-        3. Строит матрицу самоподобия (recurrence_matrix).
-        4. Определяет границы сегментов через агломеративную кластеризацию
-           по матрице самоподобия.
-        5. Ранжирует сегменты по комбинации признаков:
-           - повторяемость (self-similarity score),
-           - энергия гармоники (HPSS),
-           - ритмическая стабильность (tempogram).
-        6. Выбирает сегменты с наивысшим суммарным рейтингом как припевы.
+        Признаки: sim_score, hpss_score, tempo_score, vocal_energy, chroma_variance.
+        Все признаки нормализованы в [0, 1].
+
+        Parameters
+        ----------
+        audio_file:
+            Путь к аудиофайлу.
+        segments:
+            Список кортежей ``(start, end)`` для каждого сегмента.
+        vocal_energy_list:
+            Список значений vocal_energy для каждого сегмента (из шага 2.3).
+
+        Returns
+        -------
+        list[dict]
+            Список словарей с признаками для каждого сегмента.
+            При ошибке загрузки librosa возвращает список с нулевыми признаками.
         """
+        empty_features = [
+            {
+                "sim_score": 0.0,
+                "hpss_score": 0.0,
+                "tempo_score": 0.0,
+                "vocal_energy": vocal_energy_list[i] if i < len(vocal_energy_list) else 1.0,
+                "chroma_variance": 0.0,
+            }
+            for i in range(len(segments))
+        ]
+
         try:
             import librosa  # type: ignore[import]
         except ImportError:
             logger.error(
                 "ChorusDetector: librosa is not installed. Install it with: uv add librosa"
             )
-            return []
+            return empty_features
 
         try:
             logger.debug("ChorusDetector[librosa]: loading audio '%s'", audio_file)
@@ -486,563 +740,215 @@ class ChorusDetector:
                 audio_file,
                 exc,
             )
-            return []
+            return empty_features
 
-        duration = librosa.get_duration(y=y, sr=sr)
-        logger.debug("ChorusDetector[librosa]: duration=%.1f sec", duration)
-
-        # 1. Chroma + self-similarity
-        chroma = self._compute_chroma(y, sr)
-        sim_matrix = self._compute_self_similarity(chroma)
-
-        # 2. Определяем границы сегментов через novelty curve
-        boundaries_sec = self._compute_boundaries(y, sr, chroma, duration)
-        logger.debug(
-            "ChorusDetector[librosa]: %d boundaries found: %s",
-            len(boundaries_sec),
-            [f"{b:.1f}" for b in boundaries_sec],
-        )
-
-        if len(boundaries_sec) < 2:
-            logger.warning(
-                "ChorusDetector[librosa]: not enough boundaries for '%s'", audio_file
-            )
-            return []
-
-        # 3. Строим сегменты и вычисляем признаки для каждого
         hop_length = 512
         frames_per_sec = sr / hop_length
 
-        hpss_harmonic_energy = self._hpss_energy(y, sr)
-        tempogram_stability = self._compute_tempogram_stability(y, sr, boundaries_sec)
-
-        # Собираем все сегменты с оценками (включая отфильтрованные по длительности)
-        all_scored: list[tuple[float, float, float, float, float, float]] = []
-        for i in range(len(boundaries_sec) - 1):
-            start = boundaries_sec[i]
-            end = boundaries_sec[i + 1]
-            dur = end - start
-
-            if dur < self._min_duration or dur > self._max_duration:
-                continue
-
-            # Self-similarity score: среднее значение в блоке матрицы
-            f_start = int(start * frames_per_sec)
-            f_end = int(end * frames_per_sec)
-            f_start = max(0, min(f_start, sim_matrix.shape[0] - 1))
-            f_end = max(f_start + 1, min(f_end, sim_matrix.shape[0]))
-
-            sim_score = float(np.mean(sim_matrix[f_start:f_end, :]))
-
-            # HPSS harmonic energy score
-            h_start = int(start * sr)
-            h_end = int(end * sr)
-            h_start = max(0, min(h_start, len(hpss_harmonic_energy) - 1))
-            h_end = max(h_start + 1, min(h_end, len(hpss_harmonic_energy)))
-            hpss_score = float(np.mean(hpss_harmonic_energy[h_start:h_end]))
-
-            # Tempogram stability score
-            tempo_score = tempogram_stability.get(i, 0.0)
-
-            # Суммарный рейтинг
-            total_score = sim_score + hpss_score + tempo_score
-
-            logger.debug(
-                "ChorusDetector[librosa]: seg [%.1f-%.1f] sim=%.3f hpss=%.3f tempo=%.3f total=%.3f",
-                start,
-                end,
-                sim_score,
-                hpss_score,
-                tempo_score,
-                total_score,
-            )
-            all_scored.append((start, end, sim_score, hpss_score, tempo_score, total_score))
-
-        if not all_scored:
-            logger.warning(
-                "ChorusDetector[librosa]: no valid segments after filtering for '%s'",
-                audio_file,
-            )
-            return []
-
-        # 4. Определяем порог: сегменты с рейтингом выше медианы — припевы
-        total_scores = [total for _, _, _, _, _, total in all_scored]
-        threshold = float(np.median(total_scores))
-
-        result: list[SegmentInfo] = []
-        for start, end, sim_score, hpss_score, tempo_score, total_score in all_scored:
-            seg_type = "chorus" if total_score >= threshold else "non-chorus"
-            result.append(
-                SegmentInfo(
-                    start=start,
-                    end=end,
-                    segment_type=seg_type,
-                    backend="librosa",
-                    scores={
-                        "sim_score": round(sim_score, 4),
-                        "hpss_score": round(hpss_score, 4),
-                        "tempo_score": round(tempo_score, 4),
-                        "total_score": round(total_score, 4),
-                        "threshold": round(threshold, 4),
-                    },
-                )
-            )
-
-        chorus_result = [s for s in result if s.segment_type == "chorus"]
-        logger.info(
-            "ChorusDetector[librosa]: detected %d chorus segment(s) for '%s': %s",
-            len(chorus_result),
-            audio_file,
-            [(s.start, s.end) for s in chorus_result],
-        )
-        return result
-
-    # ------------------------------------------------------------------
-    # Backend: hybrid
-    # ------------------------------------------------------------------
-
-    def _detect_hybrid_with_info(self, audio_file: str) -> list[SegmentInfo]:
-        """Объединяет результаты msaf и librosa с расширенной информацией.
-
-        Стратегия:
-        - Запускает оба бэкенда.
-        - Если оба дали результат — объединяет chorus-сегменты с пересечением > 30%,
-          а non-chorus сегменты от обоих бэкендов включает в результат.
-        - Если только один дал результат — использует его.
-        - Если ни один не дал результат — возвращает пустой список.
-
-        Возвращает **все** сегменты (chorus + non-chorus) с характеристиками детекторов.
-        """
-        msaf_infos = self._detect_msaf_with_info(audio_file)
-        librosa_infos = self._detect_librosa_with_info(audio_file)
-
-        msaf_chorus = [(s.start, s.end) for s in msaf_infos if s.segment_type == "chorus"]
-        librosa_chorus = [(s.start, s.end) for s in librosa_infos if s.segment_type == "chorus"]
-
-        logger.debug(
-            "ChorusDetector[hybrid]: msaf=%d chorus segs, librosa=%d chorus segs",
-            len(msaf_chorus),
-            len(librosa_chorus),
-        )
-
-        if not msaf_chorus and not librosa_chorus:
-            logger.warning(
-                "ChorusDetector[hybrid]: both backends returned no segments for '%s'",
-                audio_file,
-            )
-            return []
-
-        if not msaf_chorus:
-            logger.info(
-                "ChorusDetector[hybrid]: msaf returned nothing, using librosa results"
-            )
-            return [
-                SegmentInfo(
-                    start=s.start,
-                    end=s.end,
-                    segment_type=s.segment_type,
-                    backend="hybrid",
-                    scores={**s.scores, "confirmed_by": "librosa_only"},
-                )
-                for s in librosa_infos
-            ]
-
-        if not librosa_chorus:
-            logger.info(
-                "ChorusDetector[hybrid]: librosa returned nothing, using msaf results"
-            )
-            return [
-                SegmentInfo(
-                    start=s.start,
-                    end=s.end,
-                    segment_type=s.segment_type,
-                    backend="hybrid",
-                    scores={**s.scores, "confirmed_by": "msaf_only"},
-                )
-                for s in msaf_infos
-            ]
-
-        # Объединяем chorus-сегменты из обоих бэкендов
-        merged_pairs = self._merge_segments_with_source(msaf_chorus, librosa_chorus)
-
-        # Строим индексы оценок для быстрого поиска
-        librosa_scores_map = {(s.start, s.end): s.scores for s in librosa_infos}
-        msaf_scores_map = {(s.start, s.end): s.scores for s in msaf_infos}
-
-        # 1. Добавляем все chorus-сегменты (результат объединения)
-        result: list[SegmentInfo] = []
-        for (start, end), confirmed_by in merged_pairs:
-            if confirmed_by in ("librosa", "librosa_fallback"):
-                scores = dict(librosa_scores_map.get((start, end), {}))
-            else:
-                scores = dict(msaf_scores_map.get((start, end), {}))
-            scores["confirmed_by"] = confirmed_by
-            result.append(
-                SegmentInfo(
-                    start=start,
-                    end=end,
-                    segment_type="chorus",
-                    backend="hybrid",
-                    scores=scores,
-                )
-            )
-
-        # 2. Добавляем non-chorus сегменты от msaf (не вошедшие в chorus)
-        for s in msaf_infos:
-            if s.segment_type == "non-chorus":
-                result.append(
-                    SegmentInfo(
-                        start=s.start,
-                        end=s.end,
-                        segment_type="non-chorus",
-                        backend="hybrid",
-                        scores={**s.scores, "source": "msaf"},
-                    )
-                )
-
-        # 3. Добавляем non-chorus сегменты от librosa (не вошедшие в chorus и не перекрывающиеся с msaf non-chorus)
-        msaf_non_chorus_ranges = [
-            (s.start, s.end) for s in msaf_infos if s.segment_type == "non-chorus"
-        ]
-        for s in librosa_infos:
-            if s.segment_type == "non-chorus":
-                # Проверяем, не перекрывается ли с уже добавленными msaf non-chorus
-                overlaps = any(
-                    min(s.end, me) - max(s.start, ms) > 0
-                    for ms, me in msaf_non_chorus_ranges
-                )
-                if not overlaps:
-                    result.append(
-                        SegmentInfo(
-                            start=s.start,
-                            end=s.end,
-                            segment_type="non-chorus",
-                            backend="hybrid",
-                            scores={**s.scores, "source": "librosa"},
-                        )
-                    )
-
-        result.sort(key=lambda x: x.start)
-
-        chorus_result = [s for s in result if s.segment_type == "chorus"]
-        logger.info(
-            "ChorusDetector[hybrid]: merged %d chorus segment(s) for '%s': %s",
-            len(chorus_result),
-            audio_file,
-            [(s.start, s.end) for s in chorus_result],
-        )
-        logger.debug(
-            "ChorusDetector[hybrid]: total %d segment(s) (chorus + non-chorus) for '%s'",
-            len(result),
-            audio_file,
-        )
-        return result
-
-
-    # ------------------------------------------------------------------
-    # Helper: librosa feature computation
-    # ------------------------------------------------------------------
-
-    def _compute_chroma(self, y: np.ndarray, sr: int) -> np.ndarray:
-        """Вычислить хроматограмму (chroma_cqt).
-
-        Returns
-        -------
-        np.ndarray
-            Матрица chroma shape (12, T).
-        """
-        import librosa  # type: ignore[import]
-
-        hop_length = 512
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
-        logger.debug("ChorusDetector: chroma shape=%s", chroma.shape)
-        return chroma
-
-    def _compute_self_similarity(self, chroma: np.ndarray) -> np.ndarray:
-        """Построить матрицу самоподобия на основе хроматограммы.
-
-        Использует cosine similarity между фреймами.
-
-        Returns
-        -------
-        np.ndarray
-            Квадратная матрица shape (T, T) со значениями [0, 1].
-        """
-        import librosa  # type: ignore[import]
-
-        # Нормализуем chroma по L2 для cosine similarity
-        chroma_norm = librosa.util.normalize(chroma, axis=0)
-        # recurrence_matrix возвращает булеву или взвешенную матрицу
-        R = librosa.segment.recurrence_matrix(
-            chroma_norm,
-            mode="affinity",
-            metric="cosine",
-            sparse=False,
-        )
-        logger.debug("ChorusDetector: self-similarity matrix shape=%s", R.shape)
-        return R
-
-    def _compute_boundaries(
-        self,
-        y: np.ndarray,
-        sr: int,
-        chroma: np.ndarray,
-        duration: float,
-    ) -> list[float]:
-        """Определить границы сегментов через novelty curve по chroma.
-
-        Returns
-        -------
-        list[float]
-            Список временных меток границ в секундах (включая 0 и duration).
-        """
-        import librosa  # type: ignore[import]
-
-        hop_length = 512
-
-        # Novelty curve через структурные границы
+        # Chroma + self-similarity matrix
         try:
-            # Используем агломеративную кластеризацию через librosa
-            bounds_frames = librosa.segment.agglomerative(chroma, k=8)
-            bounds_sec = librosa.frames_to_time(bounds_frames, sr=sr, hop_length=hop_length)
-            bounds_list = [0.0] + sorted(float(b) for b in bounds_sec) + [duration]
-            # Убираем дубликаты и слишком близкие границы (< 5 сек)
-            filtered: list[float] = [bounds_list[0]]
-            for b in bounds_list[1:]:
-                if b - filtered[-1] >= 5.0:
-                    filtered.append(b)
-            if filtered[-1] < duration - 1.0:
-                filtered.append(duration)
-            return filtered
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+            chroma_norm = librosa.util.normalize(chroma, axis=0)
+            sim_matrix = librosa.segment.recurrence_matrix(
+                chroma_norm,
+                mode="affinity",
+                metric="cosine",
+                sparse=False,
+            )
         except Exception as exc:
             logger.warning(
-                "ChorusDetector: agglomerative segmentation failed: %s, "
-                "falling back to fixed-size segments",
-                exc,
+                "ChorusDetector[librosa]: chroma/similarity computation failed: %s", exc
             )
-            # Fallback: фиксированные сегменты по 30 секунд
-            step = 30.0
-            return [float(t) for t in np.arange(0, duration, step)] + [duration]
+            sim_matrix = None
+            chroma = None
 
-    def _hpss_energy(self, y: np.ndarray, sr: int) -> np.ndarray:
-        """Вычислить энергию гармонической составляющей (HPSS).
+        # HPSS harmonic energy
+        try:
+            y_harmonic, _ = librosa.effects.hpss(y)
+            frame_length = 2048
+            rms_harmonic = librosa.feature.rms(
+                y=y_harmonic, frame_length=frame_length, hop_length=hop_length
+            )[0]
+            rms_full = np.interp(
+                np.arange(len(y)),
+                np.linspace(0, len(y), len(rms_harmonic)),
+                rms_harmonic,
+            )
+            max_rms = float(np.max(rms_full))
+            if max_rms > 0:
+                rms_full = rms_full / max_rms
+        except Exception as exc:
+            logger.warning(
+                "ChorusDetector[librosa]: HPSS computation failed: %s", exc
+            )
+            rms_full = None
 
-        Returns
-        -------
-        np.ndarray
-            Массив RMS-энергии гармоники, shape (N_samples,).
-            Значения нормализованы в [0, 1].
-        """
-        import librosa  # type: ignore[import]
-
-        y_harmonic, _ = librosa.effects.hpss(y)
-        # RMS по скользящему окну
-        frame_length = 2048
-        hop_length = 512
-        rms = librosa.feature.rms(y=y_harmonic, frame_length=frame_length, hop_length=hop_length)[0]
-        # Интерполируем обратно до длины сигнала
-        rms_full = np.interp(
-            np.arange(len(y)),
-            np.linspace(0, len(y), len(rms)),
-            rms,
-        )
-        # Нормализуем
-        max_val = float(np.max(rms_full))
-        if max_val > 0:
-            rms_full = rms_full / max_val
-        return rms_full
-
-    def _compute_tempogram_stability(
-        self,
-        y: np.ndarray,
-        sr: int,
-        boundaries_sec: list[float],
-    ) -> dict[int, float]:
-        """Вычислить ритмическую стабильность для каждого сегмента.
-
-        Использует tempogram: сегменты с более стабильным ритмом
-        (меньшей дисперсией темпа) получают более высокий балл.
-
-        Returns
-        -------
-        dict[int, float]
-            Словарь {индекс_сегмента: stability_score} в [0, 1].
-        """
-        import librosa  # type: ignore[import]
-
-        hop_length = 512
+        # Tempogram
         try:
             oenv = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
             tempogram = librosa.feature.tempogram(
                 onset_envelope=oenv, sr=sr, hop_length=hop_length
             )
         except Exception as exc:
-            logger.warning("ChorusDetector: tempogram computation failed: %s", exc)
-            return {}
+            logger.warning(
+                "ChorusDetector[librosa]: tempogram computation failed: %s", exc
+            )
+            tempogram = None
 
-        frames_per_sec = sr / hop_length
-        stability: dict[int, float] = {}
-
-        for i in range(len(boundaries_sec) - 1):
-            start = boundaries_sec[i]
-            end = boundaries_sec[i + 1]
+        # Вычисляем признаки для каждого сегмента
+        raw_features: list[dict] = []
+        for i, (start, end) in enumerate(segments):
             f_start = int(start * frames_per_sec)
             f_end = int(end * frames_per_sec)
-            f_start = max(0, min(f_start, tempogram.shape[1] - 1))
-            f_end = max(f_start + 1, min(f_end, tempogram.shape[1]))
 
-            seg_tempogram = tempogram[:, f_start:f_end]
-            # Стабильность = 1 - нормализованная дисперсия доминирующего темпа
-            dominant_tempo_idx = np.argmax(np.mean(seg_tempogram, axis=1))
-            tempo_series = seg_tempogram[dominant_tempo_idx, :]
-            if len(tempo_series) > 1:
-                std = float(np.std(tempo_series))
-                mean = float(np.mean(tempo_series))
-                cv = std / (mean + 1e-8)  # coefficient of variation
-                stability[i] = max(0.0, 1.0 - cv)
-            else:
-                stability[i] = 0.0
+            # sim_score
+            sim_score = 0.0
+            if sim_matrix is not None:
+                fs = max(0, min(f_start, sim_matrix.shape[0] - 1))
+                fe = max(fs + 1, min(f_end, sim_matrix.shape[0]))
+                sim_score = float(np.mean(sim_matrix[fs:fe, :]))
 
-        # Нормализуем в [0, 1]
-        if stability:
-            max_s = max(stability.values())
-            if max_s > 0:
-                stability = {k: v / max_s for k, v in stability.items()}
+            # hpss_score
+            hpss_score = 0.0
+            if rms_full is not None:
+                h_start = int(start * sr)
+                h_end = int(end * sr)
+                h_start = max(0, min(h_start, len(rms_full) - 1))
+                h_end = max(h_start + 1, min(h_end, len(rms_full)))
+                hpss_score = float(np.mean(rms_full[h_start:h_end]))
 
-        return stability
+            # tempo_score (ритмическая стабильность)
+            tempo_score = 0.0
+            if tempogram is not None:
+                fs = max(0, min(f_start, tempogram.shape[1] - 1))
+                fe = max(fs + 1, min(f_end, tempogram.shape[1]))
+                seg_tempogram = tempogram[:, fs:fe]
+                dominant_idx = np.argmax(np.mean(seg_tempogram, axis=1))
+                tempo_series = seg_tempogram[dominant_idx, :]
+                if len(tempo_series) > 1:
+                    std = float(np.std(tempo_series))
+                    mean = float(np.mean(tempo_series))
+                    cv = std / (mean + 1e-8)
+                    tempo_score = max(0.0, 1.0 - cv)
 
-    # ------------------------------------------------------------------
-    # Helper: msaf segment processing
-    # ------------------------------------------------------------------
+            # chroma_variance
+            chroma_variance = 0.0
+            if chroma is not None:
+                fs = max(0, min(f_start, chroma.shape[1] - 1))
+                fe = max(fs + 1, min(f_end, chroma.shape[1]))
+                seg_chroma = chroma[:, fs:fe]
+                chroma_variance = float(np.mean(np.var(seg_chroma, axis=1)))
 
-    def _build_segments_from_boundaries(
-        self,
-        boundaries: list[float],
-        labels: list[int],
-    ) -> list[_Segment]:
-        """Построить список сегментов (start, end, label) из границ и меток."""
-        if len(boundaries) < 2:
-            return []
-        segments: list[_Segment] = []
-        for i, label in enumerate(labels):
-            if i + 1 < len(boundaries):
-                start = float(boundaries[i])
-                end = float(boundaries[i + 1])
-                segments.append((start, end, int(label)))
-        return segments
+            raw_features.append({
+                "sim_score": sim_score,
+                "hpss_score": hpss_score,
+                "tempo_score": tempo_score,
+                "vocal_energy": vocal_energy_list[i] if i < len(vocal_energy_list) else 1.0,
+                "chroma_variance": chroma_variance,
+            })
 
-    def _pick_chorus_segments(
-        self, segments: list[_Segment]
-    ) -> list[tuple[float, float]]:
-        """Выбрать сегменты с наиболее часто встречающейся меткой (припев)."""
-        label_count: dict[int, int] = {}
-        label_duration: dict[int, float] = {}
-        for start, end, label in segments:
-            label_count[label] = label_count.get(label, 0) + 1
-            label_duration[label] = label_duration.get(label, 0.0) + (end - start)
+        # Нормализуем tempo_score в [0, 1] по всем сегментам
+        tempo_scores = [f["tempo_score"] for f in raw_features]
+        max_tempo = max(tempo_scores) if tempo_scores else 0.0
+        if max_tempo > 0:
+            for f in raw_features:
+                f["tempo_score"] = f["tempo_score"] / max_tempo
+
+        # Нормализуем chroma_variance в [0, 1]
+        chroma_vars = [f["chroma_variance"] for f in raw_features]
+        max_chroma_var = max(chroma_vars) if chroma_vars else 0.0
+        if max_chroma_var > 0:
+            for f in raw_features:
+                f["chroma_variance"] = f["chroma_variance"] / max_chroma_var
 
         logger.debug(
-            "ChorusDetector[msaf]: label_count=%s, label_duration=%s",
-            label_count,
-            label_duration,
+            "ChorusDetector[librosa]: enriched %d segments with features",
+            len(raw_features),
         )
-
-        repeating = {lbl: cnt for lbl, cnt in label_count.items() if cnt > 1}
-        if repeating:
-            chorus_label = max(
-                repeating,
-                key=lambda lbl: (label_count[lbl], label_duration[lbl]),
-            )
-        else:
-            chorus_label = max(label_duration, key=lambda lbl: label_duration[lbl])
-
-        logger.debug("ChorusDetector[msaf]: chorus_label=%d", chorus_label)
-
-        return [
-            (start, end)
-            for start, end, label in segments
-            if label == chorus_label
-        ]
-
-    def _filter_by_duration(
-        self, segments: list[tuple[float, float]]
-    ) -> list[tuple[float, float]]:
-        """Отфильтровать сегменты по минимальной и максимальной длительности."""
-        filtered = [
-            (s, e)
-            for s, e in segments
-            if self._min_duration <= (e - s) <= self._max_duration
-        ]
-        if len(filtered) < len(segments):
-            logger.debug(
-                "ChorusDetector: filtered %d → %d segments by duration [%.1f, %.1f]",
-                len(segments),
-                len(filtered),
-                self._min_duration,
-                self._max_duration,
-            )
-        # Если после фильтрации ничего не осталось — возвращаем исходные
-        return filtered if filtered else segments
+        return raw_features
 
     # ------------------------------------------------------------------
-    # Helper: merge segments from two backends
+    # Private: segment classification
     # ------------------------------------------------------------------
 
-    def _merge_segments_with_source(
+    def _classify_segment(
         self,
-        msaf_segs: list[tuple[float, float]],
-        librosa_segs: list[tuple[float, float]],
-    ) -> list[tuple[tuple[float, float], str]]:
-        """Объединить сегменты из двух бэкендов с указанием источника подтверждения.
+        features: dict,
+        segment_index: int,
+        total_segments: int,
+        all_features: list[dict],
+        has_vocal_data: bool = True,
+    ) -> str:
+        """Классифицировать сегмент по типу.
+
+        Правила классификации (в порядке приоритета):
+
+        1. ``vocal_energy < vocal_silence_threshold`` → ``"instrumental"``
+           (только если есть данные о вокале)
+        2. ``segment_index == 0`` AND ``duration < 60 сек`` → ``"intro"``
+        3. ``segment_index == total_segments - 1`` AND ``duration < 60 сек`` → ``"outro"``
+        4. ``sim_score > median + 0.1`` AND ``hpss_score > median`` → ``"chorus"``
+        5. ``sim_score < median - 0.1`` AND ``vocal_energy > threshold`` → ``"verse"``
+        6. ``tempo_score < median - 0.2`` AND ``vocal_energy > threshold`` → ``"bridge"``
+        7. иначе → ``"verse"`` (fallback)
+
+        Parameters
+        ----------
+        features:
+            Словарь признаков для данного сегмента.
+        segment_index:
+            Индекс сегмента в списке.
+        total_segments:
+            Общее количество сегментов.
+        all_features:
+            Список признаков всех сегментов (для вычисления медиан).
+        has_vocal_data:
+            Флаг наличия данных о вокале (если False — правило 1 не применяется).
 
         Returns
         -------
-        list[tuple[tuple[float, float], str]]
-            Список пар ``((start, end), confirmed_by)`` где ``confirmed_by`` —
-            строка ``"librosa"``, ``"msaf"`` или ``"librosa_fallback"``.
+        str
+            Тип сегмента.
         """
-        confirmed_librosa: list[tuple[float, float]] = []
-        confirmed_msaf: list[tuple[float, float]] = []
+        vocal_energy = features.get("vocal_energy", 1.0)
+        sim_score = features.get("sim_score", 0.0)
+        hpss_score = features.get("hpss_score", 0.0)
+        tempo_score = features.get("tempo_score", 0.0)
 
-        for ls, le in librosa_segs:
-            lib_dur = le - ls
-            for ms, me in msaf_segs:
-                overlap = min(le, me) - max(ls, ms)
-                if overlap > 0 and lib_dur > 0 and overlap / lib_dur >= 0.3:
-                    confirmed_librosa.append((ls, le))
-                    break
+        # Вычисляем медианы по всем сегментам
+        sim_scores = [f.get("sim_score", 0.0) for f in all_features]
+        hpss_scores = [f.get("hpss_score", 0.0) for f in all_features]
+        tempo_scores = [f.get("tempo_score", 0.0) for f in all_features]
 
-        for ms, me in msaf_segs:
-            msaf_dur = me - ms
-            for ls, le in librosa_segs:
-                overlap = min(me, le) - max(ms, ls)
-                if overlap > 0 and msaf_dur > 0 and overlap / msaf_dur >= 0.3:
-                    confirmed_msaf.append((ms, me))
-                    break
+        median_sim = float(np.median(sim_scores)) if sim_scores else 0.0
+        median_hpss = float(np.median(hpss_scores)) if hpss_scores else 0.0
+        median_tempo = float(np.median(tempo_scores)) if tempo_scores else 0.0
 
-        # Предпочитаем librosa-границы, дополняем msaf-сегментами без пересечений
-        result: list[tuple[tuple[float, float], str]] = [
-            (seg, "librosa") for seg in confirmed_librosa
-        ]
-        result_segs = list(confirmed_librosa)
+        threshold = self._vocal_silence_threshold
 
-        for ms, me in confirmed_msaf:
-            overlaps_existing = any(
-                min(me, re) - max(ms, rs) > 0
-                for rs, re in result_segs
-            )
-            if not overlaps_existing:
-                result.append(((ms, me), "msaf"))
-                result_segs.append((ms, me))
+        # Правило 1: инструментал (только если есть данные о вокале)
+        if has_vocal_data and vocal_energy < threshold:
+            return "instrumental"
 
-        # Если ничего не подтверждено — fallback на librosa (более надёжный)
-        if not result:
-            logger.debug(
-                "ChorusDetector[hybrid]: no confirmed segments, falling back to librosa"
-            )
-            result = [(seg, "librosa_fallback") for seg in librosa_segs]
+        # Правило 2: интро (первый сегмент)
+        if segment_index == 0:
+            return "intro"
 
-        result.sort(key=lambda x: x[0][0])
-        return result
+        # Правило 3: аутро (последний сегмент)
+        if segment_index == total_segments - 1:
+            return "outro"
 
+        # Правило 4: припев
+        if sim_score > median_sim + 0.1 and hpss_score > median_hpss:
+            return "chorus"
 
+        # Правило 5: куплет
+        if sim_score < median_sim - 0.1 and vocal_energy > threshold:
+            return "verse"
+
+        # Правило 6: бридж
+        if tempo_score < median_tempo - 0.2 and vocal_energy > threshold:
+            return "bridge"
+
+        # Правило 7: fallback
+        return "verse"

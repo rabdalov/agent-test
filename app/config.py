@@ -88,12 +88,12 @@ class Settings(BaseModel):
     vocal_reverb_enabled: bool = False
     # Enable echo effect on vocal (placeholder, default: false)
     vocal_echo_enabled: bool = False
-    # ChorusDetector backend: "msaf" | "librosa" | "hybrid" (default: "hybrid")
-    chorus_detector_backend: str = "hybrid"
-    # Minimum duration (seconds) for a chorus segment candidate (default: 15)
-    chorus_min_duration_sec: float = 15.0
-    # Maximum duration (seconds) for a chorus segment candidate (default: 60)
-    chorus_max_duration_sec: float = 60.0
+    # Minimum duration (seconds) for a chorus segment candidate (default: 5.0)
+    chorus_min_duration_sec: float = 5.0
+    # Threshold of vocal energy below which a segment is classified as "instrumental" (default: 0.05)
+    chorus_vocal_silence_threshold: float = 0.05
+    # Tolerance (seconds) when merging boundaries from two files (default: 2.0)
+    chorus_boundary_merge_tolerance_sec: float = 2.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -147,9 +147,9 @@ class Settings(BaseModel):
             "chorus_backvocal_volume": float(os.getenv("CHORUS_BACKVOCAL_VOLUME", "0.3")),
             "vocal_reverb_enabled": os.getenv("VOCAL_REVERB_ENABLED", "false").lower() in ("true", "1", "yes"),
             "vocal_echo_enabled": os.getenv("VOCAL_ECHO_ENABLED", "false").lower() in ("true", "1", "yes"),
-            "chorus_detector_backend": os.getenv("CHORUS_DETECTOR_BACKEND", "hybrid"),
-            "chorus_min_duration_sec": float(os.getenv("CHORUS_MIN_DURATION_SEC", "15.0")),
-            "chorus_max_duration_sec": float(os.getenv("CHORUS_MAX_DURATION_SEC", "60.0")),
+            "chorus_min_duration_sec": float(os.getenv("CHORUS_MIN_DURATION_SEC", "5.0")),
+            "chorus_vocal_silence_threshold": float(os.getenv("CHORUS_VOCAL_SILENCE_THRESHOLD", "0.05")),
+            "chorus_boundary_merge_tolerance_sec": float(os.getenv("CHORUS_BOUNDARY_MERGE_TOLERANCE_SEC", "2.0")),
         }
 
         settings = cls(**data)

@@ -851,8 +851,8 @@ class KaraokePipeline:
         """Detect chorus segments and build volume_segments_file.
 
         Steps:
-        1. Detect chorus segments via ChorusDetector (msaf/librosa/hybrid).
-        2. Build volume_segments based on chorus positions.
+        1. Detect segments via ChorusDetector (dual_file or single_file mode).
+        2. Build volume_segments based on segment types.
         3. Save volume_segments to JSON file (volume_segments_file).
         """
         # Check if step is enabled in config
@@ -871,22 +871,27 @@ class KaraokePipeline:
         stem = normalize_filename(raw_stem)
         track_dir = self._track_folder
 
-        # Step 1: Detect chorus segments with extended info
+        # Step 1: Detect segments with extended info
+        vocal_file_str = self._state.vocal_file
+        mode = "dual_file" if vocal_file_str else "single_file"
         logger.info(
-            "DETECT_CHORUS step: detecting chorus segments for track_id=%s (backend=%s)",
+            "DETECT_CHORUS step: detecting segments for track_id=%s (mode=%s)",
             self._state.track_id,
-            self._settings.chorus_detector_backend,
+            mode,
         )
         detector = ChorusDetector(
-            backend=self._settings.chorus_detector_backend,
             min_duration_sec=self._settings.chorus_min_duration_sec,
-            max_duration_sec=self._settings.chorus_max_duration_sec,
+            vocal_silence_threshold=self._settings.chorus_vocal_silence_threshold,
+            boundary_merge_tolerance_sec=self._settings.chorus_boundary_merge_tolerance_sec,
         )
         segment_infos = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: detector.detect_with_info(full_file_str),
+            lambda: detector.detect(
+                full_file_str,
+                vocal_file=vocal_file_str,
+            ),
         )
-        # Извлекаем только chorus-сегменты для построения volume_segments
+        # Извлекаем только chorus-сегменты для логирования
         chorus_segments = [
             (s.start, s.end) for s in segment_infos if s.segment_type == "chorus"
         ]
