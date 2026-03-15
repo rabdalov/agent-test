@@ -9,9 +9,8 @@
     uv run python scripts/test_chorus_detector.py --backend hybrid
 
 Тестирует определение припевов на:
-1. Полный трек: data_exapmles/Иракли - Лондон-Париж.mp3
-2. Только вокал: data_exapmles/Иракли - Лондон-Париж_(Vocals).mp3
-3. Только инструментал: data_exapmles/Иракли - Лондон-Париж_(Instrumental).mp3
+1. Полный трек
+2. Только вокал
 
 Выводит найденные сегменты и сравнивает результаты между вариантами и бэкендами.
 """
@@ -282,13 +281,15 @@ def main() -> None:
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.getLogger("app.chorus_detector").setLevel(logging.DEBUG)
+    print(f"project_root: {project_root}")
+    data_dir = Path("\\\\192.168.0.200")/"docker"/"karaoke"/"music"/"Godsmack - Nothing Else Matters"
 
-    data_dir = project_root / "data_exapmles"
+    print(f"data_dir: {data_dir}")
 
     test_files = {
-        "Полный трек": data_dir / "Иракли - Лондон-Париж.mp3",
-        "Вокал": data_dir / "Иракли - Лондон-Париж_(Vocals).mp3",
-        "Инструментал": data_dir / "Иракли - Лондон-Париж_(Instrumental).mp3",
+        "Полный трек": data_dir / "Godsmack - Nothing Else Matters.mp3",
+        "Вокал": data_dir / "Godsmack - Nothing Else Matters_(Vocals).mp3",
+#        "Инструментал": data_dir / "Godsmack - Nothing Else Matters_(Instrumental).mp3",
     }
 
     # Проверяем наличие файлов
@@ -297,7 +298,7 @@ def main() -> None:
         exists = path.exists()
         size_mb = path.stat().st_size / 1024 / 1024 if exists else 0
         status = f"[OK] {size_mb:.1f} MB" if exists else "[!!] НЕ НАЙДЕН"
-        print(f"  {label:<30} {status}")
+        print(f"  {label:<30} {status} ({path.stem})")
 
     missing = [lbl for lbl, p in test_files.items() if not p.exists()]
     if missing:

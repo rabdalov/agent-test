@@ -362,23 +362,6 @@ class ChorusDetector:
             )
             return self._detect_hybrid_with_info(audio_file)
 
-    def detect(self, audio_file: str) -> list[tuple[float, float]]:
-        """Определить временные отрезки припевов в аудиофайле.
-
-        Обёртка над :meth:`detect_with_info` для обратной совместимости.
-
-        Parameters
-        ----------
-        audio_file:
-            Путь к аудиофайлу (MP3, FLAC, WAV и т.д.).
-
-        Returns
-        -------
-        list[tuple[float, float]]
-            Список кортежей ``(start_sec, end_sec)`` для каждого припева.
-            Возвращает пустой список, если определить структуру не удалось.
-        """
-        return [(seg.start, seg.end) for seg in self.detect_with_info(audio_file)]
 
     # ------------------------------------------------------------------
     # Backend: msaf
@@ -466,16 +449,6 @@ class ChorusDetector:
             [(s.start, s.end) for s in chorus_result],
         )
         return result
-
-    def _detect_msaf(self, audio_file: str) -> list[tuple[float, float]]:
-        """Детектирование через msaf (spectral clustering).
-
-        .. deprecated::
-            Используйте :meth:`_detect_msaf_with_info` напрямую.
-            Этот метод оставлен для внутренней совместимости.
-        """
-        infos = self._detect_msaf_with_info(audio_file)
-        return [(s.start, s.end) for s in infos if s.segment_type == "chorus"]
 
     # ------------------------------------------------------------------
     # Backend: librosa
@@ -624,16 +597,6 @@ class ChorusDetector:
         )
         return result
 
-    def _detect_librosa(self, audio_file: str) -> list[tuple[float, float]]:
-        """Детектирование на основе признаков librosa.
-
-        .. deprecated::
-            Используйте :meth:`_detect_librosa_with_info` напрямую.
-            Этот метод оставлен для внутренней совместимости.
-        """
-        infos = self._detect_librosa_with_info(audio_file)
-        return [(s.start, s.end) for s in infos if s.segment_type == "chorus"]
-
     # ------------------------------------------------------------------
     # Backend: hybrid
     # ------------------------------------------------------------------
@@ -775,15 +738,6 @@ class ChorusDetector:
         )
         return result
 
-    def _detect_hybrid(self, audio_file: str) -> list[tuple[float, float]]:
-        """Объединяет результаты msaf и librosa для повышения точности.
-
-        .. deprecated::
-            Используйте :meth:`_detect_hybrid_with_info` напрямую.
-            Этот метод оставлен для внутренней совместимости.
-        """
-        infos = self._detect_hybrid_with_info(audio_file)
-        return [(s.start, s.end) for s in infos if s.segment_type == "chorus"]
 
     # ------------------------------------------------------------------
     # Helper: librosa feature computation
@@ -1091,15 +1045,4 @@ class ChorusDetector:
         result.sort(key=lambda x: x[0][0])
         return result
 
-    def _merge_segments(
-        self,
-        msaf_segs: list[tuple[float, float]],
-        librosa_segs: list[tuple[float, float]],
-    ) -> list[tuple[float, float]]:
-        """Объединить сегменты из двух бэкендов.
 
-        .. deprecated::
-            Используйте :meth:`_merge_segments_with_source` напрямую.
-            Этот метод оставлен для внутренней совместимости.
-        """
-        return [seg for seg, _ in self._merge_segments_with_source(msaf_segs, librosa_segs)]
