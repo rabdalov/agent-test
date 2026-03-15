@@ -121,6 +121,7 @@ Style: ActiveLine, Arial,{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000
 Style: Highlight,  Arial,{font_size},&H0000FFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,2,5,0,0,0,1
 Style: NextLine,   Arial,{font_size},&H00AAAAAA,&H00AAAAAA,&H00000000,&H80000000, 0,0,0,0,100,100,0,0,1,2,1,5,0,0,0,1
 Style: Title,      Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,2,8,30,30,50,1
+Style: Segments,   Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,2,8,30,30,270,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
@@ -163,16 +164,22 @@ class AssGenerator:
         aligned_json_path: Path,
         output_ass_path: Path,
         track_title: str = "",
+        volume_segments_path: Path | None = None,
     ) -> None:
         """Generate ASS subtitle file.
 
         Args:
-            aligned_json_path: Path to the aligned lyrics JSON produced by
-                               AlignmentService (words + segments).
-            output_ass_path:   Destination path for the .ass file.
-            track_title:       Human-readable title shown in the ASS header and
-                               as the first dialogue line.  Defaults to the stem
-                               of *aligned_json_path*.
+            aligned_json_path:    Path to the aligned lyrics JSON produced by
+                                  AlignmentService (words + segments).
+            output_ass_path:      Destination path for the .ass file.
+            track_title:          Human-readable title shown in the ASS header and
+                                  as the first dialogue line.  Defaults to the stem
+                                  of *aligned_json_path*.
+            volume_segments_path: Optional path to the volume_segments JSON file
+                                  (produced by DETECT_CHORUS step).  When provided
+                                  and the file exists, each segment is rendered as a
+                                  ``Dialogue: 0`` line in the ``Segments`` style,
+                                  displayed at the top-quarter of the screen.
 
         Raises:
             FileNotFoundError: If *aligned_json_path* does not exist.
@@ -218,6 +225,25 @@ class AssGenerator:
             f"Title,,0,0,0,,{title}\n"
         )
 
+        # Volume segments info overlay (optional)
+        if volume_segments_path is not None and volume_segments_path.exists():
+            try:
+                volume_segments: list[dict] = json.loads(
+                    volume_segments_path.read_text(encoding="utf-8")
+                )
+                lines.extend(self._build_segment_info_dialogues(volume_segments))
+                logger.info(
+                    "AssGenerator: added %d segment info overlays from '%s'",
+                    len(volume_segments),
+                    volume_segments_path,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "AssGenerator: failed to load volume_segments_file '%s': %s",
+                    volume_segments_path,
+                    exc,
+                )
+
         # Group words into segments
         grouped = self._group_words_into_segments(segments, words)
 
@@ -240,6 +266,56 @@ class AssGenerator:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_segment_info_dialogues(
+        volume_segments: list[dict],
+    ) -> list[str]:
+        """Build Dialogue lines for volume segments info overlay.
+
+        Each segment produces one Dialogue line in the Segments style,
+        displayed at the top-quarter of the screen for the duration of
+        the segment.
+
+        Format: mm:ss-mm:ss [segment_type] vol:{volume:.2f} energy:{vocal_energy:.2f}
+                chroma:{chroma_variance:.2f} sim:{sim_score:.2f} hpss:{hpss_score:.2f}
+        """
+        def _fmt_mmss(seconds: float) -> str:
+            total_s = int(seconds)
+            m = total_s // 60
+            s = total_s % 60
+            return f"{m:02d}:{s:02d}"
+
+        lines: list[str] = []
+        for seg in volume_segments:
+            start: float = seg.get("start", 0.0)
+            end: float = seg.get("end", 0.0)
+            seg_type: str = seg.get("segment_type", "unknown")
+            volume: float = seg.get("volume", 0.0)
+            scores: dict = seg.get("scores", {})
+
+            vocal_energy: float = scores.get("vocal_energy", 0.0)
+            chroma_variance: float = scores.get("chroma_variance", 0.0)
+            sim_score: float = scores.get("sim_score", 0.0)
+            hpss_score: float = scores.get("hpss_score", 0.0)
+
+            text = (
+                f"{_fmt_mmss(start)}-{_fmt_mmss(end)} "
+                f"[{seg_type}] "
+                f"vol:{volume:.2f} "
+                f"energy:{vocal_energy:.2f} "
+                f"chroma:{chroma_variance:.2f} "
+                f"sim:{sim_score:.2f} "
+                f"hpss:{hpss_score:.2f}"
+            )
+
+            lines.append(
+                f"Dialogue: 0,"
+                f"{_format_ass_time(start)},"
+                f"{_format_ass_time(end)},"
+                f"Segments,,0,0,0,,{text}\n"
+            )
+        return lines
 
     @staticmethod
     def _group_words_into_segments(

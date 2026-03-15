@@ -1245,6 +1245,13 @@ class KaraokePipeline:
 
         track_title = stem.replace("_", " ")
 
+        # Resolve volume_segments_path if available
+        volume_segments_path: Path | None = None
+        if self._state.volume_segments_file:
+            vsp = Path(self._state.volume_segments_file)
+            if vsp.exists():
+                volume_segments_path = vsp
+
         generator = AssGenerator(font_size=self._settings.ass_font_size)
         await asyncio.get_event_loop().run_in_executor(
             None,
@@ -1252,6 +1259,7 @@ class KaraokePipeline:
                 aligned_json_path=aligned_path,
                 output_ass_path=output_ass,
                 track_title=track_title,
+                volume_segments_path=volume_segments_path,
             ),
         )
 
