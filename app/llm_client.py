@@ -75,7 +75,7 @@ class LLMClient:
         prompt: str,
         system_prompt: str | None = None,
         temperature: float = 0.1,
-        max_tokens: int = 16000,
+        max_tokens: int = 32000,
     ) -> str:
         """Send a completion request to the LLM.
 

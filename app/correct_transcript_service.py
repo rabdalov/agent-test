@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # Максимальный размер транскрипции (в символах) для одного запроса к LLM
 # При превышении — разбиваем на чанки по словам.
 # Используется после линеаризации JSON (без indent), поэтому порог выше.
-_MAX_TRANSCRIPTION_CHARS = 12000
+_MAX_TRANSCRIPTION_CHARS = 32000
 
 # System prompt for the LLM
 _SYSTEM_PROMPT = """You are a music transcription expert. Your task is to correct transcribed text 
