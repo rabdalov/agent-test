@@ -88,6 +88,9 @@ class VolumeSegment:
     scores:
         Характеристики детектора для данного сегмента (зависят от бэкенда).
         Пустой словарь, если информация недоступна.
+    id:
+        Порядковый номер сегмента (начиная с 1). Присваивается при построении
+        списка сегментов.
     """
     start: float
     end: float
@@ -95,6 +98,7 @@ class VolumeSegment:
     segment_type: str | None = None
     backend: str | None = None
     scores: dict[str, Any] = field(default_factory=dict)
+    id: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -387,12 +391,16 @@ def build_volume_segments(
                     volume=default_volume,
                 )
             )
+        # Присваиваем порядковые номера
+        for idx, seg in enumerate(result, start=1):
+            seg.id = idx
         return result
 
     # Fallback: строим из chorus_segments без расширенной информации детектора
     if not chorus_segments:
         # No chorus detected — use default volume for the whole track
-        return [VolumeSegment(start=0.0, end=audio_duration, volume=default_volume)]
+        seg = VolumeSegment(start=0.0, end=audio_duration, volume=default_volume, id=1)
+        return [seg]
 
     sorted_chorus = sorted(chorus_segments, key=lambda s: s[0])
     segments: list[VolumeSegment] = []
@@ -421,6 +429,10 @@ def build_volume_segments(
             VolumeSegment(start=current_pos, end=audio_duration, volume=default_volume)
         )
 
+    # Присваиваем порядковые номера
+    for idx, seg in enumerate(segments, start=1):
+        seg.id = idx
+
     return segments
 
 
@@ -444,6 +456,7 @@ def save_volume_segments(
     data = []
     for seg in segments:
         item: dict[str, Any] = {
+            "id": seg.id,
             "start": seg.start,
             "end": seg.end,
             "volume": seg.volume,
@@ -512,6 +525,7 @@ def load_volume_segments(input_path: Path) -> list[VolumeSegment]:
                 segment_type=item.get("segment_type"),
                 backend=item.get("backend"),
                 scores=item.get("scores", {}),
+                id=int(item.get("id", 0)),
             )
         )
     _logger.debug(
