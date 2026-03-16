@@ -78,6 +78,7 @@ class PipelineState(BaseModel):
     notification_message_id: int | None = None  # ID сообщения для редактирования уведомлений
     # MIX_AUDIO step artifacts
     volume_segments_file: str | None = None   # JSON с разметкой громкости вокала по сегментам
+    segment_groups_file: str | None = None    # JSON с группами сегментов (объединёнными по типу)
     processed_vocal_file: str | None = None   # Обработанная вокальная дорожка (с применённой громкостью)
     backvocal_mix_file: str | None = None     # MP3 микс: instrumental + processed_vocal
     supressedvocal_mix: str | None = None     # MP3 микс: instrumental + raw_vocal (с фиксированной громкостью)

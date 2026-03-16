@@ -106,6 +106,8 @@ def main() -> None:
 
     # --- Извлекаем пути к артефактам ---
     volume_segments_file = _resolve_path(
+        track_dir, state.get("segment_groups_file")
+    ) or _resolve_path(
         track_dir, state.get("volume_segments_file")
     ) or _find_file_by_suffix(track_dir, ["_volume_segments.json"])
 

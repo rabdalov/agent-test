@@ -316,6 +316,181 @@ def _get_volume_for_segment_type(
         return default_volume  # verse, bridge, intro, outro
 
 
+def group_volume_segments(
+    segments: list[VolumeSegment],
+    chorus_volume: float = 0.4,
+    default_volume: float = 0.2,
+) -> list[VolumeSegment]:
+    """Группировать соседние сегменты по идентичному типу.
+
+    Алгоритм:
+    1. Сортировать по start (гарантировано, но на всякий случай)
+    2. Пройти по сегментам, группируя соседние с одинаковым segment_type
+    3. Для каждой группы создать новый VolumeSegment с:
+       - id = 0 (группы не имеют id)
+       - id_group = порядковый номер группы (начиная с 1)
+       - start = начало первого сегмента
+       - end = конец последнего сегмента
+       - volume = вычисляется на основе типа сегмента через _get_volume_for_segment_type
+       - segment_type = тип группы
+       - backend = из первого сегмента
+       - scores = массив словарей {id, ...metrics}
+
+    Parameters
+    ----------
+    segments:
+        Список сегментов громкости для группировки.
+    chorus_volume:
+        Громкость для припевов (по умолчанию 0.4).
+    default_volume:
+        Громкость по умолчанию (по умолчанию 0.2).
+
+    Returns
+    -------
+    list[VolumeSegment]
+        Список групп сегментов с массивом scores внутри каждой группы.
+    """
+    if not segments:
+        return []
+
+    # Сортируем по start (на всякий случай)
+    sorted_segments = sorted(segments, key=lambda s: s.start)
+
+    groups: list[VolumeSegment] = []
+    current_group: list[VolumeSegment] = []
+    current_type: str | None = None
+
+    for seg in sorted_segments:
+        seg_type = seg.segment_type or "unknown"
+
+        if current_type is None:
+            # Начинаем новую группу
+            current_type = seg_type
+            current_group = [seg]
+        elif seg_type == current_type:
+            # Добавляем к текущей группе
+            current_group.append(seg)
+        else:
+            # Завершаем текущую группу и начинаем новую
+            if current_group:
+                groups.append(_create_group_from_segments(current_group, len(groups) + 1, chorus_volume, default_volume))
+            current_type = seg_type
+            current_group = [seg]
+
+    # Добавляем последнюю группу
+    if current_group:
+        groups.append(_create_group_from_segments(current_group, len(groups) + 1, chorus_volume, default_volume))
+
+    return groups
+
+
+def _create_group_from_segments(
+    segs: list[VolumeSegment],
+    group_id: int,
+    chorus_volume: float,
+    default_volume: float,
+) -> VolumeSegment:
+    """Создать VolumeSegment-группу из списка сегментов.
+
+    Parameters
+    ----------
+    segs:
+        Список сегментов для объединения в группу.
+    group_id:
+        Порядковый номер группы (начиная с 1).
+    chorus_volume:
+        Громкость для припевов.
+    default_volume:
+        Громкость по умолчанию.
+
+    Returns
+    -------
+    VolumeSegment
+        Группа сегментов с массивом scores.
+    """
+    if not segs:
+        raise ValueError("Cannot create group from empty segment list")
+
+    first_seg = segs[0]
+    last_seg = segs[-1]
+    segment_type = first_seg.segment_type or "unknown"
+
+    # Вычисляем volume на основе типа сегмента
+    volume = _get_volume_for_segment_type(segment_type, chorus_volume, default_volume)
+
+    # Формируем массив scores
+    scores_array: list[dict[str, Any]] = []
+    for s in segs:
+        score_item: dict[str, Any] = {
+            "id": s.id,
+        }
+        # Добавляем все метрики из scores
+        for key, value in s.scores.items():
+            score_item[key] = value
+        scores_array.append(score_item)
+
+    return VolumeSegment(
+        start=first_seg.start,
+        end=last_seg.end,
+        volume=volume,
+        segment_type=segment_type,
+        backend=first_seg.backend,
+        scores={"id_group": group_id, "scores": scores_array},  # type: ignore[arg-type]
+        id=0,  # Группы не имеют id (используется id_group в scores)
+    )
+
+
+def save_segment_groups(
+    groups: list[VolumeSegment],
+    output_path: Path,
+) -> None:
+    """Сохранить группы сегментов в JSON-файл.
+
+    Parameters
+    ----------
+    groups:
+        Список групп сегментов.
+    output_path:
+        Путь к выходному JSON-файлу.
+    """
+    _logger = logging.getLogger(__name__)
+    data = []
+
+    for group in groups:
+        # Извлекаем id_group и массив scores из scores dict
+        scores_dict = group.scores if isinstance(group.scores, dict) else {}
+        id_group = scores_dict.get("id_group", 0)
+        scores_array = scores_dict.get("scores", [])
+
+        item: dict[str, Any] = {
+            "id_group": id_group,
+            "start": group.start,
+            "end": group.end,
+            "volume": group.volume,
+        }
+
+        if group.segment_type is not None:
+            item["segment_type"] = group.segment_type
+        if group.backend is not None:
+            item["backend"] = group.backend
+
+        # Добавляем массив scores
+        if scores_array:
+            item["scores"] = scores_array
+
+        data.append(item)
+
+    output_path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _logger.debug(
+        "save_segment_groups: saved %d groups to '%s'",
+        len(groups),
+        output_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Volume segments functions
 # ---------------------------------------------------------------------------

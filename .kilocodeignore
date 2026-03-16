@@ -1,3 +1,5 @@
 cr-promts/*.*
 .env
 users.json
+estimations/*.*
+.features_msaf_tmp.json

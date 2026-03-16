@@ -16,8 +16,10 @@ from .chorus_detector import (
     ChorusDetector,
     VolumeSegment,
     build_volume_segments,
+    group_volume_segments,
     load_volume_segments,
     save_volume_segments,
+    save_segment_groups,
 )
 from .config import Settings
 from .correct_transcript_service import CorrectTranscriptService
@@ -1187,6 +1189,35 @@ class KaraokePipeline:
             if vsp.exists():
                 volume_segments_path = vsp
 
+        # Создаём группы сегментов из volume_segments
+        segment_groups_path: Path | None = None
+        if volume_segments_path and volume_segments_path.exists():
+            try:
+                # Загружаем сегменты
+                volume_segments = load_volume_segments(volume_segments_path)
+                if volume_segments:
+                    # Группируем сегменты
+                    groups = group_volume_segments(
+                        segments=volume_segments,
+                        chorus_volume=self._settings.chorus_backvocal_volume,
+                        default_volume=self._settings.audio_mix_voice_volume,
+                    )
+                    # Сохраняем группы
+                    segment_groups_path = track_dir / f"{stem}_segment_groups.json"
+                    save_segment_groups(groups, segment_groups_path)
+                    self._state.segment_groups_file = str(segment_groups_path)
+                    self._save_state()
+                    logger.info(
+                        "GENERATE_ASS step: created segment groups file '%s' with %d groups",
+                        segment_groups_path,
+                        len(groups),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "GENERATE_ASS step: failed to create segment groups: %s",
+exc
+                )
+
         generator = AssGenerator(font_size=self._settings.ass_font_size)
         await asyncio.get_event_loop().run_in_executor(
             None,
@@ -1194,7 +1225,7 @@ class KaraokePipeline:
                 aligned_json_path=aligned_path,
                 output_ass_path=output_ass,
                 track_title=track_title,
-                volume_segments_path=volume_segments_path,
+                volume_segments_path=segment_groups_path if segment_groups_path else volume_segments_path,
             ),
         )
 
@@ -1228,7 +1259,12 @@ class KaraokePipeline:
                         Path(self._state.source_lyrics_file)
                         if self._state.source_lyrics_file else None
                     ),
-                    volume_segments_file=volume_segments_path,
+                    # Используем segment_groups_file если есть, иначе volume_segments_file
+                    volume_segments_file=(
+                        Path(self._state.segment_groups_file)
+                        if self._state.segment_groups_file and Path(self._state.segment_groups_file).exists()
+                        else (segment_groups_path if segment_groups_path else volume_segments_path)
+                    ),
                     track_title=self._state.track_stem or "",
                 )
                 self._state.visualization_file = str(viz_path)

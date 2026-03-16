@@ -277,6 +277,10 @@ class AssGenerator:
         displayed at the top-quarter of the screen for the duration of
         the segment.
 
+        Supports two formats:
+        - Old: scores - dict {vocal_energy, chroma_variance, sim_score, hpss_score}
+        - New (groups): scores - list array [{id, vocal_energy, ...}, ...]
+
         Format: mm:ss-mm:ss [segment_type] vol:{volume:.2f} energy:{vocal_energy:.2f}
                 chroma:{chroma_variance:.2f} sim:{sim_score:.2f} hpss:{hpss_score:.2f}
         """
@@ -288,28 +292,56 @@ class AssGenerator:
 
         lines: list[str] = []
         for seg in volume_segments:
-            id: str = seg.get("id", 0)
+            # Определяем формат: старый (dict) или новый (list - группы)
+            scores = seg.get("scores")
+            
+            if isinstance(scores, list):
+                # Новый формат групп: scores - массив
+                if scores:
+                    # id_group из первого элемента
+                    id_val = scores[0].get("id_group", 0)
+                    # Среднее значение метрик по группе
+                    vocal_energy = sum(s.get("vocal_energy", 0.0) for s in scores) / len(scores)
+                    # Для остальных метрик тоже среднее
+                    first_score = scores[0] if scores else {}
+                    chroma_variance = first_score.get("chroma_variance", 0.0)
+                    sim_score = first_score.get("sim_score", 0.0)
+                    hpss_score = first_score.get("hpss_score", 0.0)
+                    # Диапазон id
+                    ids = [s.get("id", 0) for s in scores]
+                    if ids and min(ids) != max(ids):
+                        id_display = f"#{min(ids)}-{max(ids)}"
+                    else:
+                        id_display = f"#{id_val}" if id_val else ""
+                else:
+                    id_val = 0
+                    id_display = ""
+                    vocal_energy = 0.0
+                    chroma_variance = 0.0
+                    sim_score = 0.0
+                    hpss_score = 0.0
+            else:
+                # Старый формат
+                id_val = seg.get("id", 0)
+                id_display = f"{id_val}." if id_val else ""
+                scores = scores or {}
+                vocal_energy = float(scores.get("vocal_energy", 0.0))
+                chroma_variance = float(scores.get("chroma_variance", 0.0))
+                sim_score = float(scores.get("sim_score", 0.0))
+                hpss_score = float(scores.get("hpss_score", 0.0))
+
             start: float = seg.get("start", 0.0)
             end: float = seg.get("end", 0.0)
             seg_type: str = seg.get("segment_type", "unknown")
             volume: float = seg.get("volume", 0.0)
-            scores: dict = seg.get("scores", {})
 
-            vocal_energy: float = scores.get("vocal_energy", 0.0)
-            chroma_variance: float = scores.get("chroma_variance", 0.0)
-            sim_score: float = scores.get("sim_score", 0.0)
-            hpss_score: float = scores.get("hpss_score", 0.0)
-            seg_length_sec=end-start
-            intro_length_sec= f" - {seg_length_sec:.0f} сек." if seg_type=='instrumental' else f""
+            seg_length_sec = end - start
+            intro_length_sec = f" - {seg_length_sec:.0f} сек." if seg_type == "instrumental" else f""
             text = (
-                # f"{_fmt_mmss(start)}-{_fmt_mmss(end)} "
-                f"{id}. "
-                f"{seg_type} {intro_length_sec}"
-                f"(V:{100*volume:.0f}% "
-                f"E:{100*vocal_energy:.0f}) "
-                # f"chroma:{chroma_variance:.2f} "
-                # f"sim:{sim_score:.2f} "
-                # f"hpss:{hpss_score:.2f}"
+                # f"{id_display} "
+                f"{seg_type}{intro_length_sec}"
+                #f"(V:{100 * volume:.0f}% "
+                #f"E:{100 * vocal_energy:.0f}) "
             )
 
             lines.append(

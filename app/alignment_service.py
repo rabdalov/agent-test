@@ -592,9 +592,6 @@ class AlignmentService:
         # --- Post-process: guarantee non-negative, monotonically-non-decreasing times ---
         result = self._sanitise(result)
 
-        # --- Post-process: insert "(проигрыш)" markers for abnormally long first words ---
-        result = self._fix_long_first_words(result, max_word_time=max_word_time, normal_word_time=normal_word_time)
-
         logger.info(
             "AlignmentService: alignment produced %d words, %d segments",
             len(result.words),
@@ -627,116 +624,7 @@ class AlignmentService:
             lt.end_time = max(lt.start_time, round(lt.end_time, 3))
         return result
 
-    @staticmethod
-    def _fix_long_first_words(
-        result: AlignedLyricsResult,
-        max_word_time: float,
-        normal_word_time: float,
-    ) -> AlignedLyricsResult:
-        """Insert "(проигрыш)" gap markers when the first word of a line is too long.
 
-        Algorithm (applied per segment/line):
-        1. Find the first word in ``result.words`` that belongs to this segment
-           (matched by ``start_time`` of the segment).
-        2. If the duration of that first word exceeds *max_word_time*:
-           a. Save ``start_time_gap = first_word.start_time``.
-           b. Set ``first_word.start_time = first_word.end_time - normal_word_time``
-              (clamped so it never goes below ``start_time_gap``).
-           c. Insert a new ``WordWithTimestamp("(проигрыш)", start_time_gap,
-              first_word.start_time)`` **before** the first word in the flat
-              words list.
-           d. Prepend "(проигрыш) " to the corresponding segment's ``text``
-              and set ``segment.start_time = start_time_gap``.
-
-        The method rebuilds ``result.words`` in a single pass so that the
-        insertion positions are handled correctly even when multiple lines
-        are affected.
-        """
-        if not result.segments or not result.words:
-            return result
-
-        # Build a quick map: for each segment, find the index of its first word
-        # in result.words by matching start_time (after _sanitise they are exact).
-        # We do a single linear scan — O(W + S).
-
-        # Index: word_index → segment_index (which segment "owns" this word)
-        # We will rebuild this during the scan below.
-
-        # Step 1: For each segment find candidate first-word index in result.words.
-        # A word belongs to segment[i] if its start_time is within
-        # [segment.start_time, segment.end_time).
-        # We walk both lists in order (both are expected to be sorted by time).
-
-        seg_first_word_idx: list[int | None] = [None] * len(result.segments)
-        seg_idx = 0
-        for wi, w in enumerate(result.words):
-            # Advance segment pointer past segments whose end_time <= w.start_time
-            while seg_idx < len(result.segments) and result.segments[seg_idx].end_time <= w.start_time:
-                seg_idx += 1
-            if seg_idx >= len(result.segments):
-                break
-            seg = result.segments[seg_idx]
-            if seg.start_time <= w.start_time < seg.end_time:
-                if seg_first_word_idx[seg_idx] is None:
-                    seg_first_word_idx[seg_idx] = wi
-
-        # Step 2: Identify which word indices need a gap marker BEFORE them.
-        # Collect as a set for O(1) lookup during rebuild.
-        insertions: dict[int, WordWithTimestamp] = {}  # word_index → marker to insert before it
-
-        for si, seg in enumerate(result.segments):
-            first_wi = seg_first_word_idx[si]
-            if first_wi is None:
-                continue
-
-            first_word = result.words[first_wi]
-            duration = first_word.end_time - first_word.start_time
-            if duration <= max_word_time:
-                continue
-
-            # Compute corrected start_time for the real first word
-            start_time_gap = first_word.start_time
-            corrected_start = round(first_word.end_time - normal_word_time, 3)
-            # Clamp: must not go below the gap start
-            corrected_start = max(corrected_start, start_time_gap)
-
-            # Create the gap marker word
-            gap_marker = WordWithTimestamp(
-                word="(проигрыш)",
-                start_time=start_time_gap,
-                end_time=corrected_start,
-            )
-
-            # Update the first real word's start_time
-            first_word.start_time = corrected_start
-
-            # Update the segment text and start_time
-            seg.start_time = start_time_gap
-            if not seg.text.startswith("(проигрыш)"):
-                seg.text = "(проигрыш) " + seg.text
-
-            insertions[first_wi] = gap_marker
-            logger.info(
-                "AlignmentService._fix_long_first_words: inserted gap marker before word '%s' "
-                "(duration=%.2fs > max=%.2fs) in segment '%s'",
-                first_word.word,
-                duration,
-                max_word_time,
-                seg.text,
-            )
-
-        if not insertions:
-            return result
-
-        # Step 3: Rebuild the words list with gap markers inserted
-        new_words: list[WordWithTimestamp] = []
-        for wi, w in enumerate(result.words):
-            if wi in insertions:
-                new_words.append(insertions[wi])
-            new_words.append(w)
-
-        result.words = new_words
-        return result
 
 
 # ---------------------------------------------------------------------------
