@@ -75,6 +75,7 @@ class VideoRenderer:
         ass_path: Path,
         output_path: Path,
         backvocal_mix_path: Path | None = None,
+        supressedvocal_mix_path: Path | None = None,
     ) -> Path:
         """Render the karaoke video with three (or four) audio tracks.
 
@@ -93,6 +94,10 @@ class VideoRenderer:
         backvocal_mix_path:
             Optional path to the back-vocal mix file (Instrumental + BackVocal).
             If provided, a fourth audio track is added to the output MP4.
+        supressedvocal_mix_path:
+            Optional path to the supressedvocal mix file (Instrumental + Vocal at fixed volume).
+            If provided, this pre-rendered file is used for the third audio track instead of
+            generating the mix on-the-fly.
 
         Returns
         -------
@@ -120,14 +125,38 @@ class VideoRenderer:
         # Determine if we have a 4th audio track (BackVocal mix)
         has_backvocal = backvocal_mix_path is not None and backvocal_mix_path.exists()
 
+        # Determine if we have pre-rendered supressedvocal mix
+        has_supressedvocal_mix = (
+            supressedvocal_mix_path is not None and supressedvocal_mix_path.exists()
+        )
+
         # Audio inputs: [0:v] = lavfi color, [1:a] = instrumental, [2:a] = original, [3:a] = vocal
         # Optional [4:a] = backvocal_mix (if provided)
-        # Mix instrumental + vocal (at reduced volume) for third track
-        # amix weights: instrumental=1, vocal=mix_voice_volume
-        filter_complex = (
-            f"[0:v]ass='{ass_for_filter}'[vout];"
-            f"[1:a][2:a]amix=inputs=2:duration=longest:weights=1 {self._mix_voice_volume}[a3]"
-        )
+        # Third track: use pre-rendered supressedvocal_mix OR generate on-the-fly
+        if has_supressedvocal_mix:
+            # Use pre-rendered supressedvocal_mix file as third audio track
+            logger.info(
+                "VideoRenderer: using pre-rendered supressedvocal_mix='%s'",
+                supressedvocal_mix_path,
+            )
+            # filter_complex only burns ASS subtitles
+            filter_complex = f"[0:v]ass='{ass_for_filter}'[vout]"
+            # Audio inputs: 1=instrumental, 2=original, 3=supressedvocal_mix
+            audio_input_count = 3
+        else:
+            # Generate mix on-the-fly using amix filter
+            # Mix instrumental + vocal (at reduced volume) for third track
+            # amix weights: instrumental=1, vocal=mix_voice_volume
+            logger.info(
+                "VideoRenderer: generating supressedvocal mix on-the-fly (volume=%.2f)",
+                self._mix_voice_volume,
+            )
+            filter_complex = (
+                f"[0:v]ass='{ass_for_filter}'[vout];"
+                f"[1:a][3:a]amix=inputs=2:duration=longest:weights=1 {self._mix_voice_volume}[a3]"
+            )
+            # Audio inputs: 1=instrumental, 2=original, 3=vocal (for on-the-fly mixing)
+            audio_input_count = 4 if has_backvocal else 3
 
         cmd: list[str] = [
             "ffmpeg",
@@ -139,25 +168,38 @@ class VideoRenderer:
             "-i", str(instrumental_path.resolve()),
             # Audio input 2: Original → [2:a]
             "-i", str(original_path.resolve()),
-            # Audio input 3: Vocal → [3:a]
-            "-i", str(vocal_path.resolve()),
         ]
+
+        # Add third audio input (either pre-rendered or vocal for on-the-fly mixing)
+        if has_supressedvocal_mix:
+            # Use pre-rendered supressedvocal_mix as third audio track
+            cmd += ["-i", str(supressedvocal_mix_path.resolve())]  # type: ignore[union-attr]
+        else:
+            # Use raw vocal for on-the-fly mixing
+            cmd += ["-i", str(vocal_path.resolve())]
 
         # Optional 4th audio input: BackVocal mix → [4:a]
         if has_backvocal:
             cmd += ["-i", str(backvocal_mix_path.resolve())]  # type: ignore[union-attr]
 
         cmd += [
-            # Filter: burn ASS subtitles + mix instrumental+voice
+            # Filter: burn ASS subtitles
             "-filter_complex", filter_complex,
             "-map", "[vout]",
             "-map", "1:a",                    # First audio track: Instrumental
             "-map", "2:a",                    # Second audio track: Original
-            "-map", "[a3]",                   # Third audio track: Instrumental+Voice mix
         ]
 
+        # Third audio track: use pre-rendered or on-the-fly mix
+        if has_supressedvocal_mix:
+            cmd += ["-map", "3:a"]            # Third audio track: pre-rendered supressedvocal_mix
+        else:
+            cmd += ["-map", "[a3]"]           # Third audio track: on-the-fly mix
+
         if has_backvocal:
-            cmd += ["-map", "4:a"]            # Fourth audio track: Instrumental+BackVocal
+            # Fourth audio track index depends on whether we have pre-rendered mix
+            fourth_audio_idx = "4:a" if has_supressedvocal_mix else "5:a"
+            cmd += ["-map", fourth_audio_idx]
 
         cmd += [
             # Video codec settings
@@ -193,12 +235,13 @@ class VideoRenderer:
         cmd += [str(output_path.resolve())]
 
         logger.info(
-            "VideoRenderer: starting ffmpeg render\n  instrumental='%s'\n  original='%s'\n  vocal='%s'\n  ass='%s'\n  backvocal_mix='%s'\n  output='%s'",
+            "VideoRenderer: starting ffmpeg render\n  instrumental='%s'\n  original='%s'\n  vocal='%s'\n  ass='%s'\n  backvocal_mix='%s'\n  supressedvocal_mix='%s'\n  output='%s'",
             instrumental_path,
             original_path,
             vocal_path,
             ass_path,
             backvocal_mix_path,
+            supressedvocal_mix_path,
             output_path,
         )
         

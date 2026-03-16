@@ -1,15 +1,15 @@
 """Тест VocalProcessor — проверка применения разметки громкости к вокальной дорожке.
 
 Запуск:
-    uv run python scripts/test_vocal_processor.py <vocal_file> [output_file]
+    uv run python scripts/test_vocal_processor.py <instrumental_file> <vocal_file> [output_file]
 
 Пример:
-    uv run python scripts/test_vocal_processor.py tracks/my_track/vocals.mp3
+    uv run python scripts/test_vocal_processor.py tracks/my_track/instrumental.mp3 tracks/my_track/vocals.mp3
 
 Скрипт:
 1. Строит тестовую разметку громкости (имитирует chorus/non-chorus сегменты).
 2. Выводит ffmpeg-фильтр, который будет применён.
-3. Запускает VocalProcessor.process() и сохраняет результат.
+3. Запускает VocalProcessor.process_and_mix() и сохраняет результат.
 4. Выводит размер входного и выходного файлов для сравнения.
 """
 
@@ -77,25 +77,33 @@ def build_test_segments(duration_sec: float) -> list[VolumeSegment]:
 
 
 async def main() -> None:
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 3:
         print(
             "Использование: uv run python scripts/test_vocal_processor.py "
-            "<vocal_file> [output_file]"
+            "<instrumental_file> <vocal_file> [output_file]"
         )
+        print("\nПример:")
+        print("  uv run python scripts/test_vocal_processor.py tracks/my_track/instrumental.mp3 tracks/my_track/vocals.mp3")
         sys.exit(1)
 
-    vocal_file = sys.argv[1]
+    instrumental_file = sys.argv[1]
+    vocal_file = sys.argv[2]
+    instrumental_path = Path(instrumental_file)
     vocal_path = Path(vocal_file)
+
+    if not instrumental_path.exists():
+        print(f"Ошибка: файл не найден: {instrumental_file}")
+        sys.exit(1)
 
     if not vocal_path.exists():
         print(f"Ошибка: файл не найден: {vocal_file}")
         sys.exit(1)
 
     # Определяем путь к выходному файлу
-    if len(sys.argv) >= 3:
-        output_file = sys.argv[2]
+    if len(sys.argv) >= 4:
+        output_file = sys.argv[3]
     else:
-        output_file = str(vocal_path.parent / f"{vocal_path.stem}_processed_test.mp3")
+        output_file = str(vocal_path.parent / f"{vocal_path.stem}_mixed_test.mp3")
 
     # Получаем длительность файла через ffprobe
     duration_sec = await _get_duration(vocal_file)
@@ -118,9 +126,10 @@ async def main() -> None:
     volume_filter = processor._build_volume_filter(segments)
     print(f"\nffmpeg volume filter:\n  {volume_filter}\n")
 
-    # Запускаем обработку
-    logger.info("Запуск VocalProcessor.process()...")
-    result = await processor.process(
+    # Запускаем обработку и микширование (один проход)
+    logger.info("Запуск VocalProcessor.process_and_mix()...")
+    result = await processor.process_and_mix(
+        instrumental_file=instrumental_file,
         vocal_file=vocal_file,
         volume_segments=segments,
         output_file=output_file,
@@ -130,9 +139,9 @@ async def main() -> None:
     input_size = vocal_path.stat().st_size
     output_size = Path(result).stat().st_size
     print(f"\nРезультат:")
-    print(f"  Входной файл:  {vocal_file} ({input_size:,} байт)")
-    print(f"  Выходной файл: {result} ({output_size:,} байт)")
-    print(f"\nГотово! Проверьте выходной файл — громкость должна меняться каждые 30 сек.")
+    print(f"  Вокальный файл:    {vocal_file} ({input_size:,} байт)")
+    print(f"  Выходной файл:    {result} ({output_size:,} байт)")
+    print(f"\nГотово! Проверьте выходной файл — громкость вокала должна меняться каждые 30 сек.")
     print(f"  non-chorus (0–30, 60–90, 120–...): громкость 40%")
     print(f"  chorus     (30–60, 90–120, ...):   громкость 100%")
 

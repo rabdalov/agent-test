@@ -80,6 +80,7 @@ class PipelineState(BaseModel):
     volume_segments_file: str | None = None   # JSON с разметкой громкости вокала по сегментам
     processed_vocal_file: str | None = None   # Обработанная вокальная дорожка (с применённой громкостью)
     backvocal_mix_file: str | None = None     # MP3 микс: instrumental + processed_vocal
+    supressedvocal_mix: str | None = None     # MP3 микс: instrumental + raw_vocal (с фиксированной громкостью)
 
 
 class PipelineResult(BaseModel):

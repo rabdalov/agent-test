@@ -940,8 +940,8 @@ class KaraokePipeline:
 
         Steps:
         1. Load volume_segments from volume_segments_file (built in DETECT_CHORUS step).
-        2. Apply volume segments to vocal track via VocalProcessor (ffmpeg).
-        3. Create backvocal_mix_file: instrumental + processed_vocal.
+        2. Apply volume segments to vocal AND mix with instrumental in ONE ffmpeg pass.
+        3. Create supressedvocal_mix_file: instrumental + raw vocal (with fixed volume).
         """
         # Check if step is enabled in config
         if not self._settings.mix_audio_enabled:
@@ -976,103 +976,38 @@ class KaraokePipeline:
             self._state.track_id,
         )
 
-        # Step 2: Apply volume segments to vocal track
-        processed_vocal_file = track_dir / f"{stem}_processed_vocal.mp3"
+        # Step 2: Apply volume segments to vocal AND mix with instrumental in one pass
+        backvocal_mix_file = track_dir / f"{stem}_backvocal_mix.mp3"
         processor = VocalProcessor(
             reverb_enabled=self._settings.vocal_reverb_enabled,
             echo_enabled=self._settings.vocal_echo_enabled,
+            mix_voice_volume=self._settings.audio_mix_voice_volume,
         )
-        await processor.process(
+        await processor.process_and_mix(
+            instrumental_file=instrumental_file_str,
             vocal_file=vocal_file_str,
             volume_segments=volume_segments,
-            output_file=str(processed_vocal_file),
-        )
-        self._state.processed_vocal_file = str(processed_vocal_file)
-
-        # Step 3: Create backvocal_mix_file: instrumental + processed_vocal
-        backvocal_mix_file = track_dir / f"{stem}_backvocal_mix.mp3"
-        await self._mix_instrumental_and_vocal(
-            instrumental_path=Path(instrumental_file_str),
-            vocal_path=processed_vocal_file,
-            output_path=backvocal_mix_file,
+            output_file=str(backvocal_mix_file),
         )
         self._state.backvocal_mix_file = str(backvocal_mix_file)
+
+        # Step 3: Create supressedvocal_mix_file: instrumental + raw vocal (with fixed volume)
+        # This is used for the 3rd audio track in the video (Instrumental+Voice mix)
+        supressedvocal_mix_file = track_dir / f"{stem}_supressedvocal_mix.mp3"
+        await processor.mix_instrumental_and_vocal_fixed_volume(
+            instrumental_path=Path(instrumental_file_str),
+            vocal_path=Path(vocal_file_str),  # Use raw vocal, not processed
+            output_path=supressedvocal_mix_file,
+        )
+        self._state.supressedvocal_mix = str(supressedvocal_mix_file)
 
         self._save_state()
         logger.info(
             "MIX_AUDIO step completed for track_id=%s: "
-            "processed_vocal='%s', backvocal_mix='%s'",
+            "backvocal_mix='%s', supressedvocal_mix='%s'",
             self._state.track_id,
-            processed_vocal_file,
             backvocal_mix_file,
-        )
-
-    async def _mix_instrumental_and_vocal(
-        self,
-        instrumental_path: Path,
-        vocal_path: Path,
-        output_path: Path,
-    ) -> None:
-        """Mix instrumental and processed vocal tracks into a single MP3 file.
-
-        Uses ffmpeg amix filter to combine the two audio streams.
-        The vocal is already at the correct volume (applied in VocalProcessor).
-        """
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # amix with weights 1:1 — vocal volume is already adjusted
-        filter_complex = "[0:a][1:a]amix=inputs=2:duration=longest:weights=1 1[aout]"
-
-        cmd: list[str] = [
-            "ffmpeg",
-            "-y",
-            "-i", str(instrumental_path.resolve()),
-            "-i", str(vocal_path.resolve()),
-            "-filter_complex", filter_complex,
-            "-map", "[aout]",
-            "-c:a", "libmp3lame",
-            "-b:a", "320k",
-            "-ar", "44100",
-            str(output_path.resolve()),
-        ]
-
-        logger.debug(
-            "MIX_AUDIO: mixing instrumental + processed_vocal → '%s'",
-            output_path,
-        )
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except OSError as exc:
-            raise RuntimeError(
-                f"Не удалось запустить ffmpeg для микширования: {exc}"
-            ) from exc
-
-        stdout, stderr = await process.communicate()
-        stderr_text = stderr.decode("utf-8", errors="replace")
-
-        if stderr_text:
-            logger.debug("MIX_AUDIO ffmpeg stderr:\n%s", stderr_text)
-
-        if process.returncode != 0:
-            raise RuntimeError(
-                f"ffmpeg завершился с кодом {process.returncode} при микшировании. "
-                f"Детали: {stderr_text[-500:]}"
-            )
-
-        if not output_path.exists():
-            raise RuntimeError(
-                f"ffmpeg завершился успешно, но файл микса не найден: {output_path}"
-            )
-
-        logger.info(
-            "MIX_AUDIO: backvocal mix created → '%s' (size=%d bytes)",
-            output_path,
-            output_path.stat().st_size,
+            supressedvocal_mix_file,
         )
 
     # ------------------------------------------------------------------
@@ -1326,6 +1261,22 @@ class KaraokePipeline:
                     self._state.backvocal_mix_file,
                 )
 
+        # Pass supressedvocal_mix_path if available (from MIX_AUDIO step)
+        supressedvocal_mix_path: Path | None = None
+        if self._state.supressedvocal_mix:
+            candidate = Path(self._state.supressedvocal_mix)
+            if candidate.exists():
+                supressedvocal_mix_path = candidate
+                logger.info(
+                    "RENDER_VIDEO step: using supressedvocal_mix='%s' for 3rd audio track",
+                    supressedvocal_mix_path,
+                )
+            else:
+                logger.warning(
+                    "RENDER_VIDEO step: supressedvocal_mix set but not found: '%s'",
+                    self._state.supressedvocal_mix,
+                )
+
         await renderer.render(
             instrumental_path=instrumental_path,
             original_path=original_path,
@@ -1333,6 +1284,7 @@ class KaraokePipeline:
             ass_path=ass_path,
             output_path=output_path,
             backvocal_mix_path=backvocal_mix_path,
+            supressedvocal_mix_path=supressedvocal_mix_path,
         )
 
         self._state.output_file = str(output_path)
