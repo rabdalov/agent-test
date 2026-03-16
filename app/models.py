@@ -81,6 +81,8 @@ class PipelineState(BaseModel):
     processed_vocal_file: str | None = None   # Обработанная вокальная дорожка (с применённой громкостью)
     backvocal_mix_file: str | None = None     # MP3 микс: instrumental + processed_vocal
     supressedvocal_mix: str | None = None     # MP3 микс: instrumental + raw_vocal (с фиксированной громкостью)
+    # Track visualization file (generated in GENERATE_ASS step when enabled)
+    visualization_file: str | None = None
 
 
 class PipelineResult(BaseModel):

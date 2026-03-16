@@ -94,6 +94,9 @@ class Settings(BaseModel):
     chorus_vocal_silence_threshold: float = 0.05
     # Tolerance (seconds) when merging boundaries from two files (default: 2.0)
     chorus_boundary_merge_tolerance_sec: float = 2.0
+    # Track visualization settings
+    # Enable/disable PNG timeline visualization after GENERATE_ASS step (default: false)
+    track_visualization_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -150,6 +153,7 @@ class Settings(BaseModel):
             "chorus_min_duration_sec": float(os.getenv("CHORUS_MIN_DURATION_SEC", "5.0")),
             "chorus_vocal_silence_threshold": float(os.getenv("CHORUS_VOCAL_SILENCE_THRESHOLD", "0.05")),
             "chorus_boundary_merge_tolerance_sec": float(os.getenv("CHORUS_BOUNDARY_MERGE_TOLERANCE_SEC", "2.0")),
+            "track_visualization_enabled": os.getenv("TRACK_VISUALIZATION_ENABLED", "false").lower() in ("true", "1", "yes"),
         }
 
         settings = cls(**data)

@@ -1206,6 +1206,41 @@ class KaraokePipeline:
             output_ass,
         )
 
+        # Опциональная визуализация сегментов
+        if self._settings.track_visualization_enabled:
+            from app.track_visualizer import TrackVisualizer
+
+            viz_path = track_dir / f"{stem}_timeline.png"
+            visualizer = TrackVisualizer()
+            try:
+                visualizer.generate(
+                    output_path=viz_path,
+                    transcribe_json_file=(
+                        Path(self._state.transcribe_json_file)
+                        if self._state.transcribe_json_file else None
+                    ),
+                    corrected_transcribe_json_file=(
+                        Path(self._state.corrected_transcribe_json_file)
+                        if self._state.corrected_transcribe_json_file else None
+                    ),
+                    aligned_lyrics_file=Path(aligned_path),
+                    source_lyrics_file=(
+                        Path(self._state.source_lyrics_file)
+                        if self._state.source_lyrics_file else None
+                    ),
+                    volume_segments_file=volume_segments_path,
+                    track_title=self._state.track_stem or "",
+                )
+                self._state.visualization_file = str(viz_path)
+                self._save_state()
+                logger.info(
+                    "TrackVisualizer: saved timeline to '%s'", viz_path
+                )
+            except Exception as exc:
+                logger.warning(
+                    "TrackVisualizer: failed to generate visualization: %s", exc
+                )
+
     # ------------------------------------------------------------------
     # Step: RENDER_VIDEO
     # ------------------------------------------------------------------
@@ -1394,6 +1429,36 @@ class KaraokePipeline:
                 exc,
             )
             raise
+
+        # Отправка визуализации timeline, если она была создана
+        visualization_file_str = self._state.visualization_file
+        if visualization_file_str:
+            viz_path = Path(visualization_file_str)
+            if viz_path.exists():
+                try:
+                    from aiogram.types import FSInputFile
+                    viz_file = FSInputFile(viz_path, filename=viz_path.name)
+                    await self._bot.send_photo(
+                        chat_id=user_id,
+                        photo=viz_file,
+                        caption="📊 Визуализация сегментирования трека",
+                    )
+                    logger.info(
+                        "SEND_VIDEO step: visualization sent to user_id=%s",
+                        user_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "SEND_VIDEO step: failed to send visualization for track_id=%s: %s",
+                        self._state.track_id,
+                        exc,
+                    )
+            else:
+                logger.warning(
+                    "SEND_VIDEO step: visualization file not found for track_id=%s: %s",
+                    self._state.track_id,
+                    visualization_file_str,
+                )
 
     # ------------------------------------------------------------------
     # Utility methods
