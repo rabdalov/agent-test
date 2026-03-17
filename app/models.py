@@ -119,3 +119,8 @@ class LyricsChoiceStates(StatesGroup):
 class LyricsConfirmStates(StatesGroup):
     """FSM для подтверждения текста песни, сгенерированного из транскрипции."""
     waiting_for_confirmation = State()
+
+
+class SegmentChangeStates(StatesGroup):
+    """FSM для процесса изменения типа сегмента."""
+    waiting_for_type_selection = State()

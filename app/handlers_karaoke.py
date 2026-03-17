@@ -24,12 +24,15 @@ from .models import (
     PipelineStatus,
     PipelineStep,
     SearchStates,
+    SegmentChangeStates,
     SourceType,
     TrackLangStates,
 )
 from .pipeline import KaraokePipeline, LyricsNotFoundError, WaitingForInputError, _ORDERED_STEPS
 from .yandex_music_downloader import YandexMusicDownloader
 from .utils import normalize_filename
+from .segment_change_service import SegmentChangeService
+from .chorus_detector import load_volume_segments, save_volume_segments
 
 
 class KaraokeHandlers:
@@ -402,6 +405,305 @@ class KaraokeHandlers:
             await message.answer(
                 "🔍 Введите информацию для поиска в формате Артист - Песня.\n"
                 "Например: Полина Гагарина - Shallow"
+            )
+
+        @self.router.message(Command("change"))
+        async def handle_change(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            """Обработчик команды /change <диапазон>."""
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+
+            # Получаем аргумент (диапазон сегментов)
+            args = message.text.split(maxsplit=1) if message.text else []
+            if len(args) < 2:
+                await message.answer(
+                    "❌ Укажите диапазон сегментов.\n"
+                    "Примеры: /change 5, /change 3-5, /change 1,3,5-7"
+                )
+                return
+
+            range_str = args[1].strip()
+
+            # Поиск последнего трека пользователя
+            caller_user_id = message.from_user.id if message.from_user else None
+            result = self._find_latest_state(user_id=caller_user_id)
+
+            if result is None:
+                await message.answer(
+                    "❌ Нет активного трека. Пожалуйста, начните обработку."
+                )
+                return
+
+            pipeline_state, track_dir = result
+            track_name = track_dir.name
+
+            # Проверка наличия volume_segments_file
+            if not pipeline_state.volume_segments_file:
+                await message.answer(
+                    "❌ Файл разметки сегментов не найден. Сначала выполните /step_chorus."
+                )
+                return
+
+            segments_path = Path(pipeline_state.volume_segments_file)
+            if not segments_path.exists():
+                await message.answer(
+                    "❌ Файл разметки сегментов не найден. Сначала выполните /step_chorus."
+                )
+                return
+
+            # Парсинг диапазона через SegmentChangeService
+            service = SegmentChangeService(
+                chorus_volume=self._settings.chorus_backvocal_volume,
+                default_volume=self._settings.audio_mix_voice_volume,
+            )
+
+            try:
+                segment_ids = service.parse_segment_range(range_str)
+            except ValueError as exc:
+                await message.answer(
+                    f"❌ Некорректный формат диапазона: {exc}\n"
+                    f"Используйте: /change 1,2,3 или /change 5-10"
+                )
+                return
+
+            # Загрузка и валидация сегментов
+            try:
+                segments = load_volume_segments(segments_path)
+            except Exception as exc:
+                self._logger.error("Failed to load volume segments for track_id=%s: %s", pipeline_state.track_id, exc)
+                await message.answer(f"❌ Ошибка загрузки разметки сегментов: {exc}")
+                return
+
+            is_valid, error_msg = service.validate_segments(segment_ids, segments)
+            if not is_valid:
+                await message.answer(f"❌ {error_msg}")
+                return
+
+            # Сохранение в FSM
+            await state.set_state(SegmentChangeStates.waiting_for_type_selection)
+            await state.update_data(
+                track_id=pipeline_state.track_id,
+                track_folder=str(track_dir),
+                segment_ids=segment_ids,
+            )
+
+            self._logger.info(
+                "User %s initiated /change for segments %s on track %s",
+                caller_user_id, segment_ids, pipeline_state.track_id
+            )
+
+            # Отправка inline-клавиатуры с типами сегментов
+            formatted_ids = service.format_segment_ids(segment_ids)
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🎤 Припев", callback_data="change_type:chorus"),
+                        InlineKeyboardButton(text="📝 Куплет", callback_data="change_type:verse"),
+                        InlineKeyboardButton(text="🎹 Инструментал", callback_data="change_type:instrumental"),
+                    ]
+                ]
+            )
+
+            await message.answer(
+                f"🎵 Выберите новый тип для сегментов {formatted_ids}:\n"
+                f"track: <code>{track_name}</code>",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+
+        # ----- FSM: waiting for segment type selection -----
+        @self.router.callback_query(
+            SegmentChangeStates.waiting_for_type_selection,
+            F.data.startswith("change_type:")
+        )
+        async def handle_change_type_selection(
+            callback: types.CallbackQuery,
+            state: FSMContext
+        ) -> None:
+            """Обработчик выбора типа сегмента."""
+            caller_id = callback.from_user.id if callback.from_user else None
+            if caller_id is None:
+                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
+                return
+            if self._settings.is_user_denied(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+            if not self._settings.is_user_allowed(caller_id):
+                allowed = self._settings.tlg_allowed_id
+                if allowed and caller_id not in allowed:
+                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                    return
+
+            # Извлечение типа из callback
+            try:
+                new_type = callback.data.split(":")[1]
+            except IndexError:
+                await callback.answer("❌ Неверный выбор.", show_alert=True)
+                return
+
+            # Получение данных из FSM
+            data = await state.get_data()
+            track_folder = data.get("track_folder")
+            segment_ids = data.get("segment_ids")
+
+            if not track_folder or not segment_ids:
+                await callback.answer("❌ Не удалось определить параметры изменения.", show_alert=True)
+                await state.clear()
+                return
+
+            track_dir = Path(track_folder)
+            segments_path = track_dir / f"{track_dir.name}_volume_segments.json"
+
+            # Загрузка сегментов
+            try:
+                segments = load_volume_segments(segments_path)
+            except Exception as exc:
+                self._logger.error("Failed to load volume segments: %s", exc)
+                await callback.answer("❌ Ошибка загрузки разметки сегментов.", show_alert=True)
+                await state.clear()
+                return
+
+            # Обновление типов через SegmentChangeService
+            service = SegmentChangeService(
+                chorus_volume=self._settings.chorus_backvocal_volume,
+                default_volume=self._settings.audio_mix_voice_volume,
+            )
+
+            try:
+                updated_segments = service.update_segment_types(segment_ids, new_type, segments)
+            except ValueError as exc:
+                await callback.answer(f"❌ {exc}", show_alert=True)
+                await state.clear()
+                return
+
+            # Сохранение обновлённого JSON
+            try:
+                save_volume_segments(updated_segments, segments_path)
+            except Exception as exc:
+                self._logger.error("Failed to save volume segments: %s", exc)
+                await callback.answer("❌ Ошибка сохранения разметки сегментов.", show_alert=True)
+                await state.clear()
+                return
+
+            # Очистка FSM
+            await state.clear()
+
+            formatted_ids = service.format_segment_ids(segment_ids)
+            type_labels = {
+                "chorus": "припев",
+                "verse": "куплет",
+                "instrumental": "инструментал",
+            }
+            type_label = type_labels.get(new_type, new_type)
+
+            self._logger.info(
+                "Segment types updated: %s -> %s, volumes recalculated",
+                segment_ids, new_type
+            )
+
+            await callback.answer(f"✅ Тип изменён на {type_label}")
+
+            # Отправка сообщения с кнопкой "Пересчитать"
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Пересчитать", callback_data="change_recalc")]
+                ]
+            )
+
+            if callback.message:
+                await callback.message.edit_text(
+                    f"✅ Сегменты {formatted_ids} изменены на {type_label}. Volume обновлён.",
+                    reply_markup=keyboard,
+                )
+
+        # ----- Callback: recalculate from MIX_AUDIO -----
+        @self.router.callback_query(F.data == "change_recalc")
+        async def handle_change_recalc(
+            callback: types.CallbackQuery,
+            state: FSMContext
+        ) -> None:
+            """Запускает пайплайн с шага MIX_AUDIO."""
+            caller_id = callback.from_user.id if callback.from_user else None
+            if caller_id is None:
+                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
+                return
+            if self._settings.is_user_denied(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+            if not self._settings.is_user_allowed(caller_id):
+                allowed = self._settings.tlg_allowed_id
+                if allowed and caller_id not in allowed:
+                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                    return
+
+            await callback.answer("🔄 Запускаю пересчёт...")
+
+            # Получение последнего трека пользователя
+            result = self._find_latest_state(user_id=caller_id)
+
+            if result is None:
+                if callback.message:
+                    await callback.message.edit_text(
+                        "❌ Нет активного трека. Пожалуйста, начните обработку."
+                    )
+                return
+
+            pipeline_state, track_dir = result
+            track_name = track_dir.name
+
+            self._logger.info(
+                "User %s triggered recalculation from MIX_AUDIO for track %s",
+                caller_id, pipeline_state.track_id
+            )
+
+            # Отправка нового сообщения
+            if callback.message:
+                try:
+                    await callback.message.edit_text(
+                        f"▶️ Запускаю пересчёт с шага MIX_AUDIO...\n"
+                        f"track: <code>{track_name}</code>",
+                        parse_mode="HTML",
+                    )
+                    # Обновляем ID сообщения для уведомлений
+                    pipeline_state.notification_chat_id = callback.message.chat.id
+                    pipeline_state.notification_message_id = callback.message.message_id
+                except Exception:
+                    # Если не удалось отредактировать, отправляем новое
+                    sent_msg = await callback.message.answer(
+                        f"▶️ Запускаю пересчёт с шага MIX_AUDIO...\n"
+                        f"track: <code>{track_name}</code>",
+                        parse_mode="HTML",
+                    )
+                    pipeline_state.notification_chat_id = sent_msg.chat.id
+                    pipeline_state.notification_message_id = sent_msg.message_id
+            else:
+                sent_msg = await callback.bot.send_message(
+                    chat_id=caller_id,
+                    text=f"▶️ Запускаю пересчёт с шага MIX_AUDIO...\n"
+                         f"track: <code>{track_name}</code>",
+                    parse_mode="HTML",
+                )
+                pipeline_state.notification_chat_id = sent_msg.chat.id
+                pipeline_state.notification_message_id = sent_msg.message_id
+
+            # Сохраняем обновлённые notification IDs
+            state_path = track_dir / "state.json"
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error(
+                    "Failed to update state.json with notification IDs for track_id=%s: %s",
+                    pipeline_state.track_id, exc,
+                )
+
+            # Запуск пайплайна с шага MIX_AUDIO
+            await self._run_from_step(
+                callback.message,  # type: ignore[arg-type]
+                track_dir,
+                pipeline_state,
+                PipelineStep.MIX_AUDIO,
+                state,
             )
 
         # ----- FSM: waiting for search query -----
