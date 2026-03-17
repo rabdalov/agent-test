@@ -152,8 +152,15 @@ class AssGenerator:
         generator.generate(aligned_json_path, output_ass_path, track_title="My Song")
     """
 
-    def __init__(self, font_size: int = 60) -> None:
+    def __init__(
+        self,
+        font_size: int = 60,
+        countdown_enabled: bool = True,
+        countdown_seconds: int = 3,
+    ) -> None:
         self.font_size = font_size
+        self.countdown_enabled = countdown_enabled
+        self.countdown_seconds = countdown_seconds
 
     # ------------------------------------------------------------------
     # Public interface
@@ -225,10 +232,12 @@ class AssGenerator:
             f"Title,,0,0,0,,{title}\n"
         )
 
-        # Volume segments info overlay (optional)
+        # Load volume segments (for segment info overlay and countdown)
+        volume_segments: list[dict] = []
+        instrumental_windows: list[tuple[float, float, dict | None]] = []
         if volume_segments_path is not None and volume_segments_path.exists():
             try:
-                volume_segments: list[dict] = json.loads(
+                volume_segments = json.loads(
                     volume_segments_path.read_text(encoding="utf-8")
                 )
                 lines.extend(self._build_segment_info_dialogues(volume_segments))
@@ -237,6 +246,11 @@ class AssGenerator:
                     len(volume_segments),
                     volume_segments_path,
                 )
+                # Compute instrumental windows for countdown
+                if self.countdown_enabled:
+                    instrumental_windows = self._get_instrumental_windows(
+                        volume_segments, segments
+                    )
             except Exception as exc:
                 logger.warning(
                     "AssGenerator: failed to load volume_segments_file '%s': %s",
@@ -250,7 +264,18 @@ class AssGenerator:
         # Generate dialogue entries — two lines at a time
         for idx, seg_entry in enumerate(grouped):
             next_seg_entry: dict | None = grouped[idx + 1] if idx + 1 < len(grouped) else None
-            lines.extend(self._build_segment_dialogues(seg_entry, next_seg_entry))
+            lines.extend(
+                self._build_segment_dialogues(seg_entry, next_seg_entry)
+            )
+
+        # Add countdown dialogues for instrumental segments
+        if self.countdown_enabled and instrumental_windows:
+            for inst_start, inst_end, next_vocal in instrumental_windows:
+                lines.extend(
+                    self._build_instrumental_countdown_dialogues(
+                        inst_start, inst_end, next_vocal
+                    )
+                )
 
         ass_content = "".join(lines)
         output_ass_path.parent.mkdir(parents=True, exist_ok=True)
@@ -339,6 +364,54 @@ class AssGenerator:
         return lines
 
     @staticmethod
+    def _get_instrumental_windows(
+        volume_segments: list[dict],
+        aligned_segments: list[dict],
+    ) -> list[tuple[float, float, dict | None]]:
+        """Extract instrumental intervals and their next vocal segments.
+
+        Args:
+            volume_segments: List of volume segments from ChorusDetector.
+            aligned_segments: List of aligned lyric segments.
+
+        Returns:
+            List of tuples: (instrumental_start, instrumental_end, next_vocal_segment)
+            next_vocal_segment is the first vocal segment after the instrumental
+            (or None if not found).
+        """
+        # Filter instrumental segments
+        instrumental_segs = [
+            seg for seg in volume_segments
+            if seg.get("segment_type") == "instrumental"
+        ]
+
+        result: list[tuple[float, float, dict | None]] = []
+
+        for inst_seg in instrumental_segs:
+            inst_start: float = inst_seg.get("start", 0.0)
+            inst_end: float = inst_seg.get("end", 0.0)
+
+            # Find next vocal segment (first segment with start_time >= inst_end)
+            next_vocal: dict | None = None
+            min_start_diff = float("inf")
+
+            for seg in aligned_segments:
+                seg_start: float = seg.get("start_time", 0.0)
+                if seg_start >= inst_end - 0.01:  # Small tolerance
+                    start_diff = seg_start - inst_end
+                    if start_diff < min_start_diff:
+                        min_start_diff = start_diff
+                        next_vocal = seg
+
+            result.append((inst_start, inst_end, next_vocal))
+
+        logger.debug(
+            "AssGenerator: found %d instrumental windows for countdown",
+            len(result)
+        )
+        return result
+
+    @staticmethod
     def _group_words_into_segments(
         segments: list[dict],
         words: list[dict],
@@ -386,6 +459,54 @@ class AssGenerator:
 
         return result
 
+    def _build_instrumental_countdown_dialogues(
+        self,
+        inst_start: float,
+        inst_end: float,
+        next_vocal: dict | None,
+    ) -> list[str]:
+        """Build countdown (3-2-1) and early NextLine for an instrumental segment.
+
+        Args:
+            inst_start: Start time of the instrumental segment.
+            inst_end: End time of the instrumental segment.
+            next_vocal: Next vocal segment after instrumental (for NextLine preview).
+
+        Returns:
+            List of Dialogue strings for countdown and early NextLine.
+        """
+        lines: list[str] = []
+
+        # Calculate countdown start time (N seconds before end, but not before start)
+        countdown_start = max(inst_start, inst_end - self.countdown_seconds)
+
+        # Generate countdown digits (3-2-1) in Highlight style (Layer 0)
+        for i, digit in enumerate(range(self.countdown_seconds, 0, -1)):
+            digit_start = inst_end - (self.countdown_seconds - i)
+            digit_end = min(digit_start + 1.0, inst_end)
+
+            # Only add if digit is within instrumental segment
+            if digit_start >= inst_start - 0.01:
+                lines.append(
+                    f"Dialogue: 0,"
+                    f"{_format_ass_time(digit_start)},"
+                    f"{_format_ass_time(digit_end)},"
+                    f"Highlight,,0,0,0,,{digit}\n"
+                )
+
+        # Early NextLine (preview of next vocal segment)
+        if next_vocal and countdown_start < inst_end:
+            next_text = next_vocal.get("text", "")
+            if next_text:
+                lines.append(
+                    f"Dialogue: 0,"
+                    f"{_format_ass_time(countdown_start)},"
+                    f"{_format_ass_time(inst_end)},"
+                    f"NextLine,,0,0,0,,{next_text}\n"
+                )
+
+        return lines
+
     def _build_segment_dialogues(
         self,
         seg: dict,
@@ -410,14 +531,12 @@ class AssGenerator:
         lines: list[str] = []
 
         # ---- Active line: ActiveLine style ----
-
         lines.append(
             f"Dialogue: 0,"
             f"{_format_ass_time(seg_start)},"
             f"{_format_ass_time(seg_end)},"
             f"ActiveLine,,0,0,0,,{seg_text}\n"
         )
-
 
         # ---- Active line: per-word highlight on ActiveLine style ----
         for i, word_entry in enumerate(seg_words):
@@ -431,7 +550,8 @@ class AssGenerator:
                 f"{_format_ass_time(word_end)},"
                 f"ActiveLine,,0,0,0,,{highlighted}\n"
             )
-        # ---- Next/preparatory line (always static during this segment) ----
+
+        # ---- Next/preparatory line ----
         if next_text:
             lines.append(
                 f"Dialogue: 0,"

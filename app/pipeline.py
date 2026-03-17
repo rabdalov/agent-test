@@ -1259,7 +1259,11 @@ class KaraokePipeline:
             if vsp.exists():
                 volume_segments_path = vsp
 
-        generator = AssGenerator(font_size=self._settings.ass_font_size)
+        generator = AssGenerator(
+            font_size=self._settings.ass_font_size,
+            countdown_enabled=self._settings.ass_countdown_enabled,
+            countdown_seconds=self._settings.ass_countdown_seconds,
+        )
         await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: generator.generate(

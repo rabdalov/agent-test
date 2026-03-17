@@ -97,6 +97,11 @@ class Settings(BaseModel):
     # Track visualization settings
     # Enable/disable PNG timeline visualization after GENERATE_ASS step (default: false)
     track_visualization_enabled: bool = False
+    # Countdown settings for instrumental segments (ASS)
+    # Enable/disable countdown display in instrumental segments (default: true)
+    ass_countdown_enabled: bool = True
+    # Countdown duration in seconds (1-5, default: 3)
+    ass_countdown_seconds: int = Field(default=3, ge=1, le=5)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -154,6 +159,8 @@ class Settings(BaseModel):
             "chorus_vocal_silence_threshold": float(os.getenv("CHORUS_VOCAL_SILENCE_THRESHOLD", "0.05")),
             "chorus_boundary_merge_tolerance_sec": float(os.getenv("CHORUS_BOUNDARY_MERGE_TOLERANCE_SEC", "2.0")),
             "track_visualization_enabled": os.getenv("TRACK_VISUALIZATION_ENABLED", "false").lower() in ("true", "1", "yes"),
+            "ass_countdown_enabled": os.getenv("ASS_COUNTDOWN_ENABLED", "true").lower() in ("true", "1", "yes"),
+            "ass_countdown_seconds": int(os.getenv("ASS_COUNTDOWN_SECONDS", "3")),
         }
 
         settings = cls(**data)
