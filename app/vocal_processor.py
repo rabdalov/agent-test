@@ -46,7 +46,7 @@ class VocalProcessor:
         *,
         reverb_enabled: bool = False,
         echo_enabled: bool = False,
-        mix_voice_volume: float = 0.4,
+        mix_voice_volume: float = 0.0,
     ) -> None:
         self._reverb_enabled = reverb_enabled
         self._echo_enabled = echo_enabled
@@ -129,7 +129,7 @@ class VocalProcessor:
         # volume filter applied to vocal
         # [0:a] - instrumental input (first -i)
         # amix - mix both with equal weights (1:1)
-        filter_complex = f"[1:a]{filter_chain}[vocal];[0:a][vocal]amix=inputs=2:duration=longest:weights=1 1[aout]"
+        filter_complex = f"[1:a]{filter_chain}[vocal];[0:a][vocal]amix=inputs=2:duration=longest:weights=1 1:normalize=0[aout]"
 
         cmd: list[str] = [
             "ffmpeg",
@@ -151,7 +151,7 @@ class VocalProcessor:
             output_file,
             len(volume_segments),
         )
-        logger.debug("VocalProcessor: ffmpeg command: %s", " ".join(cmd))
+        logger.info("VocalProcessor: ffmpeg command: %s", " ".join(cmd))
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -270,7 +270,7 @@ class VocalProcessor:
         # amix with fixed weight ratio: instrumental=1, vocal=mix_voice_volume
         # This matches the filter_complex used in VideoRenderer.render()
         filter_complex = (
-            f"[0:a][1:a]amix=inputs=2:duration=longest:weights=1 {self._mix_voice_volume}[aout]"
+            f"[0:a][1:a]amix=inputs=2:duration=longest:weights=1 {self._mix_voice_volume}:normalize=0[aout]"
         )
 
         cmd: list[str] = [
@@ -294,6 +294,7 @@ class VocalProcessor:
             "mix_instrumental_and_vocal_fixed_volume: using vocal volume=%.2f",
             self._mix_voice_volume,
         )
+        logger.info("VocalProcessor: ffmpeg command: %s", " ".join(cmd))
 
         try:
             process = await asyncio.create_subprocess_exec(

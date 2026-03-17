@@ -534,19 +534,7 @@ class TrackVisualizer:
     def _load_volume_segments(self, path: Path) -> list[dict]:
         """Загрузить сегменты из volume_segments_file.
 
-        Parameters
-        ----------
-        path:
-            Путь к JSON-файлу с разметкой сегментов.
-
-        Returns
-        -------
-        list[dict]
-            Список словарей с полями: ``id``, ``start``, ``end``, ``volume``,
-            ``segment_type``, ``backend``, ``scores``.
-            Поддерживает два формата scores:
-            - dict (старый): {vocal_energy, chroma_variance, sim_score, hpss_score}
-            - list (новый): [{id, vocal_energy, ...}, ...] — формат групп
+        Now scores is always list, format unified.
         """
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -782,9 +770,7 @@ class TrackVisualizer:
         Для каждого сегмента рисует цветной прямоугольник по временному
         диапазону и добавляет текстовую подпись с типом.
 
-        Поддерживает два формата:
-        - Старый: scores - dict, id - отдельное поле
-        - Новый (группы): scores - list массив, id_group - в scores
+        Now scores is always list, format unified.
 
         Parameters
         ----------
@@ -812,30 +798,25 @@ class TrackVisualizer:
             end = float(seg.get("end", 0.0))
             seg_type = seg.get("segment_type") or "unknown"
             volume = float(seg.get("volume", 0.0))
-            scores = seg.get("scores") or {}
+            scores = seg.get("scores") or []
 
-            # Определяем формат: старый (dict) или новый (list - группы)
-            is_group_format = isinstance(scores, list)
-
-            if is_group_format:
-                # Новый формат групп: scores - массив, id_group в первом элементе
-                seg_id = scores[0].get("id_group", 0) if scores else 0
-                # Для метрик используем среднее значение по группе
-                vocal_energy = float(np.mean([s.get("vocal_energy", 0.0) for s in scores])) if scores else 0.0
-                sim_score = float(np.mean([s.get("sim_score", 0.0) for s in scores])) if scores else 0.0
-                hpss_score = float(np.mean([s.get("hpss_score", 0.0) for s in scores])) if scores else 0.0
-                # Диапазон id: "#1-3"
+            # Now scores is always list
+            seg_id = seg.get("id", 0)
+            
+            # For metrics, compute average from scores list
+            if isinstance(scores, list) and scores:
+                vocal_energy = float(np.mean([s.get("vocal_energy", 0.0) for s in scores]))
+                sim_score = float(np.mean([s.get("sim_score", 0.0) for s in scores]))
+                hpss_score = float(np.mean([s.get("hpss_score", 0.0) for s in scores]))
+                # Range of IDs: "#1-3"
                 ids = [s.get("id", 0) for s in scores]
                 if ids:
                     id_range = f"#{min(ids)}-{max(ids)}"
                 else:
                     id_range = f"#{seg_id}"
             else:
-                # Старый формат
-                seg_id = seg.get("id", 0)
-                vocal_energy = float(scores.get("vocal_energy", 0.0))
-                sim_score = float(scores.get("sim_score", 0.0))
-                hpss_score = float(scores.get("hpss_score", 0.0))
+                # No scores or empty list
+                vocal_energy = sim_score = hpss_score = 0.0
                 id_range = f"#{seg_id}" if seg_id else ""
 
             color = _SEGMENT_COLORS.get(seg_type, _SEGMENT_COLORS["unknown"])
@@ -844,7 +825,7 @@ class TrackVisualizer:
             if seg_width <= 0:
                 continue
 
-            # Прямоугольник группы (основная часть слоя, выше полосы подсегментов)
+            # Group rectangle (main part of layer, above subsegment strip)
             group_y_bottom = y_bottom + subseg_strip_height
             rect = mpatches.FancyBboxPatch(
                 (start, group_y_bottom),
@@ -859,14 +840,14 @@ class TrackVisualizer:
             )
             ax.add_patch(rect)
 
-            # Формируем текст подписи (только тип и volume)
+            # Form label text (type and volume only)
             label_lines = [
                 seg_type,
                 f"vol:{volume:.2f}",
             ]
             label = "\n".join(label_lines)
 
-            # Показываем подпись только если сегмент достаточно широкий
+            # Show label only if segment is wide enough
             min_width_for_label = duration * 0.04
             if seg_width >= min_width_for_label:
                 ax.text(
@@ -883,7 +864,7 @@ class TrackVisualizer:
                     wrap=False,
                 )
 
-            # Порядковый номер группы/сегмента в левом верхнем углу
+            # Sequential number of group/segment in top-left corner
             if id_range:
                 ax.text(
                     start + duration * 0.003,
@@ -898,7 +879,7 @@ class TrackVisualizer:
                     clip_on=True,
                 )
 
-            # Временные метки на границах сегмента
+            # Time labels on segment boundaries
             ax.text(
                 start + 1,
                 group_y_bottom + group_rect_height * 0.05,
@@ -911,9 +892,9 @@ class TrackVisualizer:
                 clip_on=True,
             )
 
-            # --- Полоса подсегментов (нижняя часть слоя) ---
-            # Рисуем прямоугольники подсегментов из scores с номером id по центру
-            if is_group_format and scores:
+            # --- Subsegment strip (lower part of layer) ---
+            # Draw subsegment rectangles from scores with id number in center
+            if isinstance(scores, list) and scores:
                 seg_duration = end - start
                 sub_count = len(scores)
                 sub_width = seg_duration / sub_count
@@ -922,7 +903,7 @@ class TrackVisualizer:
                     sub_start = start + i * sub_width
                     sub_end = sub_start + sub_width
 
-                    # Прямоугольник подсегмента
+                    # Subsegment rectangle
                     sub_rect = mpatches.Rectangle(
                         (sub_start, y_bottom),
                         sub_width,
@@ -935,7 +916,7 @@ class TrackVisualizer:
                     )
                     ax.add_patch(sub_rect)
 
-                    # Номер подсегмента по центру (только если достаточно места)
+                    # Subsegment number in center (only if enough space)
                     min_sub_width_for_label = duration * 0.005
                     if sub_width >= min_sub_width_for_label:
                         ax.text(
@@ -1110,9 +1091,7 @@ class TrackVisualizer:
         Рисует три ступенчатых графика: ``vocal_energy``, ``sim_score``,
         ``hpss_score``. Каждая метрика — отдельная линия с подписью.
 
-        Поддерживает два формата scores:
-        - Старый: scores - dict {vocal_energy, chroma_variance, sim_score, hpss_score}
-        - Новый: scores - list массив [{id, vocal_energy, ...}, ...] — формат групп
+        Now scores is always list, format unified.
 
         Parameters
         ----------
@@ -1141,41 +1120,33 @@ class TrackVisualizer:
         for seg in segments:
             start = float(seg.get("start", 0.0))
             end = float(seg.get("end", 0.0))
-            scores = seg.get("scores") or {}
+            scores = seg.get("scores") or []
 
             if end <= start:
                 continue
 
-            # Определяем формат: старый (dict) или новый (list - группы)
-            if isinstance(scores, list):
-                # Новый формат групп: scores - массив, рисуем метрики для каждого элемента
-                if scores:
-                    # Разбиваем временной интервал группы на подинтервалы для каждого элемента scores
-                    seg_duration = end - start
-                    sub_duration = seg_duration / len(scores)
-                    for i, sub_score in enumerate(scores):
-                        sub_start = start + i * sub_duration
-                        sub_end = sub_start + sub_duration
-                        vocal_energy = float(sub_score.get("vocal_energy", 0.0))
-                        sim_score = float(sub_score.get("sim_score", 0.0))
-                        hpss_score = float(sub_score.get("hpss_score", 0.0))
-                        metrics_data["vocal_energy"].append((sub_start, sub_end, vocal_energy))
-                        metrics_data["sim_score"].append((sub_start, sub_end, sim_score))
-                        metrics_data["hpss_score"].append((sub_start, sub_end, hpss_score))
-                else:
-                    metrics_data["vocal_energy"].append((start, end, 0.0))
-                    metrics_data["sim_score"].append((start, end, 0.0))
-                    metrics_data["hpss_score"].append((start, end, 0.0))
+            # Now scores is always list
+            if isinstance(scores, list) and scores:
+                # Scores is array, draw metrics for each element
+                # Split time interval into subintervals for each scores element
+                seg_duration = end - start
+                sub_duration = seg_duration / len(scores)
+                for i, sub_score in enumerate(scores):
+                    sub_start = start + i * sub_duration
+                    sub_end = sub_start + sub_duration
+                    vocal_energy = float(sub_score.get("vocal_energy", 0.0))
+                    sim_score = float(sub_score.get("sim_score", 0.0))
+                    hpss_score = float(sub_score.get("hpss_score", 0.0))
+                    metrics_data["vocal_energy"].append((sub_start, sub_end, vocal_energy))
+                    metrics_data["sim_score"].append((sub_start, sub_end, sim_score))
+                    metrics_data["hpss_score"].append((sub_start, sub_end, hpss_score))
             else:
-                # Старый формат
-                vocal_energy = float(scores.get("vocal_energy", 0.0))
-                sim_score = float(scores.get("sim_score", 0.0))
-                hpss_score = float(scores.get("hpss_score", 0.0))
-                metrics_data["vocal_energy"].append((start, end, vocal_energy))
-                metrics_data["sim_score"].append((start, end, sim_score))
-                metrics_data["hpss_score"].append((start, end, hpss_score))
+                # Empty scores
+                metrics_data["vocal_energy"].append((start, end, 0.0))
+                metrics_data["sim_score"].append((start, end, 0.0))
+                metrics_data["hpss_score"].append((start, end, 0.0))
 
-        # Рисуем фон слоя метрик
+        # Draw metrics layer background
         import matplotlib.patches as mpatches  # type: ignore[import]
         bg_rect = mpatches.Rectangle(
             (0, y_bottom),
@@ -1188,7 +1159,7 @@ class TrackVisualizer:
         )
         ax.add_patch(bg_rect)
 
-        # Горизонтальные линии сетки для метрик
+        # Horizontal grid lines for metrics
         for grid_val in [0.25, 0.5, 0.75, 1.0]:
             grid_y = y_bottom + grid_val * height
             ax.axhline(
@@ -1200,20 +1171,20 @@ class TrackVisualizer:
                 xmax=1,
             )
 
-        # Рисуем ступенчатые графики
+        # Draw step plots
         for metric_name, data_points in metrics_data.items():
             if not data_points:
                 continue
 
             color = _METRIC_COLORS.get(metric_name, "#ffffff")
 
-            # Строим ступенчатый график
+            # Build step plot
             x_vals: list[float] = []
             y_vals: list[float] = []
 
             for start, end, value in data_points:
-                # Нормализуем значение в диапазон [y_bottom, y_bottom + height]
-                y_norm = y_bottom + value * height * 0.9  # 90% высоты для отступа
+                # Normalize value to range [y_bottom, y_bottom + height]
+                y_norm = y_bottom + value * height * 0.9  # 90% height for margin
                 x_vals.extend([start, end])
                 y_vals.extend([y_norm, y_norm])
 
@@ -1228,7 +1199,7 @@ class TrackVisualizer:
                     label=metric_name,
                 )
 
-        # Подписи метрик справа
+        # Metric labels on the right
         metric_labels = [
             ("vocal_energy", _METRIC_COLORS["vocal_energy"]),
             ("sim_score", _METRIC_COLORS["sim_score"]),

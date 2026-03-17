@@ -14,12 +14,12 @@ from .alignment_service import AlignmentService, save_aligned_result
 from .ass_generator import AssGenerator
 from .chorus_detector import (
     ChorusDetector,
+    SegmentScore,
     VolumeSegment,
     build_volume_segments,
-    group_volume_segments,
     load_volume_segments,
     save_volume_segments,
-    save_segment_groups,
+    should_merge_same_type,
 )
 from .config import Settings
 from .correct_transcript_service import CorrectTranscriptService
@@ -96,7 +96,7 @@ _STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
     PipelineStep.CORRECT_TRANSCRIPT: ["transcribe_json_file", "source_lyrics_file"],
     PipelineStep.ALIGN: ["source_lyrics_file", "transcribe_json_file"],
     PipelineStep.MIX_AUDIO: ["vocal_file", "instrumental_file", "volume_segments_file"],
-    PipelineStep.GENERATE_ASS: ["aligned_lyrics_file"],
+    PipelineStep.GENERATE_ASS: ["aligned_lyrics_file", "segment_groups_file"],
     PipelineStep.RENDER_VIDEO: ["ass_file", "vocal_file", "instrumental_file"],
     PipelineStep.SEND_VIDEO: ["output_file"],
 }
@@ -854,13 +854,7 @@ class KaraokePipeline:
     # ------------------------------------------------------------------
 
     async def _step_detect_chorus(self) -> None:
-        """Detect chorus segments and build volume_segments_file.
-
-        Steps:
-        1. Detect segments via ChorusDetector (dual_file or single_file mode).
-        2. Build volume_segments based on segment types.
-        3. Save volume_segments to JSON file (volume_segments_file).
-        """
+        """Detect chorus segments and build volume_segments_file."""
         # Check if step is enabled in config
         if not self._settings.detect_chorus_enabled:
             logger.info(
@@ -877,7 +871,7 @@ class KaraokePipeline:
         stem = normalize_filename(raw_stem)
         track_dir = self._track_folder
 
-        # Step 1: Detect segments with extended info
+        # Step 1: Detect segments via ChorusDetector (dual_file or single_file mode).
         vocal_file_str = self._state.vocal_file
         mode = "dual_file" if vocal_file_str else "single_file"
         logger.info(
@@ -889,6 +883,8 @@ class KaraokePipeline:
             min_duration_sec=self._settings.chorus_min_duration_sec,
             vocal_silence_threshold=self._settings.chorus_vocal_silence_threshold,
             boundary_merge_tolerance_sec=self._settings.chorus_boundary_merge_tolerance_sec,
+            chorus_volume=self._settings.chorus_backvocal_volume,
+            default_volume=self._settings.audio_mix_voice_volume,
         )
         segment_infos = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -897,57 +893,46 @@ class KaraokePipeline:
                 vocal_file=vocal_file_str,
             ),
         )
-        # Извлекаем только chorus-сегменты для логирования
-        chorus_segments = [
-            (s.start, s.end) for s in segment_infos if s.segment_type == "chorus"
-        ]
-        logger.info(
-            "DETECT_CHORUS step: found %d chorus segment(s) for track_id=%s",
-            len(chorus_segments),
-            self._state.track_id,
-        )
-
-        # Step 2: Probe audio duration for building full volume_segments coverage
+        
+        # Step 2: Probe audio duration
         audio_duration = await self._probe_audio_duration(Path(full_file_str))
         if audio_duration is None:
-            logger.warning(
-                "DETECT_CHORUS step: could not probe audio duration for '%s', using 0.0",
-                full_file_str,
-            )
             audio_duration = 0.0
 
-        # Step 3: Build volume segments (с передачей расширенной информации о сегментах)
+        # Step 3: Build volume segments
         volume_segments = build_volume_segments(
-            chorus_segments=chorus_segments,
+            chorus_segments=[],
             audio_duration=audio_duration,
             chorus_volume=self._settings.chorus_backvocal_volume,
             default_volume=self._settings.audio_mix_voice_volume,
             segment_infos=segment_infos,
         )
+        
+        # Step 4: Merge short segments (используем метод detector)
+        volume_segments = detector.merge_segments(
+            segments=volume_segments,
+            should_merge=detector.should_merge_short,
+        )
 
-        # Save volume segments to JSON
+        # Save to JSON
         volume_segments_file = track_dir / f"{stem}_volume_segments.json"
         save_volume_segments(volume_segments, volume_segments_file)
         self._state.volume_segments_file = str(volume_segments_file)
 
         self._save_state()
-        logger.info(
-            "DETECT_CHORUS step completed for track_id=%s: volume_segments_file='%s'",
-            self._state.track_id,
-            volume_segments_file,
-        )
 
     # ------------------------------------------------------------------
     # Step: MIX_AUDIO — обработка вокала с эффектом бэк-вокала
     # ------------------------------------------------------------------
 
     async def _step_mix_audio(self) -> None:
-        """Apply back-vocal effect using pre-built volume_segments_file.
+        """Apply back-vocal effect using volume_segments_file.
 
         Steps:
         1. Load volume_segments from volume_segments_file (built in DETECT_CHORUS step).
-        2. Apply volume segments to vocal AND mix with instrumental in ONE ffmpeg pass.
-        3. Create supressedvocal_mix_file: instrumental + raw vocal (with fixed volume).
+        2. Create segment_groups by grouping volume_segments by type.
+        3. Apply grouped segments to vocal AND mix with instrumental in ONE ffmpeg pass.
+        4. Create supressedvocal_mix_file: instrumental + raw vocal (with fixed volume).
         """
         # Check if step is enabled in config
         if not self._settings.mix_audio_enabled:
@@ -982,7 +967,29 @@ class KaraokePipeline:
             self._state.track_id,
         )
 
-        # Step 2: Apply volume segments to vocal AND mix with instrumental in one pass
+        # Step 2: Create segment groups by grouping volume_segments by type
+        # This creates segment_groups_file for use in GENERATE_ASS step
+        detector = ChorusDetector(
+            chorus_volume=self._settings.chorus_backvocal_volume,
+            default_volume=self._settings.audio_mix_voice_volume,
+        )
+        segment_groups = detector.merge_segments(
+            segments=volume_segments,
+            should_merge=should_merge_same_type,
+        )
+        segment_groups_path = track_dir / f"{stem}_segment_groups.json"
+        save_volume_segments(segment_groups, segment_groups_path)
+        self._state.segment_groups_file = str(segment_groups_path)
+        self._save_state()
+        logger.info(
+            "MIX_AUDIO step: created %d segment group(s) in '%s' for track_id=%s",
+            len(segment_groups),
+            segment_groups_path,
+            self._state.track_id,
+        )
+
+        # Step 3: Apply grouped segments to vocal AND mix with instrumental in one pass
+        # Use segment_groups (grouped by type) for correct volume levels per segment type
         backvocal_mix_file = track_dir / f"{stem}_backvocal_mix.mp3"
         processor = VocalProcessor(
             reverb_enabled=self._settings.vocal_reverb_enabled,
@@ -992,7 +999,7 @@ class KaraokePipeline:
         await processor.process_and_mix(
             instrumental_file=instrumental_file_str,
             vocal_file=vocal_file_str,
-            volume_segments=volume_segments,
+            volume_segments=segment_groups,  # Use grouped segments with correct volume levels
             output_file=str(backvocal_mix_file),
         )
         self._state.backvocal_mix_file = str(backvocal_mix_file)
@@ -1238,41 +1245,19 @@ class KaraokePipeline:
 
         track_title = stem.replace("_", " ")
 
-        # Resolve volume_segments_path if available
+        # Use segment_groups_file created in MIX_AUDIO step (required artifact)
+        segment_groups_path = Path(self._state.segment_groups_file)
+        if not segment_groups_path.exists():
+            raise RuntimeError(
+                f"segment_groups_file не найден: {segment_groups_path} — шаг MIX_AUDIO не был выполнен"
+            )
+        
+        # Fallback volume_segments_path for backward compatibility
         volume_segments_path: Path | None = None
         if self._state.volume_segments_file:
             vsp = Path(self._state.volume_segments_file)
             if vsp.exists():
                 volume_segments_path = vsp
-
-        # Создаём группы сегментов из volume_segments
-        segment_groups_path: Path | None = None
-        if volume_segments_path and volume_segments_path.exists():
-            try:
-                # Загружаем сегменты
-                volume_segments = load_volume_segments(volume_segments_path)
-                if volume_segments:
-                    # Группируем сегменты
-                    groups = group_volume_segments(
-                        segments=volume_segments,
-                        chorus_volume=self._settings.chorus_backvocal_volume,
-                        default_volume=self._settings.audio_mix_voice_volume,
-                    )
-                    # Сохраняем группы
-                    segment_groups_path = track_dir / f"{stem}_segment_groups.json"
-                    save_segment_groups(groups, segment_groups_path)
-                    self._state.segment_groups_file = str(segment_groups_path)
-                    self._save_state()
-                    logger.info(
-                        "GENERATE_ASS step: created segment groups file '%s' with %d groups",
-                        segment_groups_path,
-                        len(groups),
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "GENERATE_ASS step: failed to create segment groups: %s",
-exc
-                )
 
         generator = AssGenerator(font_size=self._settings.ass_font_size)
         await asyncio.get_event_loop().run_in_executor(
@@ -1281,7 +1266,7 @@ exc
                 aligned_json_path=aligned_path,
                 output_ass_path=output_ass,
                 track_title=track_title,
-                volume_segments_path=segment_groups_path if segment_groups_path else volume_segments_path,
+                volume_segments_path=segment_groups_path,
             ),
         )
 
@@ -1315,12 +1300,8 @@ exc
                         Path(self._state.source_lyrics_file)
                         if self._state.source_lyrics_file else None
                     ),
-                    # Используем segment_groups_file если есть, иначе volume_segments_file
-                    volume_segments_file=(
-                        Path(self._state.segment_groups_file)
-                        if self._state.segment_groups_file and Path(self._state.segment_groups_file).exists()
-                        else (segment_groups_path if segment_groups_path else volume_segments_path)
-                    ),
+                    # Use segment_groups_file from MIX_AUDIO step
+                    volume_segments_file=segment_groups_path,
                     track_title=self._state.track_stem or "",
                 )
                 self._state.visualization_file = str(viz_path)

@@ -25,6 +25,56 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class SegmentScore:
+    """Метрики отдельного суб-сегмента.
+    
+    Attributes
+    ----------
+    id:
+        Порядковый номер суб-сегмента (из msaf).
+    vocal_energy:
+        Нормализованная энергия вокала [0, 1].
+    chroma_variance:
+        Вариативность chroma features [0, 1].
+    sim_score:
+        Self-similarity score [0, 1].
+    hpss_score:
+        Harmonic-percussive separation score [0, 1].
+    tempo_score:
+        Rhythmic stability score [0, 1].
+    """
+    id: int
+    vocal_energy: float = 0.0
+    chroma_variance: float = 0.0
+    sim_score: float = 0.0
+    hpss_score: float = 0.0
+    tempo_score: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Сериализовать в dict для JSON."""
+        return {
+            "id": self.id,
+            "vocal_energy": self.vocal_energy,
+            "chroma_variance": self.chroma_variance,
+            "sim_score": self.sim_score,
+            "hpss_score": self.hpss_score,
+            "tempo_score": self.tempo_score,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SegmentScore":
+        """Десериализовать из dict."""
+        return cls(
+            id=int(data.get("id", 0)),
+            vocal_energy=float(data.get("vocal_energy", 0.0)),
+            chroma_variance=float(data.get("chroma_variance", 0.0)),
+            sim_score=float(data.get("sim_score", 0.0)),
+            hpss_score=float(data.get("hpss_score", 0.0)),
+            tempo_score=float(data.get("tempo_score", 0.0)),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -66,39 +116,93 @@ class SegmentInfo:
 @dataclass
 class VolumeSegment:
     """Временной сегмент с заданной громкостью вокала.
-
-    Является результатом шага детектирования припевов: содержит временные
-    границы, громкость вокала и расширенную информацию от детектора.
-
+    
+    scores ВСЕГДА список SegmentScore, даже для несгруппированных сегментов.
+    
     Attributes
     ----------
-    start:
-        Начало сегмента в секундах.
-    end:
-        Конец сегмента в секундах.
-    volume:
-        Громкость вокала в данном сегменте (0.0–1.0, где 1.0 = 100%).
-    segment_type:
-        Тип сегмента из детектора: ``"chorus"``, ``"verse"``, ``"bridge"``,
-        ``"intro"``, ``"outro"``, ``"instrumental"`` или ``None``
-        (если информация о типе недоступна).
-    backend:
-        Бэкенд детектора, которым был найден сегмент: ``"dual_file"``,
-        ``"single_file"`` или ``None``.
+    start, end, volume, segment_type, backend:
+        Как раньше.
     scores:
-        Характеристики детектора для данного сегмента (зависят от бэкенда).
-        Пустой словарь, если информация недоступна.
+        Список метрик суб-сегментов (всегда list, никогда dict).
+        Для несгруппированного сегмента — список из 1 элемента.
     id:
-        Порядковый номер сегмента (начиная с 1). Присваивается при построении
-        списка сегментов.
+        id первого суб-сегмента (= scores[0].id если scores не пуст).
     """
     start: float
     end: float
     volume: float
     segment_type: str | None = None
     backend: str | None = None
-    scores: dict[str, Any] = field(default_factory=dict)
+    scores: list[SegmentScore] = field(default_factory=list)
     id: int = 0
+
+    @property
+    def duration(self) -> float:
+        """Длительность сегмента в секундах."""
+        return self.end - self.start
+
+    @property
+    def subsegment_count(self) -> int:
+        """Количество суб-сегментов в группе."""
+        return len(self.scores)
+
+    def get_first_id(self) -> int:
+        """Получить id первого суб-сегмента."""
+        return self.scores[0].id if self.scores else self.id
+
+    def get_last_id(self) -> int:
+        """Получить id последнего суб-сегмента."""
+        return self.scores[-1].id if self.scores else self.id
+
+    def get_id_range(self) -> str:
+        """Вернуть строку диапазона id, например '#1-3'."""
+        if not self.scores:
+            return f"#{self.id}"
+        first = self.get_first_id()
+        last = self.get_last_id()
+        if first == last:
+            return f"#{first}"
+        return f"#{first}-{last}"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Сериализовать в dict для JSON."""
+        result: dict[str, Any] = {
+            "id": self.id,
+            "start": self.start,
+            "end": self.end,
+            "volume": self.volume,
+        }
+        if self.segment_type is not None:
+            result["segment_type"] = self.segment_type
+        if self.backend is not None:
+            result["backend"] = self.backend
+        if self.scores:
+            result["scores"] = [s.to_dict() for s in self.scores]
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VolumeSegment":
+        """Десериализовать из dict.
+        
+        Поддерживает ТОЛЬКО новый формат (scores как list[dict]).
+        """
+        scores_data = data.get("scores", [])
+        scores: list[SegmentScore] = []
+        
+        if isinstance(scores_data, list):
+            scores = [SegmentScore.from_dict(s) for s in scores_data]
+        # Если scores не list — ошибка, старый формат не поддерживается
+        
+        return cls(
+            start=float(data["start"]),
+            end=float(data["end"]),
+            volume=float(data["volume"]),
+            segment_type=data.get("segment_type"),
+            backend=data.get("backend"),
+            scores=scores,
+            id=int(data.get("id", 0)),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -160,68 +264,6 @@ def _boundaries_to_segments(
     if len(boundaries) < 2:
         return []
     return [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
-
-
-def _merge_short_segments(
-    segments: list[tuple[float, float]],
-    min_duration_sec: float,
-) -> list[tuple[float, float]]:
-    """Объединить короткие сегменты с соседними, не удаляя их.
-
-    Алгоритм: проходим по сегментам слева направо. Если текущий сегмент
-    короче ``min_duration_sec`` — объединяем его с предыдущим (расширяем
-    конец предыдущего до конца текущего). Если предыдущего нет — объединяем
-    со следующим (расширяем начало следующего до начала текущего).
-    Повторяем до тех пор, пока все сегменты не будут >= min_duration_sec
-    или пока не останется один сегмент.
-
-    Parameters
-    ----------
-    segments:
-        Список кортежей ``(start, end)`` в хронологическом порядке.
-    min_duration_sec:
-        Минимальная допустимая длительность сегмента в секундах.
-
-    Returns
-    -------
-    list[tuple[float, float]]
-        Список сегментов, каждый из которых >= min_duration_sec.
-        Временно́е пространство полностью покрыто без пробелов.
-    """
-    if not segments:
-        return []
-
-    result = list(segments)
-    changed = True
-    while changed and len(result) > 1:
-        changed = False
-        new_result: list[tuple[float, float]] = []
-        i = 0
-        while i < len(result):
-            start, end = result[i]
-            duration = end - start
-            if duration < min_duration_sec:
-                # Объединяем с предыдущим, если он есть
-                if new_result:
-                    prev_start, _ = new_result[-1]
-                    new_result[-1] = (prev_start, end)
-                    changed = True
-                elif i + 1 < len(result):
-                    # Нет предыдущего — объединяем со следующим
-                    next_start, next_end = result[i + 1]
-                    new_result.append((start, next_end))
-                    i += 2
-                    changed = True
-                    continue
-                else:
-                    # Единственный сегмент — оставляем как есть
-                    new_result.append((start, end))
-            else:
-                new_result.append((start, end))
-            i += 1
-        result = new_result
-
-    return result
 
 
 def _compute_vocal_energy_per_segment(
@@ -316,181 +358,6 @@ def _get_volume_for_segment_type(
         return default_volume  # verse, bridge, intro, outro
 
 
-def group_volume_segments(
-    segments: list[VolumeSegment],
-    chorus_volume: float = 0.4,
-    default_volume: float = 0.2,
-) -> list[VolumeSegment]:
-    """Группировать соседние сегменты по идентичному типу.
-
-    Алгоритм:
-    1. Сортировать по start (гарантировано, но на всякий случай)
-    2. Пройти по сегментам, группируя соседние с одинаковым segment_type
-    3. Для каждой группы создать новый VolumeSegment с:
-       - id = 0 (группы не имеют id)
-       - id_group = порядковый номер группы (начиная с 1)
-       - start = начало первого сегмента
-       - end = конец последнего сегмента
-       - volume = вычисляется на основе типа сегмента через _get_volume_for_segment_type
-       - segment_type = тип группы
-       - backend = из первого сегмента
-       - scores = массив словарей {id, ...metrics}
-
-    Parameters
-    ----------
-    segments:
-        Список сегментов громкости для группировки.
-    chorus_volume:
-        Громкость для припевов (по умолчанию 0.4).
-    default_volume:
-        Громкость по умолчанию (по умолчанию 0.2).
-
-    Returns
-    -------
-    list[VolumeSegment]
-        Список групп сегментов с массивом scores внутри каждой группы.
-    """
-    if not segments:
-        return []
-
-    # Сортируем по start (на всякий случай)
-    sorted_segments = sorted(segments, key=lambda s: s.start)
-
-    groups: list[VolumeSegment] = []
-    current_group: list[VolumeSegment] = []
-    current_type: str | None = None
-
-    for seg in sorted_segments:
-        seg_type = seg.segment_type or "unknown"
-
-        if current_type is None:
-            # Начинаем новую группу
-            current_type = seg_type
-            current_group = [seg]
-        elif seg_type == current_type:
-            # Добавляем к текущей группе
-            current_group.append(seg)
-        else:
-            # Завершаем текущую группу и начинаем новую
-            if current_group:
-                groups.append(_create_group_from_segments(current_group, len(groups) + 1, chorus_volume, default_volume))
-            current_type = seg_type
-            current_group = [seg]
-
-    # Добавляем последнюю группу
-    if current_group:
-        groups.append(_create_group_from_segments(current_group, len(groups) + 1, chorus_volume, default_volume))
-
-    return groups
-
-
-def _create_group_from_segments(
-    segs: list[VolumeSegment],
-    group_id: int,
-    chorus_volume: float,
-    default_volume: float,
-) -> VolumeSegment:
-    """Создать VolumeSegment-группу из списка сегментов.
-
-    Parameters
-    ----------
-    segs:
-        Список сегментов для объединения в группу.
-    group_id:
-        Порядковый номер группы (начиная с 1).
-    chorus_volume:
-        Громкость для припевов.
-    default_volume:
-        Громкость по умолчанию.
-
-    Returns
-    -------
-    VolumeSegment
-        Группа сегментов с массивом scores.
-    """
-    if not segs:
-        raise ValueError("Cannot create group from empty segment list")
-
-    first_seg = segs[0]
-    last_seg = segs[-1]
-    segment_type = first_seg.segment_type or "unknown"
-
-    # Вычисляем volume на основе типа сегмента
-    volume = _get_volume_for_segment_type(segment_type, chorus_volume, default_volume)
-
-    # Формируем массив scores
-    scores_array: list[dict[str, Any]] = []
-    for s in segs:
-        score_item: dict[str, Any] = {
-            "id": s.id,
-        }
-        # Добавляем все метрики из scores
-        for key, value in s.scores.items():
-            score_item[key] = value
-        scores_array.append(score_item)
-
-    return VolumeSegment(
-        start=first_seg.start,
-        end=last_seg.end,
-        volume=volume,
-        segment_type=segment_type,
-        backend=first_seg.backend,
-        scores={"id_group": group_id, "scores": scores_array},  # type: ignore[arg-type]
-        id=0,  # Группы не имеют id (используется id_group в scores)
-    )
-
-
-def save_segment_groups(
-    groups: list[VolumeSegment],
-    output_path: Path,
-) -> None:
-    """Сохранить группы сегментов в JSON-файл.
-
-    Parameters
-    ----------
-    groups:
-        Список групп сегментов.
-    output_path:
-        Путь к выходному JSON-файлу.
-    """
-    _logger = logging.getLogger(__name__)
-    data = []
-
-    for group in groups:
-        # Извлекаем id_group и массив scores из scores dict
-        scores_dict = group.scores if isinstance(group.scores, dict) else {}
-        id_group = scores_dict.get("id_group", 0)
-        scores_array = scores_dict.get("scores", [])
-
-        item: dict[str, Any] = {
-            "id_group": id_group,
-            "start": group.start,
-            "end": group.end,
-            "volume": group.volume,
-        }
-
-        if group.segment_type is not None:
-            item["segment_type"] = group.segment_type
-        if group.backend is not None:
-            item["backend"] = group.backend
-
-        # Добавляем массив scores
-        if scores_array:
-            item["scores"] = scores_array
-
-        data.append(item)
-
-    output_path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    _logger.debug(
-        "save_segment_groups: saved %d groups to '%s'",
-        len(groups),
-        output_path,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Volume segments functions
 # ---------------------------------------------------------------------------
@@ -541,11 +408,23 @@ def build_volume_segments(
                         start=current_pos,
                         end=info.start,
                         volume=default_volume,
+                        scores=[],
                     )
                 )
             volume = _get_volume_for_segment_type(
                 info.segment_type, chorus_volume, default_volume
             )
+            
+            # Создаём SegmentScore из info.scores
+            scores_list = [SegmentScore(
+                id=0,  # Будет присвоен позже
+                vocal_energy=float(info.scores.get("vocal_energy", 1.0)),
+                chroma_variance=float(info.scores.get("chroma_variance", 0.0)),
+                sim_score=float(info.scores.get("sim_score", 0.0)),
+                hpss_score=float(info.scores.get("hpss_score", 0.0)),
+                tempo_score=float(info.scores.get("tempo_score", 0.0)),
+            )]
+            
             result.append(
                 VolumeSegment(
                     start=info.start,
@@ -553,7 +432,7 @@ def build_volume_segments(
                     volume=volume,
                     segment_type=info.segment_type,
                     backend=info.backend,
-                    scores=dict(info.scores),
+                    scores=scores_list,
                 )
             )
             current_pos = info.end
@@ -564,17 +443,21 @@ def build_volume_segments(
                     start=current_pos,
                     end=audio_duration,
                     volume=default_volume,
+                    scores=[],
                 )
             )
         # Присваиваем порядковые номера
         for idx, seg in enumerate(result, start=1):
             seg.id = idx
+            # Обновляем id в scores, если есть
+            if seg.scores:
+                seg.scores[0].id = idx
         return result
 
     # Fallback: строим из chorus_segments без расширенной информации детектора
     if not chorus_segments:
         # No chorus detected — use default volume for the whole track
-        seg = VolumeSegment(start=0.0, end=audio_duration, volume=default_volume, id=1)
+        seg = VolumeSegment(start=0.0, end=audio_duration, volume=default_volume, id=1, scores=[])
         return [seg]
 
     sorted_chorus = sorted(chorus_segments, key=lambda s: s[0])
@@ -585,7 +468,7 @@ def build_volume_segments(
         # Non-chorus segment before this chorus
         if start > current_pos:
             segments.append(
-                VolumeSegment(start=current_pos, end=start, volume=default_volume)
+                VolumeSegment(start=current_pos, end=start, volume=default_volume, scores=[])
             )
         # Chorus segment
         segments.append(
@@ -594,6 +477,7 @@ def build_volume_segments(
                 end=end,
                 volume=chorus_volume,
                 segment_type="chorus",
+                scores=[],
             )
         )
         current_pos = end
@@ -601,7 +485,7 @@ def build_volume_segments(
     # Non-chorus segment after the last chorus
     if current_pos < audio_duration:
         segments.append(
-            VolumeSegment(start=current_pos, end=audio_duration, volume=default_volume)
+            VolumeSegment(start=current_pos, end=audio_duration, volume=default_volume, scores=[])
         )
 
     # Присваиваем порядковые номера
@@ -615,35 +499,13 @@ def save_volume_segments(
     segments: list[VolumeSegment],
     output_path: Path,
 ) -> None:
-    """Сохранить разметку громкости в JSON-файл.
-
-    Сохраняет обязательные поля ``start``, ``end``, ``volume``, а также
-    опциональные поля детектора: ``segment_type``, ``backend``, ``scores``.
-
-    Parameters
-    ----------
-    segments:
-        Список сегментов громкости.
-    output_path:
-        Путь к выходному JSON-файлу.
+    """Сохранить разметку громкости в JSON.
+    
+    Использует новый формат с scores как list[SegmentScore].
     """
     _logger = logging.getLogger(__name__)
-    data = []
-    for seg in segments:
-        item: dict[str, Any] = {
-            "id": seg.id,
-            "start": seg.start,
-            "end": seg.end,
-            "volume": seg.volume,
-        }
-        if seg.segment_type is not None:
-            item["segment_type"] = seg.segment_type
-        if seg.backend is not None:
-            item["backend"] = seg.backend
-        if seg.scores:
-            item["scores"] = seg.scores
-        data.append(item)
-
+    data = [seg.to_dict() for seg in segments]
+    
     output_path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -657,52 +519,20 @@ def save_volume_segments(
 
 def load_volume_segments(input_path: Path) -> list[VolumeSegment]:
     """Загрузить разметку громкости из JSON-файла.
-
-    Поддерживает как старый формат (только ``start``, ``end``, ``volume``),
-    так и новый формат с полями ``segment_type``, ``backend``, ``scores``.
-
-    Parameters
-    ----------
-    input_path:
-        Путь к JSON-файлу с разметкой громкости.
-
-    Returns
-    -------
-    list[VolumeSegment]
-        Список сегментов громкости.
-
-    Raises
-    ------
-    FileNotFoundError
-        Если файл не найден.
-    ValueError
-        Если файл содержит некорректные данные.
+    
+    Поддерживает ТОЛЬКО новый формат: scores как list[dict].
     """
     _logger = logging.getLogger(__name__)
     if not input_path.exists():
-        raise FileNotFoundError(
-            f"Файл разметки громкости не найден: {input_path}"
-        )
+        raise FileNotFoundError(f"Файл разметки громкости не найден: {input_path}")
+    
     try:
         data = json.loads(input_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Некорректный JSON в файле разметки громкости '{input_path}': {exc}"
-        ) from exc
-
-    segments: list[VolumeSegment] = []
-    for item in data:
-        segments.append(
-            VolumeSegment(
-                start=float(item["start"]),
-                end=float(item["end"]),
-                volume=float(item["volume"]),
-                segment_type=item.get("segment_type"),
-                backend=item.get("backend"),
-                scores=item.get("scores", {}),
-                id=int(item.get("id", 0)),
-            )
-        )
+        raise ValueError(f"Некорректный JSON в файле '{input_path}': {exc}") from exc
+    
+    segments = [VolumeSegment.from_dict(item) for item in data]
+    
     _logger.debug(
         "load_volume_segments: loaded %d segments from '%s'",
         len(segments),
@@ -743,10 +573,14 @@ class ChorusDetector:
         min_duration_sec: float = 5.0,
         vocal_silence_threshold: float = 0.05,
         boundary_merge_tolerance_sec: float = 2.0,
+        chorus_volume: float = 0.4,
+        default_volume: float = 0.2,
     ) -> None:
         self._min_duration = min_duration_sec
         self._vocal_silence_threshold = vocal_silence_threshold
         self._boundary_merge_tolerance = boundary_merge_tolerance_sec
+        self._chorus_volume = chorus_volume
+        self._default_volume = default_volume
 
     # ------------------------------------------------------------------
     # Public API
@@ -824,7 +658,7 @@ class ChorusDetector:
         )
         segments = _boundaries_to_segments(merged_boundaries)
         # Объединяем короткие сегменты с соседними (не удаляем — это создаёт пробелы)
-        segments = _merge_short_segments(segments, self._min_duration)
+        segments = self._merge_short_segments_internal(segments, self._min_duration)
 
         if not segments:
             logger.warning(
@@ -895,6 +729,46 @@ class ChorusDetector:
             audio_file,
             [(s.start, s.end, s.segment_type) for s in result],
         )
+        return result
+
+    def _merge_short_segments_internal(
+        self,
+        segments: list[tuple[float, float]],
+        min_duration: float,
+    ) -> list[tuple[float, float]]:
+        """Объединить короткие сегменты с соседними.
+        
+        Сегменты короче min_duration объединяются с предыдущим сегментом.
+        Это внутренний метод для работы с сырыми сегментами (кортежами).
+        
+        Parameters
+        ----------
+        segments:
+            Список кортежей (start, end).
+        min_duration:
+            Минимальная длительность сегмента в секундах.
+            
+        Returns
+        -------
+        list[tuple[float, float]]
+            Список объединённых сегментов.
+        """
+        if not segments:
+            return []
+        
+        result: list[tuple[float, float]] = [segments[0]]
+        
+        for current in segments[1:]:
+            prev_start, prev_end = result[-1]
+            curr_start, curr_end = current
+            curr_duration = curr_end - curr_start
+            
+            if curr_duration < min_duration:
+                # Объединяем с предыдущим: расширяем prev_end до curr_end
+                result[-1] = (prev_start, curr_end)
+            else:
+                result.append(current)
+        
         return result
 
     # ------------------------------------------------------------------
@@ -1225,3 +1099,122 @@ class ChorusDetector:
 
         # Правило 7: fallback
         return "verse"
+
+    def merge_segments(
+        self,
+        segments: list[VolumeSegment],
+        should_merge: Callable[[VolumeSegment, VolumeSegment], bool],
+    ) -> list[VolumeSegment]:
+        """Универсальный метод объединения соседних сегментов.
+        
+        Проходим по сегментам слева направо, группируя соседние,
+        для которых should_merge(prev, current) возвращает True.
+        
+        Алгоритм объединения (единый для всех случаев):
+        - start = start первого сегмента в группе
+        - end = end последнего сегмента в группе
+        - segment_type = тип первого сегмента
+        - backend = backend первого сегмента
+        - scores = конкатенация всех scores в хронологическом порядке
+        - id = id первого сегмента
+        - volume = вычисляется по типу через _get_volume_for_segment_type
+          с использованием self._chorus_volume и self._default_volume
+          
+        Parameters
+        ----------
+        segments:
+            Исходный список сегментов (будет отсортирован по start).
+        should_merge:
+            Функция (prev, current) -> bool, определяющая объединение.
+            
+        Returns
+        -------
+        list[VolumeSegment]
+            Список объединённых сегментов.
+        """
+        if not segments:
+            return []
+        
+        # Сортируем по start
+        sorted_segs = sorted(segments, key=lambda s: s.start)
+        
+        groups: list[list[VolumeSegment]] = []
+        current_group: list[VolumeSegment] = [sorted_segs[0]]
+        
+        for seg in sorted_segs[1:]:
+            prev = current_group[-1]
+            if should_merge(prev, seg):
+                current_group.append(seg)
+            else:
+                groups.append(current_group)
+                current_group = [seg]
+        
+        if current_group:
+            groups.append(current_group)
+        
+        # Создаём VolumeSegment для каждой группы
+        result: list[VolumeSegment] = []
+        for group in groups:
+            merged = self._combine_group(group)
+            result.append(merged)
+        
+        return result
+
+    def _combine_group(
+        self,
+        segs: list[VolumeSegment],
+    ) -> VolumeSegment:
+        """Объединить группу сегментов в один."""
+        if not segs:
+            raise ValueError("Cannot combine empty group")
+        if len(segs) == 1:
+            return segs[0]
+        
+        first = segs[0]
+        last = segs[-1]
+        segment_type = first.segment_type or "unknown"
+        
+        # Вычисляем volume по типу через _get_volume_for_segment_type
+        volume = _get_volume_for_segment_type(
+            segment_type, self._chorus_volume, self._default_volume
+        )
+        
+        # Конкатенируем все scores
+        all_scores: list[SegmentScore] = []
+        for seg in segs:
+            all_scores.extend(seg.scores)
+        
+        return VolumeSegment(
+            start=first.start,
+            end=last.end,
+            volume=volume,
+            segment_type=segment_type,
+            backend=first.backend,
+            scores=all_scores,
+            id=first.id,
+        )
+
+    def should_merge_short(
+        self,
+        prev: VolumeSegment,
+        current: VolumeSegment,
+    ) -> bool:
+        """Предикат для объединения коротких сегментов.
+        
+        Объединяем, если ТЕКУЩИЙ сегмент короче min_duration.
+        Использует self._min_duration из настроек ChorusDetector.
+        """
+        return (current.end - current.start) < self._min_duration
+
+
+from collections.abc import Callable
+
+
+def should_merge_same_type(
+    prev: VolumeSegment,
+    current: VolumeSegment,
+) -> bool:
+    """Предикат для объединения сегментов одинакового типа."""
+    prev_type = prev.segment_type or "unknown"
+    curr_type = current.segment_type or "unknown"
+    return prev_type == curr_type
