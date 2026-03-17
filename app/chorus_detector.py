@@ -1085,8 +1085,15 @@ class ChorusDetector:
         if segment_index == total_segments - 1:
             return "outro"
 
-        # Правило 4: припев
-        if sim_score > median_sim + 0.1 and hpss_score > median_hpss:
+        # Правило 4: припев (основан на vocal_energy относительно среднего)
+        # Вычисляем mean_vocal_energy только для сегментов с vocal_energy > threshold
+        vocal_energies_above_threshold = [
+            f.get("vocal_energy", 0.0)
+            for f in all_features
+            if f.get("vocal_energy", 0.0) > threshold
+        ]
+        mean_vocal_energy = float(np.mean(vocal_energies_above_threshold)) if vocal_energies_above_threshold else 0.5
+        if vocal_energy > mean_vocal_energy:
             return "chorus"
 
         # Правило 5: куплет
