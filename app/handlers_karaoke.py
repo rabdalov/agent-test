@@ -16,6 +16,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from .config import Settings
 from .config_watcher import ConfigWatcher
 from .models import (
+    LyricsChoiceStates,
+    LyricsConfirmStates,
     LyricsStates,
     PipelineResult,
     PipelineState,
@@ -244,6 +246,58 @@ class KaraokeHandlers:
                 await self._reject_unauthorized(message)
                 return
             await self._handle_step_command(message, PipelineStep.TRANSCRIBE, state)
+
+        @self.router.message(Command("step_generate_lyrics"))
+        async def handle_step_generate_lyrics(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+
+            caller_user_id = message.from_user.id if message.from_user else None
+            result = self._find_latest_state(user_id=caller_user_id)
+
+            if result is None:
+                await message.answer(
+                    "❌ Нет активного трека для продолжения. Пожалуйста, начните новую обработку."
+                )
+                return
+
+            pipeline_state, track_dir = result
+            track_name = track_dir.name
+
+            # Автоматически устанавливаем флаг для ручного запуска GENERATE_LYRICS
+            if not pipeline_state.use_transcription_as_lyrics:
+                pipeline_state.use_transcription_as_lyrics = True
+                state_path = track_dir / "state.json"
+                try:
+                    state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+                    self._logger.info(
+                        "Auto-set use_transcription_as_lyrics=true for track_id=%s (manual step command)",
+                        pipeline_state.track_id
+                    )
+                except OSError as exc:
+                    self._logger.error("Failed to update state.json with flag for track_id=%s: %s", pipeline_state.track_id, exc)
+
+            step_name = PipelineStep.GENERATE_LYRICS.value
+            sent_msg = await message.answer(
+                f"▶️ Запускаю обработку с шага {step_name}...\n"
+                f"track: <code>{track_name}</code>",
+                parse_mode="HTML",
+            )
+
+            # Update state with new notification IDs
+            pipeline_state.notification_chat_id = sent_msg.chat.id
+            pipeline_state.notification_message_id = sent_msg.message_id
+            state_path = track_dir / "state.json"
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error(
+                    "Failed to update state.json with notification IDs for track_id=%s: %s",
+                    pipeline_state.track_id, exc,
+                )
+
+            await self._run_from_step(message, track_dir, pipeline_state, PipelineStep.GENERATE_LYRICS, state)
 
         @self.router.message(Command("step_correct"))
         async def handle_step_correct(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
@@ -558,6 +612,165 @@ class KaraokeHandlers:
             # Continue pipeline from SEPARATE step (after GET_LYRICS)
             await self._run_from_step(message, track_dir, pipeline_state, PipelineStep.SEPARATE, state)
 
+        # ----- Callback: lyrics choice (transcription or upload) -----
+        @self.router.callback_query(LyricsChoiceStates.waiting_for_choice, F.data == "lyrics_choice:transcription")
+        async def handle_lyrics_choice_transcription(callback: types.CallbackQuery, state: FSMContext) -> None:
+            """Пользователь выбрал использовать транскрипцию."""
+            # Получаем данные из FSM
+            data = await state.get_data()
+            track_id = data.get("track_id")
+            track_folder = data.get("track_folder")
+
+            if not track_id or not track_folder:
+                await callback.answer("❌ Не удалось определить трек.", show_alert=True)
+                await state.clear()
+                return
+
+            # Читаем state.json
+            track_dir = Path(track_folder)
+            state_path = track_dir / "state.json"
+            try:
+                pipeline_state = PipelineState.model_validate_json(state_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self._logger.error("Failed to read state.json for track_id=%s: %s", track_id, exc)
+                await callback.answer("❌ Ошибка чтения состояния трека.", show_alert=True)
+                await state.clear()
+                return
+
+            # Устанавливаем флаг
+            pipeline_state.use_transcription_as_lyrics = True
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error("Failed to update state.json for track_id=%s: %s", track_id, exc)
+                await callback.answer("❌ Ошибка сохранения состояния.", show_alert=True)
+                await state.clear()
+                return
+
+            # Очищаем FSM
+            await state.clear()
+            await callback.answer("Выбран вариант с транскрипцией")
+
+            # Продолжаем пайплайн с SEPARATE
+            if callback.message:
+                await self._run_from_step(callback.message, track_dir, pipeline_state, PipelineStep.SEPARATE, state)
+
+        @self.router.callback_query(LyricsChoiceStates.waiting_for_choice, F.data == "lyrics_choice:upload")
+        async def handle_lyrics_choice_upload(callback: types.CallbackQuery, state: FSMContext) -> None:
+            """Пользователь выбрал загрузить текст вручную."""
+            # Переходим в FSM ожидания текста
+            await state.set_state(LyricsStates.waiting_for_lyrics)
+
+            text = "Пожалуйста, пришлите полный текст песни в следующем сообщении."
+            await callback.answer("Ожидаю текст песни")
+
+            if callback.message:
+                try:
+                    await callback.message.edit_text(text)
+                except Exception:
+                    await callback.message.answer(text)
+
+        # ----- Callback: lyrics confirmation (ok or upload) -----
+        @self.router.callback_query(LyricsConfirmStates.waiting_for_confirmation, F.data == "lyrics_confirm:ok")
+        async def handle_lyrics_confirm_ok(callback: types.CallbackQuery, state: FSMContext) -> None:
+            """Пользователь подтвердил текст из транскрипции."""
+            # Получаем данные из FSM
+            data = await state.get_data()
+            track_id = data.get("track_id")
+            track_folder = data.get("track_folder")
+
+            if not track_id or not track_folder:
+                await callback.answer("❌ Не удалось определить трек.", show_alert=True)
+                await state.clear()
+                return
+
+            # Читаем state.json
+            track_dir = Path(track_folder)
+            state_path = track_dir / "state.json"
+            try:
+                pipeline_state = PipelineState.model_validate_json(state_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self._logger.error("Failed to read state.json for track_id=%s: %s", track_id, exc)
+                await callback.answer("❌ Ошибка чтения состояния трека.", show_alert=True)
+                await state.clear()
+                return
+
+            # Переименовываем временный файл в финальный
+            if not pipeline_state.temp_lyrics_file:
+                await callback.answer("❌ Временный файл с текстом не найден.", show_alert=True)
+                await state.clear()
+                return
+
+            temp_path = Path(pipeline_state.temp_lyrics_file)
+            stem = pipeline_state.track_stem or "track"
+            final_path = track_dir / f"{stem}_lyrics.txt"
+
+            try:
+                temp_path.rename(final_path)
+            except OSError as exc:
+                self._logger.error("Failed to rename temp lyrics file for track_id=%s: %s", track_id, exc)
+                await callback.answer("❌ Ошибка сохранения текста.", show_alert=True)
+                await state.clear()
+                return
+
+            # Обновляем состояние
+            pipeline_state.source_lyrics_file = str(final_path)
+            pipeline_state.temp_lyrics_file = None
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error("Failed to update state.json for track_id=%s: %s", track_id, exc)
+
+            # Очищаем FSM
+            await state.clear()
+            await callback.answer("Текст подтверждён")
+
+            # Продолжаем с DETECT_CHORUS (после GENERATE_LYRICS)
+            if callback.message:
+                await self._run_from_step(callback.message, track_dir, pipeline_state, PipelineStep.DETECT_CHORUS, state)
+
+        @self.router.callback_query(LyricsConfirmStates.waiting_for_confirmation, F.data == "lyrics_confirm:upload")
+        async def handle_lyrics_confirm_upload(callback: types.CallbackQuery, state: FSMContext) -> None:
+            """Пользователь хочет загрузить свой текст вместо транскрипции."""
+            # Получаем данные
+            data = await state.get_data()
+            track_folder = data.get("track_folder")
+
+            if not track_folder:
+                await callback.answer("❌ Не удалось определить трек.", show_alert=True)
+                await state.clear()
+                return
+
+            # Сбрасываем флаг и удаляем временный файл
+            track_dir = Path(track_folder)
+            state_path = track_dir / "state.json"
+            try:
+                pipeline_state = PipelineState.model_validate_json(state_path.read_text(encoding="utf-8"))
+
+                # Удаляем временный файл если есть
+                if pipeline_state.temp_lyrics_file:
+                    temp_path = Path(pipeline_state.temp_lyrics_file)
+                    if temp_path.exists():
+                        temp_path.unlink()
+
+                pipeline_state.use_transcription_as_lyrics = False
+                pipeline_state.temp_lyrics_file = None
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except Exception as exc:
+                self._logger.error("Failed to update state.json: %s", exc)
+
+            # Переходим в FSM ожидания текста
+            await state.set_state(LyricsStates.waiting_for_lyrics)
+
+            text = "Пожалуйста, пришлите полный текст песни в следующем сообщении."
+            await callback.answer("Ожидаю текст песни")
+
+            if callback.message:
+                try:
+                    await callback.message.edit_text(text)
+                except Exception:
+                    await callback.message.answer(text)
+
         # ----- Admin callback handler -----
         @self.router.callback_query(F.data.startswith("admin_"))
         async def handle_admin_callback(callback: types.CallbackQuery) -> None:
@@ -785,7 +998,7 @@ class KaraokeHandlers:
         try:
             result = await pipeline.run(_progress)
         except WaitingForInputError:
-            # Pipeline paused at ASK_LANGUAGE — ask user for language
+            # Pipeline paused waiting for user input
             # Update state with new track_folder (may have changed during DOWNLOAD)
             pipeline_state = pipeline.state
             new_track_dir = pipeline.track_folder
@@ -797,9 +1010,25 @@ class KaraokeHandlers:
             try:
                 new_state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
             except OSError as exc:
-                self._logger.error("Failed to update state.json after DOWNLOAD for track_id=%s: %s", track_id, exc)
+                self._logger.error("Failed to update state.json after WaitingForInputError for track_id=%s: %s", track_id, exc)
 
-            await self._ask_for_lang(message, state, track_id, str(new_track_dir), pipeline_state)
+            # Определяем, какой шаг вызвал ожидание
+            current_step = pipeline_state.current_step
+
+            if current_step == PipelineStep.ASK_LANGUAGE:
+                await self._ask_for_lang(message, state, track_id, str(new_track_dir), pipeline_state)
+            elif current_step == PipelineStep.GENERATE_LYRICS:
+                await self._show_lyrics_confirmation(message, state, track_id, new_track_dir, pipeline_state)
+            else:
+                self._logger.warning("Unexpected WaitingForInputError at step %s for track_id=%s", current_step, track_id)
+                try:
+                    await message.bot.edit_message_text(
+                        text=f"❌ Неожиданное ожидание ввода на шаге {current_step}",
+                        chat_id=notification_chat_id,
+                        message_id=notification_message_id,
+                    )
+                except Exception:
+                    await message.answer(f"❌ Неожиданное ожидание ввода на шаге {current_step}")
             return
         except LyricsNotFoundError:
             # Pipeline paused at GET_LYRICS — ask user for lyrics
@@ -979,13 +1208,23 @@ class KaraokeHandlers:
         track_dir: Path,
         pipeline_state: PipelineState | None = None,
     ) -> None:
-        """Transition user to FSM state waiting_for_lyrics and ask to send lyrics."""
-        await state.set_state(LyricsStates.waiting_for_lyrics)
-        await state.update_data(track_id=track_id)
+        """Ask user to choose lyrics source: transcription or manual upload."""
+        await state.set_state(LyricsChoiceStates.waiting_for_choice)
+        await state.update_data(track_id=track_id, track_folder=str(track_dir))
         self._logger.info(
-            "LyricsNotFoundError for track_id=%s — requesting lyrics from user", track_id
+            "LyricsNotFoundError for track_id=%s — asking user for lyrics source", track_id
         )
-        text = "🎵 Не удалось автоматически найти текст песни.\n\nПожалуйста, пришли полный текст песни в следующем сообщении."
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📝 Транскрипция", callback_data="lyrics_choice:transcription"),
+                    InlineKeyboardButton(text="📤 Загрузить", callback_data="lyrics_choice:upload"),
+                ]
+            ]
+        )
+
+        text = "🎵 Не удалось автоматически найти текст песни.\n\nВыберите вариант:"
 
         if pipeline_state and pipeline_state.notification_chat_id and pipeline_state.notification_message_id:
             try:
@@ -993,15 +1232,75 @@ class KaraokeHandlers:
                     chat_id=pipeline_state.notification_chat_id,
                     message_id=pipeline_state.notification_message_id,
                     text=text,
+                    reply_markup=keyboard,
                 )
+                return
             except Exception as exc:
                 self._logger.warning(
-                    "Failed to edit notification for lyrics request track_id=%s: %s.",
+                    "Failed to edit notification for lyrics choice track_id=%s: %s.",
                     track_id,
                     exc,
                 )
 
-        await message.answer(text)
+        await message.answer(text, reply_markup=keyboard)
+
+    async def _show_lyrics_confirmation(
+        self,
+        message: types.Message,
+        state: FSMContext,
+        track_id: str,
+        track_dir: Path,
+        pipeline_state: PipelineState | None = None,
+    ) -> None:
+        """Показать пользователю сгенерированный текст для подтверждения."""
+        await state.set_state(LyricsConfirmStates.waiting_for_confirmation)
+        await state.update_data(track_id=track_id, track_folder=str(track_dir))
+
+        # Читаем временный файл с текстом
+        state_path = track_dir / "state.json"
+        try:
+            pipeline_state = PipelineState.model_validate_json(state_path.read_text(encoding="utf-8"))
+            temp_lyrics_path = Path(pipeline_state.temp_lyrics_file) if pipeline_state.temp_lyrics_file else None
+
+            if temp_lyrics_path and temp_lyrics_path.exists():
+                lyrics = temp_lyrics_path.read_text(encoding="utf-8")
+            else:
+                lyrics = "[Ошибка: текст не найден]"
+        except Exception as exc:
+            self._logger.error("Failed to read temp lyrics file for track_id=%s: %s", track_id, exc)
+            lyrics = "[Ошибка: не удалось прочитать текст]"
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Ок", callback_data="lyrics_confirm:ok"),
+                    InlineKeyboardButton(text="📤 Загрузить", callback_data="lyrics_confirm:upload"),
+                ]
+            ]
+        )
+
+        # Отправляем первые 1000 символов текста
+        preview = lyrics[:1000] + "..." if len(lyrics) > 1000 else lyrics
+        text = f"📝 Текст, сгенерированный из транскрипции:\n\n<pre>{preview}</pre>\n\nПодтвердить или загрузить свой?"
+
+        if pipeline_state and pipeline_state.notification_chat_id and pipeline_state.notification_message_id:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=pipeline_state.notification_chat_id,
+                    message_id=pipeline_state.notification_message_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                )
+                return
+            except Exception as exc:
+                self._logger.warning(
+                    "Failed to edit notification for lyrics confirmation track_id=%s: %s.",
+                    track_id,
+                    exc,
+                )
+
+        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
     # ------------------------------------------------------------------
     # Track search helpers
@@ -1185,7 +1484,7 @@ class KaraokeHandlers:
         try:
             result = await pipeline.run(_step_progress, start_from_step=step)
         except WaitingForInputError:
-            # Pipeline paused at ASK_LANGUAGE
+            # Pipeline paused waiting for user input
             updated_state = pipeline.state
             updated_state.notification_chat_id = notification_chat_id
             updated_state.notification_message_id = notification_message_id
@@ -1195,7 +1494,24 @@ class KaraokeHandlers:
                 new_state_path.write_text(updated_state.model_dump_json(indent=2), encoding="utf-8")
             except OSError as exc:
                 self._logger.error("Failed to update state.json after WaitingForInput: %s", exc)
-            await self._ask_for_lang(message, fsm_context, state.track_id, str(new_track_dir), updated_state)
+
+            # Определяем, какой шаг вызвал ожидание
+            current_step = updated_state.current_step
+
+            if current_step == PipelineStep.ASK_LANGUAGE:
+                await self._ask_for_lang(message, fsm_context, state.track_id, str(new_track_dir), updated_state)
+            elif current_step == PipelineStep.GENERATE_LYRICS:
+                await self._show_lyrics_confirmation(message, fsm_context, state.track_id, new_track_dir, updated_state)
+            else:
+                self._logger.warning("Unexpected WaitingForInputError at step %s in _run_from_step", current_step)
+                try:
+                    await message.bot.edit_message_text(
+                        text=f"❌ Неожиданное ожидание ввода на шаге {current_step}",
+                        chat_id=notification_chat_id,
+                        message_id=notification_message_id,
+                    )
+                except Exception:
+                    await message.answer(f"❌ Неожиданное ожидание ввода на шаге {current_step}")
             return
         except LyricsNotFoundError:
             updated_state = pipeline.state

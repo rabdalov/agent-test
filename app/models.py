@@ -32,6 +32,7 @@ class PipelineStep(str, Enum):
     GET_LYRICS = "GET_LYRICS"
     SEPARATE = "SEPARATE"
     TRANSCRIBE = "TRANSCRIBE"
+    GENERATE_LYRICS = "GENERATE_LYRICS"
     DETECT_CHORUS = "DETECT_CHORUS"
     CORRECT_TRANSCRIPT = "CORRECT_TRANSCRIPT"
     ALIGN = "ALIGN"
@@ -84,6 +85,10 @@ class PipelineState(BaseModel):
     supressedvocal_mix: str | None = None     # MP3 микс: instrumental + raw_vocal (с фиксированной громкостью)
     # Track visualization file (generated in GENERATE_ASS step when enabled)
     visualization_file: str | None = None
+    # Флаг для использования транскрипции как текста песни (когда lyrics не найден)
+    use_transcription_as_lyrics: bool = False
+    # Временный файл с текстом, сгенерированным из транскрипции (для подтверждения)
+    temp_lyrics_file: str | None = None
 
 
 class PipelineResult(BaseModel):
@@ -104,3 +109,13 @@ class TrackLangStates(StatesGroup):
 class SearchStates(StatesGroup):
     waiting_for_query = State()
     waiting_for_selection = State()
+
+
+class LyricsChoiceStates(StatesGroup):
+    """FSM для выбора источника текста песни (транскрипция или загрузка)."""
+    waiting_for_choice = State()
+
+
+class LyricsConfirmStates(StatesGroup):
+    """FSM для подтверждения текста песни, сгенерированного из транскрипции."""
+    waiting_for_confirmation = State()

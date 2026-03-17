@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 from functools import partial
+from pathlib import Path
 
 import httpx
 
@@ -167,3 +168,43 @@ class LyricsService:
         if lines and lines[0].strip().lower().startswith(title.lower()[:10]):
             lines = lines[1:]
         return "\n".join(lines).strip() or None
+
+    @staticmethod
+    def generate_lyrics_from_transcription(transcription_json_path: Path) -> str:
+        """Генерирует текст песни из segments транскрипции.
+
+        Формат segments (после шага TRANSCRIBE и _cleanup_transcription):
+        {
+            "segments": [
+                {"id": 0, "start": 0.0, "end": 2.5, "text": "текст строки"},
+                ...
+            ]
+        }
+
+        Args:
+            transcription_json_path: Путь к JSON-файлу с транскрипцией.
+
+        Returns:
+            Строка с текстом песни, объединённые сегменты через перенос строки.
+        """
+        import json
+
+        try:
+            with open(transcription_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error(f"Failed to read transcription file {transcription_json_path}: {exc}")
+            return ""
+
+        segments = data.get("segments", [])
+        if not segments:
+            logger.warning(f"No segments found in transcription file {transcription_json_path}")
+            return ""
+
+        lines = []
+        for segment in segments:
+            text = segment.get("text", "").strip()
+            if text:
+                lines.append(text)
+
+        return "\n".join(lines)

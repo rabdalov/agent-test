@@ -58,6 +58,7 @@ _STEP_LABELS: dict[PipelineStep, str] = {
     PipelineStep.GET_LYRICS: "получение текста",
     PipelineStep.SEPARATE: "разделение дорожек",
     PipelineStep.TRANSCRIBE: "транскрипция",
+    PipelineStep.GENERATE_LYRICS: "генерация текста песни из транскрипции",
     PipelineStep.DETECT_CHORUS: "определение припевов",
     PipelineStep.CORRECT_TRANSCRIPT: "корректировка транскрипции",
     PipelineStep.ALIGN: "выравнивание",
@@ -73,6 +74,7 @@ _ORDERED_STEPS: list[PipelineStep] = [
     PipelineStep.GET_LYRICS,
     PipelineStep.SEPARATE,
     PipelineStep.TRANSCRIBE,
+    PipelineStep.GENERATE_LYRICS,
     PipelineStep.DETECT_CHORUS,
     PipelineStep.CORRECT_TRANSCRIPT,
     PipelineStep.ALIGN,
@@ -89,6 +91,7 @@ _STEP_REQUIRED_ARTIFACTS: dict[PipelineStep, list[str]] = {
     PipelineStep.GET_LYRICS: ["track_file_name", "track_stem"],
     PipelineStep.SEPARATE: ["track_source"],
     PipelineStep.TRANSCRIBE: ["vocal_file"],
+    PipelineStep.GENERATE_LYRICS: ["transcribe_json_file"],
     PipelineStep.DETECT_CHORUS: ["vocal_file", "instrumental_file"],
     PipelineStep.CORRECT_TRANSCRIPT: ["transcribe_json_file", "source_lyrics_file"],
     PipelineStep.ALIGN: ["source_lyrics_file", "transcribe_json_file"],
@@ -295,6 +298,7 @@ class KaraokePipeline:
             PipelineStep.GET_LYRICS: self._step_get_lyrics,
             PipelineStep.SEPARATE: self._step_separate,
             PipelineStep.TRANSCRIBE: self._step_transcribe,
+            PipelineStep.GENERATE_LYRICS: self._step_generate_lyrics,
             PipelineStep.DETECT_CHORUS: self._step_detect_chorus,
             PipelineStep.CORRECT_TRANSCRIPT: self._step_correct_transcribe,
             PipelineStep.ALIGN: self._step_align,
@@ -1040,6 +1044,58 @@ class KaraokePipeline:
         self._cleanup_transcription(output_json)
 
         self._save_state()
+
+    # ------------------------------------------------------------------
+    # Step: GENERATE_LYRICS
+    # ------------------------------------------------------------------
+
+    async def _step_generate_lyrics(self) -> None:
+        """Генерирует текст из транскрипции и ждёт подтверждения пользователя.
+
+        Шаг выполняется только если:
+        - use_transcription_as_lyrics=True
+        - source_lyrics_file ещё не установлен или файл пустой/не существует
+        """
+        # Пропуск если флаг не установлен
+        if not self._state.use_transcription_as_lyrics:
+            logger.info("GENERATE_LYRICS skipped: flag not set")
+            return
+
+        # Пропуск если текст уже есть (проверяем реальное наличие файла > 100 байт)
+        if self._state.source_lyrics_file:
+            lyrics_path = Path(self._state.source_lyrics_file)
+            if lyrics_path.exists() and lyrics_path.stat().st_size > 100:
+                logger.info("GENERATE_LYRICS skipped: lyrics already exists (%s, %d bytes)",
+                           lyrics_path, lyrics_path.stat().st_size)
+                return
+            else:
+                logger.info("GENERATE_LYRICS: source_lyrics_file set but file missing or too small, proceeding")
+
+        # Проверка наличия транскрипции
+        if not self._state.transcribe_json_file:
+            raise RuntimeError("transcribe_json_file не задан")
+
+        # Генерация текста
+        lyrics = LyricsService.generate_lyrics_from_transcription(
+            Path(self._state.transcribe_json_file)
+        )
+
+        if not lyrics:
+            raise RuntimeError("Не удалось сгенерировать текст из транскрипции")
+
+        # Сохранение во временный файл
+        raw_stem = self._state.track_stem or "track"
+        stem = normalize_filename(raw_stem)
+        track_dir = self._track_folder
+        temp_lyrics_file = track_dir / f"{stem}_lyrics_temp.txt"
+        temp_lyrics_file.write_text(lyrics, encoding="utf-8")
+
+        # Сохраняем путь к временному файлу в состоянии
+        self._state.temp_lyrics_file = str(temp_lyrics_file)
+        self._save_state()
+
+        # Ожидание подтверждения пользователя
+        raise WaitingForInputError("Ожидание подтверждения текста из транскрипции")
 
     # ------------------------------------------------------------------
     # Step: CORRECT_TRANSCRIPT
