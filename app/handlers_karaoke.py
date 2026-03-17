@@ -334,6 +334,65 @@ class KaraokeHandlers:
                 return
             await self._handle_step_command(message, PipelineStep.SEND_VIDEO, state)
 
+        @self.router.message(Command("step_visualize"))
+        async def handle_step_visualize(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            """Send visualization file to user if it exists."""
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+
+            caller_user_id = message.from_user.id if message.from_user else None
+            result = self._find_latest_state(user_id=caller_user_id)
+
+            if result is None:
+                await message.answer(
+                    "❌ Нет активного трека. Пожалуйста, начните новую обработку."
+                )
+                return
+
+            pipeline_state, track_dir = result
+            track_name = track_dir.name
+
+            # Check if visualization file exists
+            viz_file_str = pipeline_state.visualization_file
+            if not viz_file_str:
+                await message.answer(
+                    f"❌ Файл визуализации не найден для трека <code>{track_name}</code>.\n"
+                    f"Убедитесь, что шаг GENERATE_ASS выполнен с включённым TRACK_VISUALIZATION_ENABLED.",
+                    parse_mode="HTML",
+                )
+                return
+
+            viz_path = Path(viz_file_str)
+            if not viz_path.exists():
+                await message.answer(
+                    f"❌ Файл визуализации не существует: <code>{viz_path.name}</code>",
+                    parse_mode="HTML",
+                )
+                return
+
+            # Send the visualization file
+            try:
+                from aiogram.types import FSInputFile
+                viz_file = FSInputFile(viz_path, filename=viz_path.name)
+                await message.answer_photo(
+                    photo=viz_file,
+                    caption=f"📊 Визуализация сегментирования трека\n<code>{track_name}</code>",
+                    parse_mode="HTML",
+                )
+                self._logger.info(
+                    "Sent visualization file to user_id=%s: %s",
+                    caller_user_id, viz_path
+                )
+            except Exception as exc:
+                self._logger.error(
+                    "Failed to send visualization file for track_id=%s: %s",
+                    pipeline_state.track_id, exc
+                )
+                await message.answer(
+                    f"❌ Ошибка при отправке файла визуализации: {exc}"
+                )
+
         @self.router.message(Command("search"))
         async def handle_search(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             if not self._is_user_allowed(message):

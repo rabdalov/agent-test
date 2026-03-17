@@ -20,7 +20,7 @@ step_align - Cопоставление текста песни с таймкод
 step_ass - Генерация файла субтитров .ass
 step_render - Сборка MP4-видео с субтитрами
 step_send - Отправка готового видео пользователю
-step_visualize - Отправка схемы привязки текста с таймингамиы 
+step_visualize - Отправка PNG-визуализации таймлайна сегментов трека 
 ## Сценарии использования
 
 ### 1. Базовый сценарий
@@ -62,3 +62,4 @@ DOWNLOAD → ASK_LANGUAGE → GET_LYRICS → SEPARATE → TRANSCRIBE → GENERAT
 | `GENERATE_ASS` | `/step_ass` | Генерация файла субтитров в формате `.ass` с покадровой подсветкой слов. |
 | `RENDER_VIDEO` | `/step_render` | Финальная сборка MP4-видео: наложение субтитров на исходное видео (или заставку) через **ffmpeg**. Создаётся видео с тремя (или четырьмя) аудиодорожками: Instrumental, Original, Instrumental+Voice, Instrumental+BackVocal (если выполнен шаг `MIX_AUDIO`). |
 | `SEND_VIDEO` | `/step_send` | Отправка готового MP4-файла пользователю или формирование ссылки на скачивание. |
+| *(вспомогательная)* | `/step_visualize` | Отправка PNG-визуализации таймлайна сегментов трека (если `TRACK_VISUALIZATION_ENABLED=true` и файл существует). |
