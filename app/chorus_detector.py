@@ -33,6 +33,10 @@ class SegmentScore:
     ----------
     id:
         Порядковый номер суб-сегмента (из msaf).
+    start:
+        Начало подсегмента в секундах.
+    end:
+        Конец подсегмента в секундах.
     vocal_energy:
         Нормализованная энергия вокала [0, 1].
     chroma_variance:
@@ -45,6 +49,8 @@ class SegmentScore:
         Rhythmic stability score [0, 1].
     """
     id: int
+    start: float = 0.0
+    end: float = 0.0
     vocal_energy: float = 0.0
     chroma_variance: float = 0.0
     sim_score: float = 0.0
@@ -55,6 +61,8 @@ class SegmentScore:
         """Сериализовать в dict для JSON."""
         return {
             "id": self.id,
+            "start": self.start,
+            "end": self.end,
             "vocal_energy": self.vocal_energy,
             "chroma_variance": self.chroma_variance,
             "sim_score": self.sim_score,
@@ -67,6 +75,8 @@ class SegmentScore:
         """Десериализовать из dict."""
         return cls(
             id=int(data.get("id", 0)),
+            start=float(data.get("start", 0.0)),
+            end=float(data.get("end", 0.0)),
             vocal_energy=float(data.get("vocal_energy", 0.0)),
             chroma_variance=float(data.get("chroma_variance", 0.0)),
             sim_score=float(data.get("sim_score", 0.0)),
@@ -476,9 +486,11 @@ def build_volume_segments(
                 info.segment_type, chorus_volume, default_volume
             )
             
-            # Создаём SegmentScore из info.scores
+            # Создаём SegmentScore из info.scores с сохранением границ
             scores_list = [SegmentScore(
                 id=0,  # Будет присвоен позже
+                start=info.start,
+                end=info.end,
                 vocal_energy=float(info.scores.get("vocal_energy", 1.0)),
                 chroma_variance=float(info.scores.get("chroma_variance", 0.0)),
                 sim_score=float(info.scores.get("sim_score", 0.0)),

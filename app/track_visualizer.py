@@ -938,13 +938,22 @@ class TrackVisualizer:
             # --- Subsegment strip (lower part of layer) ---
             # Draw subsegment rectangles from scores with id number in center
             if isinstance(scores, list) and scores:
-                seg_duration = end - start
-                sub_count = len(scores)
-                sub_width = seg_duration / sub_count
-                for i, sub_score in enumerate(scores):
-                    sub_id = sub_score.get("id", i + 1)
-                    sub_start = start + i * sub_width
-                    sub_end = sub_start + sub_width
+                for sub_score in scores:
+                    sub_id = sub_score.get("id", 0)
+                    # Используем фактические границы, fallback на равномерное распределение
+                    sub_start = float(sub_score.get("start", 0.0))
+                    sub_end = float(sub_score.get("end", 0.0))
+
+                    # Fallback для старых файлов без start/end
+                    if sub_start == 0.0 and sub_end == 0.0:
+                        seg_duration = end - start
+                        sub_count = len(scores)
+                        sub_width = seg_duration / sub_count
+                        idx = scores.index(sub_score)
+                        sub_start = start + idx * sub_width
+                        sub_end = sub_start + sub_width
+
+                    sub_width = sub_end - sub_start
 
                     # Subsegment rectangle
                     sub_rect = mpatches.Rectangle(
@@ -1178,12 +1187,19 @@ class TrackVisualizer:
             # Now scores is always list
             if isinstance(scores, list) and scores:
                 # Scores is array, draw metrics for each element
-                # Split time interval into subintervals for each scores element
-                seg_duration = end - start
-                sub_duration = seg_duration / len(scores)
-                for i, sub_score in enumerate(scores):
-                    sub_start = start + i * sub_duration
-                    sub_end = sub_start + sub_duration
+                # Используем фактические границы подсегментов
+                for sub_score in scores:
+                    sub_start = float(sub_score.get("start", 0.0))
+                    sub_end = float(sub_score.get("end", 0.0))
+
+                    # Fallback для старых файлов без start/end
+                    if sub_start == 0.0 and sub_end == 0.0:
+                        seg_duration = end - start
+                        sub_duration = seg_duration / len(scores)
+                        idx = scores.index(sub_score)
+                        sub_start = start + idx * sub_duration
+                        sub_end = sub_start + sub_duration
+
                     vocal_energy = float(sub_score.get("vocal_energy", 0.0))
                     sim_score = float(sub_score.get("sim_score", 0.0))
                     hpss_score = float(sub_score.get("hpss_score", 0.0))
