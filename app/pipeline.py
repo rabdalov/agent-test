@@ -18,6 +18,7 @@ from .chorus_detector import (
     VolumeSegment,
     build_volume_segments,
     load_volume_segments,
+    save_detailed_metrics,
     save_volume_segments,
     should_merge_same_type,
 )
@@ -886,7 +887,7 @@ class KaraokePipeline:
             chorus_volume=self._settings.chorus_backvocal_volume,
             default_volume=self._settings.audio_mix_voice_volume,
         )
-        segment_infos = await asyncio.get_event_loop().run_in_executor(
+        segment_infos, detailed_metrics = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: detector.detect(
                 full_file_str,
@@ -918,6 +919,18 @@ class KaraokePipeline:
         volume_segments_file = track_dir / f"{stem}_volume_segments.json"
         save_volume_segments(volume_segments, volume_segments_file)
         self._state.volume_segments_file = str(volume_segments_file)
+
+        # Step 5: Save detailed metrics (1-second resolution)
+        if detailed_metrics:
+            detailed_metrics_file = track_dir / f"{stem}_metrics.json"
+            save_detailed_metrics(detailed_metrics, detailed_metrics_file)
+            self._state.detailed_metrics_file = str(detailed_metrics_file)
+            logger.info(
+                "DETECT_CHORUS step: saved %d detailed metrics to '%s' for track_id=%s",
+                len(detailed_metrics),
+                detailed_metrics_file,
+                self._state.track_id,
+            )
 
         self._save_state()
 
@@ -1306,6 +1319,11 @@ class KaraokePipeline:
                     ),
                     # Use segment_groups_file from MIX_AUDIO step
                     volume_segments_file=segment_groups_path,
+                    # Pass detailed metrics file for 1-second resolution metrics
+                    detailed_metrics_file=(
+                        Path(self._state.detailed_metrics_file)
+                        if self._state.detailed_metrics_file else None
+                    ),
                     track_title=self._state.track_stem or "",
                 )
                 self._state.visualization_file = str(viz_path)

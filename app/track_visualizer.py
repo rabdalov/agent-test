@@ -50,11 +50,18 @@ _ALIGNED_COLOR = "#A8E6CF"          # зелёный
 _K_FONT = 1.0 #коэффициент моноширины
 
 
-# Цвета метрик
+# Цвета метрик (для сегментов)
 _METRIC_COLORS: dict[str, str] = {
     "vocal_energy": "#FF6B6B",
     "sim_score": "#4ECDC4",
     "hpss_score": "#45B7D1",
+}
+
+# Цвета для детальных метрик (более светлые/прозрачные)
+_DETAILED_METRIC_COLORS: dict[str, str] = {
+    "vocal_energy": "#FFB3B3",  # светло-красный
+    "chroma_variance": "#B3E6E6",  # светло-бирюзовый
+    "hpss_score": "#A3D8F0",  # светло-голубой
 }
 
 # LRC timestamp pattern: [MM:SS.xx] or [MM:SS.xxx]
@@ -148,6 +155,7 @@ class TrackVisualizer:
         aligned_lyrics_file: Path | None = None,
         source_lyrics_file: Path | None = None,
         volume_segments_file: Path | None = None,
+        detailed_metrics_file: Path | None = None,
         track_title: str = "",
     ) -> None:
         """Сгенерировать PNG-файл с визуализацией timeline трека.
@@ -166,6 +174,8 @@ class TrackVisualizer:
             TXT или LRC с текстом песни (шаг GET_LYRICS).
         volume_segments_file:
             JSON с разметкой сегментов (шаг DETECT_CHORUS).
+        detailed_metrics_file:
+            JSON с детальными метриками (1-секундные точки, шаг DETECT_CHORUS).
         track_title:
             Название трека для заголовка визуализации.
 
@@ -187,6 +197,15 @@ class TrackVisualizer:
                 "TrackVisualizer: loaded %d volume segments from '%s'",
                 len(volume_segments),
                 volume_segments_file,
+            )
+
+        detailed_metrics: list[dict] = []
+        if detailed_metrics_file and detailed_metrics_file.exists():
+            detailed_metrics = self._load_detailed_metrics(detailed_metrics_file)
+            logger.debug(
+                "TrackVisualizer: loaded %d detailed metrics from '%s'",
+                len(detailed_metrics),
+                detailed_metrics_file,
             )
 
         transcription_segments: list[dict] = []
@@ -360,6 +379,7 @@ class TrackVisualizer:
                 duration=duration,
                 y_bottom=metrics_y_bottom,
                 height=metrics_height,
+                detailed_metrics=detailed_metrics if detailed_metrics else None,
             )
 
         if has_aligned:
@@ -549,6 +569,29 @@ class TrackVisualizer:
         except Exception as exc:
             logger.warning(
                 "TrackVisualizer._load_volume_segments: failed to load '%s': %s",
+                path,
+                exc,
+            )
+            return []
+
+    def _load_detailed_metrics(self, path: Path) -> list[dict]:
+        """Загрузить детальные метрики из metrics_file.
+
+        Формат: плоский массив объектов с полями time, vocal_energy, chroma_variance, hpss_score.
+        """
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                logger.warning(
+                    "TrackVisualizer._load_detailed_metrics: expected list, got %s in '%s'",
+                    type(data).__name__,
+                    path,
+                )
+                return []
+            return data
+        except Exception as exc:
+            logger.warning(
+                "TrackVisualizer._load_detailed_metrics: failed to load '%s': %s",
                 path,
                 exc,
             )
@@ -1085,11 +1128,15 @@ class TrackVisualizer:
         duration: float,
         y_bottom: float,
         height: float,
+        detailed_metrics: list[dict] | None = None,
     ) -> None:
-        """Нарисовать ступенчатые графики метрик сегментов.
+        """Нарисовать ступенчатые графики метрик сегментов и детальные линии.
 
         Рисует три ступенчатых графика: ``vocal_energy``, ``sim_score``,
         ``hpss_score``. Каждая метрика — отдельная линия с подписью.
+        
+        Если переданы detailed_metrics, также рисует плавные линии
+        детальных метрик с шагом 1 секунда.
 
         Now scores is always list, format unified.
 
@@ -1105,6 +1152,9 @@ class TrackVisualizer:
             Нижняя граница слоя.
         height:
             Высота слоя.
+        detailed_metrics:
+            Опциональный список детальных метрик с полями
+            ``time``, ``vocal_energy``, ``chroma_variance``, ``hpss_score``.
         """
         if not segments:
             return
@@ -1198,6 +1248,51 @@ class TrackVisualizer:
                     zorder=3,
                     label=metric_name,
                 )
+
+        # Draw detailed metrics lines (1-second resolution)
+        if detailed_metrics:
+            detailed_metrics_map: dict[str, list[tuple[float, float]]] = {
+                "vocal_energy": [],
+                "chroma_variance": [],
+                "hpss_score": [],
+            }
+            
+            for point in detailed_metrics:
+                time_val = float(point.get("time", 0.0))
+                detailed_metrics_map["vocal_energy"].append(
+                    (time_val, float(point.get("vocal_energy", 0.0)))
+                )
+                detailed_metrics_map["chroma_variance"].append(
+                    (time_val, float(point.get("chroma_variance", 0.0)))
+                )
+                detailed_metrics_map["hpss_score"].append(
+                    (time_val, float(point.get("hpss_score", 0.0)))
+                )
+            
+            # Sort by time
+            for metric_name in detailed_metrics_map:
+                detailed_metrics_map[metric_name].sort(key=lambda x: x[0])
+            
+            # Draw detailed lines (thinner, more transparent)
+            for metric_name, data_points in detailed_metrics_map.items():
+                if not data_points:
+                    continue
+                
+                color = _DETAILED_METRIC_COLORS.get(metric_name, "#cccccc")
+                
+                x_vals = [p[0] for p in data_points]
+                y_vals = [y_bottom + p[1] * height * 0.9 for p in data_points]
+                
+                if x_vals:
+                    ax.plot(
+                        x_vals,
+                        y_vals,
+                        color=color,
+                        linewidth=0.8,
+                        alpha=0.5,
+                        zorder=2,
+                        linestyle="-",
+                    )
 
         # Metric labels on the right
         metric_labels = [

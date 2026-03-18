@@ -85,6 +85,8 @@ class PipelineState(BaseModel):
     supressedvocal_mix: str | None = None     # MP3 микс: instrumental + raw_vocal (с фиксированной громкостью)
     # Track visualization file (generated in GENERATE_ASS step when enabled)
     visualization_file: str | None = None
+    # Detailed metrics file (generated in DETECT_CHORUS step)
+    detailed_metrics_file: str | None = None
     # Флаг для использования транскрипции как текста песни (когда lyrics не найден)
     use_transcription_as_lyrics: bool = False
     # Временный файл с текстом, сгенерированным из транскрипции (для подтверждения)

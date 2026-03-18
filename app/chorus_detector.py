@@ -81,6 +81,44 @@ class SegmentScore:
 
 
 @dataclass
+class MetricsPoint:
+    """Точка метрики с временным шагом 1 секунда.
+    
+    Attributes
+    ----------
+    time:
+        Временная метка в секундах (0, 1, 2, ...).
+    vocal_energy:
+        Нормализованная энергия вокала [0, 1].
+    chroma_variance:
+        Вариативность chroma features [0, 1].
+    hpss_score:
+        Harmonic-percussive separation score [0, 1].
+    """
+    time: float
+    vocal_energy: float = 0.0
+    chroma_variance: float = 0.0
+    hpss_score: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "time": self.time,
+            "vocal_energy": self.vocal_energy,
+            "chroma_variance": self.chroma_variance,
+            "hpss_score": self.hpss_score,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MetricsPoint":
+        return cls(
+            time=float(data.get("time", 0.0)),
+            vocal_energy=float(data.get("vocal_energy", 0.0)),
+            chroma_variance=float(data.get("chroma_variance", 0.0)),
+            hpss_score=float(data.get("hpss_score", 0.0)),
+        )
+
+
+@dataclass
 class SegmentInfo:
     """Расширенная информация о сегменте, найденном детектором.
 
@@ -208,6 +246,29 @@ class VolumeSegment:
 # ---------------------------------------------------------------------------
 # Module-level helper functions
 # ---------------------------------------------------------------------------
+
+
+def save_detailed_metrics(
+    metrics: list[MetricsPoint],
+    output_path: Path,
+) -> None:
+    """Сохранить детальные метрики в JSON-файл.
+    
+    Формат: плоский массив объектов с полями time, vocal_energy, chroma_variance, hpss_score.
+    """
+    data = [m.to_dict() for m in metrics]
+    output_path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def load_detailed_metrics(input_path: Path) -> list[MetricsPoint]:
+    """Загрузить детальные метрики из JSON-файла."""
+    if not input_path.exists():
+        return []
+    data = json.loads(input_path.read_text(encoding="utf-8"))
+    return [MetricsPoint.from_dict(m) for m in data]
 
 
 def _merge_boundaries(
@@ -542,6 +603,63 @@ def load_volume_segments(input_path: Path) -> list[VolumeSegment]:
 
 
 # ---------------------------------------------------------------------------
+# FrameFeatures dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FrameFeatures:
+    """Frame-level признаки аудио для двухэтапной агрегации.
+    
+    Содержит сырые frame-level данные, из которых можно вычислить
+    все агрегированные метрики: по сегментам и по секундам.
+    
+    Attributes
+    ----------
+    times:
+        Временные метки кадров в секундах (массив float, shape: [n_frames]).
+        Для hop_length=512 и sr=22050: frames_per_sec ≈ 43.07
+    
+    vocal_energy:
+        RMS энергия вокала для каждого кадра [0, 1], shape: [n_frames].
+        Вычисляется из vocal_file или audio_file.
+    
+    chroma:
+        Chroma features, shape: [12, n_frames].
+        Нужно для: chroma_variance (var по 12 бинам) и sim_score (recurrence_matrix).
+    
+    rms_harmonic:
+        RMS гармонической части после HPSS, shape: [n_frames].
+        Нужно для: hpss_score.
+    
+    tempo:
+        Tempogram (rhythmic stability), shape: [n_tempo_bins, n_frames].
+        Нужно для: tempo_score (CV по доминантному темпу).
+    
+    sr:
+        Sample rate (обычно 22050).
+    
+    hop_length:
+        Hop length для фреймов (обычно 512).
+    """
+    times: np.ndarray
+    vocal_energy: np.ndarray
+    chroma: np.ndarray
+    rms_harmonic: np.ndarray
+    tempo: np.ndarray
+    sr: int = 22050
+    hop_length: int = 512
+    
+    @property
+    def frames_per_sec(self) -> float:
+        return self.sr / self.hop_length
+    
+    @property
+    def duration(self) -> float:
+        return len(self.times) / self.frames_per_sec
+
+
+# ---------------------------------------------------------------------------
 # ChorusDetector class
 # ---------------------------------------------------------------------------
 
@@ -590,7 +708,7 @@ class ChorusDetector:
         self,
         audio_file: str,
         vocal_file: str | None = None,
-    ) -> list[SegmentInfo]:
+    ) -> tuple[list[SegmentInfo], list[MetricsPoint]]:
         """Определить сегменты с расширенной информацией.
 
         Если ``vocal_file`` передан — использует двухфайловый подход:
@@ -607,14 +725,16 @@ class ChorusDetector:
 
         Returns
         -------
-        list[SegmentInfo]
-            Список объектов :class:`SegmentInfo` для каждого найденного сегмента.
-            Возвращает пустой список, если определить структуру не удалось.
+        tuple[list[SegmentInfo], list[MetricsPoint]]
+            Кортеж из:
+            - списка объектов :class:`SegmentInfo` для каждого найденного сегмента
+            - списка объектов :class:`MetricsPoint` с детальными метриками (1с шаг)
+            Возвращает пустые списки, если определить структуру не удалось.
         """
         audio_path = Path(audio_file)
         if not audio_path.exists():
             logger.warning("ChorusDetector: audio file not found: '%s'", audio_file)
-            return []
+            return [], []
 
         backend_name = "dual_file" if vocal_file else "single_file"
         logger.debug(
@@ -630,7 +750,7 @@ class ChorusDetector:
             logger.warning(
                 "ChorusDetector: msaf returned no boundaries for '%s'", audio_file
             )
-            return []
+            return [], []
 
         boundaries_vocal: list[float] = []
         if vocal_file:
@@ -667,7 +787,7 @@ class ChorusDetector:
                 self._min_duration,
                 audio_file,
             )
-            return []
+            return [], []
 
         logger.debug(
             "ChorusDetector: %d segments after merging and filtering: %s",
@@ -675,17 +795,32 @@ class ChorusDetector:
             [(f"{s:.1f}", f"{e:.1f}") for s, e in segments],
         )
 
-        # Шаг 3: Вычислить vocal_energy для каждого сегмента
-        if vocal_file and Path(vocal_file).exists():
-            vocal_energy_list = _compute_vocal_energy_per_segment(vocal_file, segments)
+        # Шаг 3: Один проход извлечения frame-level признаков
+        frame_features = self._extract_frame_features(audio_file, vocal_file)
+        
+        if frame_features is None:
+            # Fallback: используем старый метод
+            logger.warning(
+                "ChorusDetector: frame feature extraction failed, falling back to legacy method"
+            )
+            if vocal_file and Path(vocal_file).exists():
+                vocal_energy_list = _compute_vocal_energy_per_segment(vocal_file, segments)
+            else:
+                vocal_energy_list = [1.0] * len(segments)
+            features_list = self._enrich_segments_with_librosa(
+                audio_file, segments, vocal_energy_list
+            )
         else:
-            # Нет данных о вокале — считаем вокал везде
-            vocal_energy_list = [1.0] * len(segments)
-
-        # Шаг 4: Обогатить сегменты признаками librosa
-        features_list = self._enrich_segments_with_librosa(
-            audio_file, segments, vocal_energy_list
-        )
+            # Агрегация по сегментам
+            features_list = self._aggregate_segment_features(frame_features, segments)
+        
+        # Шаг 4: Агрегация по секундам для детальных метрик
+        audio_duration = float(np.max(frame_features.times)) if frame_features is not None else 0.0
+        detailed_metrics: list[MetricsPoint] = []
+        if frame_features is not None and audio_duration > 0:
+            detailed_metrics = self._aggregate_detailed_metrics(
+                frame_features, audio_duration
+            )
 
         # Шаг 5: Классифицировать сегменты
         total_segments = len(segments)
@@ -729,7 +864,13 @@ class ChorusDetector:
             audio_file,
             [(s.start, s.end, s.segment_type) for s in result],
         )
-        return result
+        logger.debug(
+            "ChorusDetector[%s]: generated %d detailed metric points for '%s'",
+            backend_name,
+            len(detailed_metrics),
+            audio_file,
+        )
+        return result, detailed_metrics
 
     def _merge_short_segments_internal(
         self,
@@ -828,6 +969,294 @@ class ChorusDetector:
             return []
 
         return [float(b) for b in boundaries]
+
+    # ------------------------------------------------------------------
+    # Private: frame-level feature extraction (optimized single pass)
+    # ------------------------------------------------------------------
+
+    def _extract_frame_features(
+        self,
+        audio_file: str,
+        vocal_file: str | None,
+    ) -> FrameFeatures | None:
+        """Извлечь frame-level признаки из аудио (один проход).
+        
+        Загружает аудио один раз, вычисляет все признаки на уровне кадров.
+        Возвращает данные для последующей агрегации.
+        
+        Parameters
+        ----------
+        audio_file:
+            Путь к основному аудиофайлу.
+        vocal_file:
+            Путь к файлу вокала (опционально).
+            
+        Returns
+        -------
+        FrameFeatures | None
+            Frame-level признаки или None при ошибке.
+        """
+        try:
+            import librosa  # type: ignore[import]
+        except ImportError:
+            logger.error(
+                "ChorusDetector: librosa is not installed. Install it with: uv add librosa"
+            )
+            return None
+
+        try:
+            logger.debug("ChorusDetector[_extract_frame_features]: loading audio '%s'", audio_file)
+            y, sr = librosa.load(audio_file, sr=22050, mono=True)
+        except Exception as exc:
+            logger.warning(
+                "ChorusDetector[_extract_frame_features]: failed to load audio '%s': %s",
+                audio_file,
+                exc,
+            )
+            return None
+
+        hop_length = 512
+        frame_length = 2048
+        frames_per_sec = sr / hop_length
+        n_frames = 1 + (len(y) - frame_length) // hop_length
+        times = np.arange(n_frames) / frames_per_sec
+
+        # vocal_energy: RMS from vocal_file or audio_file
+        try:
+            if vocal_file and Path(vocal_file).exists():
+                y_vocal, _ = librosa.load(vocal_file, sr=sr, mono=True)
+                rms = librosa.feature.rms(
+                    y=y_vocal, frame_length=frame_length, hop_length=hop_length
+                )[0]
+            else:
+                rms = librosa.feature.rms(
+                    y=y, frame_length=frame_length, hop_length=hop_length
+                )[0]
+            # Normalize to [0, 1]
+            max_rms = float(np.max(rms)) if len(rms) > 0 else 1.0
+            if max_rms > 0:
+                vocal_energy = rms / max_rms
+            else:
+                vocal_energy = np.zeros_like(rms)
+        except Exception as exc:
+            logger.warning(
+                "ChorusDetector[_extract_frame_features]: vocal_energy computation failed: %s", exc
+            )
+            vocal_energy = np.ones(n_frames) * 0.5
+
+        # chroma features
+        try:
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+            # Pad or truncate to match n_frames
+            if chroma.shape[1] < n_frames:
+                chroma = np.pad(chroma, ((0, 0), (0, n_frames - chroma.shape[1])), mode='edge')
+            elif chroma.shape[1] > n_frames:
+                chroma = chroma[:, :n_frames]
+        except Exception as exc:
+            logger.warning(
+                "ChorusDetector[_extract_frame_features]: chroma computation failed: %s", exc
+            )
+            chroma = np.zeros((12, n_frames))
+
+        # rms_harmonic from HPSS
+        try:
+            y_harmonic, _ = librosa.effects.hpss(y)
+            rms_harmonic_full = librosa.feature.rms(
+                y=y_harmonic, frame_length=frame_length, hop_length=hop_length
+            )[0]
+            # Normalize
+            max_harm = float(np.max(rms_harmonic_full)) if len(rms_harmonic_full) > 0 else 1.0
+            if max_harm > 0:
+                rms_harmonic = rms_harmonic_full / max_harm
+            else:
+                rms_harmonic = np.zeros_like(rms_harmonic_full)
+        except Exception as exc:
+            logger.warning(
+                "ChorusDetector[_extract_frame_features]: HPSS computation failed: %s", exc
+            )
+            rms_harmonic = np.zeros(n_frames)
+
+        # tempogram
+        try:
+            oenv = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+            tempo = librosa.feature.tempogram(
+                onset_envelope=oenv, sr=sr, hop_length=hop_length
+            )
+            # Pad or truncate to match n_frames
+            if tempo.shape[1] < n_frames:
+                tempo = np.pad(tempo, ((0, 0), (0, n_frames - tempo.shape[1])), mode='edge')
+            elif tempo.shape[1] > n_frames:
+                tempo = tempo[:, :n_frames]
+        except Exception as exc:
+            logger.warning(
+                "ChorusDetector[_extract_frame_features]: tempogram computation failed: %s", exc
+            )
+            tempo = np.zeros((384, n_frames))  # default tempogram size
+
+        return FrameFeatures(
+            times=times,
+            vocal_energy=vocal_energy[:n_frames],
+            chroma=chroma,
+            rms_harmonic=rms_harmonic[:n_frames],
+            tempo=tempo,
+            sr=sr,
+            hop_length=hop_length,
+        )
+
+    def _aggregate_segment_features(
+        self,
+        frame_features: FrameFeatures,
+        segments: list[tuple[float, float]],
+    ) -> list[dict]:
+        """Агрегировать frame-level признаки по сегментам.
+        
+        Вычисляет: sim_score, hpss_score, tempo_score, vocal_energy, chroma_variance
+        
+        Parameters
+        ----------
+        frame_features:
+            Frame-level признаки из `_extract_frame_features()`.
+        segments:
+            Список кортежей (start, end) для каждого сегмента.
+            
+        Returns
+        -------
+        list[dict]
+            Список словарей с агрегированными признаками.
+        """
+        raw_features: list[dict] = []
+        n_frames = len(frame_features.times)
+        
+        for start, end in segments:
+            f_start = int(start * frame_features.frames_per_sec)
+            f_end = int(end * frame_features.frames_per_sec)
+            f_start = max(0, min(f_start, n_frames - 1))
+            f_end = max(f_start + 1, min(f_end, n_frames))
+            
+            # vocal_energy: mean по кадрам сегмента
+            vocal_energy = float(np.mean(
+                frame_features.vocal_energy[f_start:f_end]
+            )) if f_end > f_start else 0.0
+            
+            # chroma_variance: mean(var(chroma, axis=0)) по кадрам сегмента
+            seg_chroma = frame_features.chroma[:, f_start:f_end]
+            chroma_variance = float(np.mean(np.var(seg_chroma, axis=0))) \
+                if f_end > f_start and seg_chroma.shape[1] > 0 else 0.0
+            
+            # hpss_score: mean(rms_harmonic)
+            hpss_score = float(np.mean(
+                frame_features.rms_harmonic[f_start:f_end]
+            )) if f_end > f_start else 0.0
+            
+            # tempo_score: CV по доминантному темпу
+            tempo_score = 0.0
+            seg_tempo = frame_features.tempo[:, f_start:f_end]
+            if seg_tempo.shape[1] > 0:
+                dominant_idx = np.argmax(np.mean(seg_tempo, axis=1))
+                tempo_series = seg_tempo[dominant_idx, :]
+                if len(tempo_series) > 1:
+                    std = float(np.std(tempo_series))
+                    mean = float(np.mean(tempo_series))
+                    cv = std / (mean + 1e-8)
+                    tempo_score = max(0.0, 1.0 - cv)
+            
+            # sim_score: извлекаем из chroma сегмента
+            sim_score = 0.0
+            if seg_chroma.shape[1] > 1:
+                try:
+                    import librosa  # type: ignore[import]
+                    chroma_norm = librosa.util.normalize(seg_chroma, axis=0)
+                    sim_matrix = librosa.segment.recurrence_matrix(
+                        chroma_norm, mode="affinity", metric="cosine", sparse=False
+                    )
+                    sim_score = float(np.mean(sim_matrix))
+                except Exception:
+                    sim_score = 0.0
+            
+            raw_features.append({
+                "vocal_energy": vocal_energy,
+                "chroma_variance": chroma_variance,
+                "hpss_score": hpss_score,
+                "tempo_score": tempo_score,
+                "sim_score": sim_score,
+            })
+        
+        # Нормализация tempo_score и chroma_variance по всем сегментам
+        tempo_scores = [f["tempo_score"] for f in raw_features]
+        max_tempo = max(tempo_scores) if tempo_scores else 0.0
+        if max_tempo > 0:
+            for f in raw_features:
+                f["tempo_score"] = f["tempo_score"] / max_tempo
+        
+        chroma_vars = [f["chroma_variance"] for f in raw_features]
+        max_chroma_var = max(chroma_vars) if chroma_vars else 0.0
+        if max_chroma_var > 0:
+            for f in raw_features:
+                f["chroma_variance"] = f["chroma_variance"] / max_chroma_var
+        
+        return raw_features
+
+    def _aggregate_detailed_metrics(
+        self,
+        frame_features: FrameFeatures,
+        duration: float,
+        aggregate_sec: float = 1.0,
+    ) -> list[MetricsPoint]:
+        """Агрегировать frame-level признаки по временным окнам.
+        
+        Для детальных метрик сохраняем: vocal_energy, chroma_variance, hpss_score
+        (без sim_score и tempo_score, т.к. они требуют контекста всего сегмента).
+        
+        Parameters
+        ----------
+        frame_features:
+            Frame-level признаки из `_extract_frame_features()`.
+        duration:
+            Общая длительность трека в секундах.
+        aggregate_sec:
+            Шаг агрегации в секундах (по умолчанию 1.0).
+            
+        Returns
+        -------
+        list[MetricsPoint]
+            Список точек метрик с шагом aggregate_sec.
+        """
+        metrics: list[MetricsPoint] = []
+        n_frames = len(frame_features.times)
+        num_points = int(duration / aggregate_sec) + 1
+        
+        for i in range(num_points):
+            t_start = i * aggregate_sec
+            t_end = min(t_start + aggregate_sec, duration)
+            
+            f_start = int(t_start * frame_features.frames_per_sec)
+            f_end = int(t_end * frame_features.frames_per_sec)
+            f_start = max(0, min(f_start, n_frames - 1))
+            f_end = max(f_start + 1, min(f_end, n_frames))
+            
+            # vocal_energy: mean по кадрам окна
+            vocal_energy = float(np.mean(
+                frame_features.vocal_energy[f_start:f_end]
+            )) if f_end > f_start else 0.0
+            
+            # chroma_variance: mean(var по 12 бинам)
+            seg_chroma = frame_features.chroma[:, f_start:f_end]
+            chroma_variance = float(np.mean(np.var(seg_chroma, axis=0))) \
+                if f_end > f_start and seg_chroma.shape[1] > 0 else 0.0
+            
+            # hpss_score: mean(rms_harmonic)
+            hpss_score = float(np.mean(
+                frame_features.rms_harmonic[f_start:f_end]
+            )) if f_end > f_start else 0.0
+            
+            metrics.append(MetricsPoint(
+                time=t_start,
+                vocal_energy=vocal_energy,
+                chroma_variance=chroma_variance,
+                hpss_score=hpss_score,
+            ))
+        
+        return metrics
 
     # ------------------------------------------------------------------
     # Private: librosa feature enrichment
