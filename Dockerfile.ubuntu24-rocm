@@ -1,0 +1,82 @@
+# syntax=docker/dockerfile:1
+# Ubuntu 24.04 + ROCm - Экспериментальный Dockerfile для AMD GPU
+# 
+# ⚠️ ПРЕДУПРЕЖДЕНИЕ: Этот образ предназначен только для экспериментов!
+# - Размер образа: ~5 GB (в 10 раз больше CPU-only)
+# - Требует ROCm runtime на хосте (amd-smi, /dev/kfd, /dev/dri)
+# - Для AMD iGPU (Rembrandt 680M) прирост производительности не гарантирован
+#
+# Рекомендуется использовать Dockerfile.ubuntu24 (CPU-only) для production
+
+FROM rocm/pytorch:rocm6.0_ubuntu24.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install additional system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsndfile1 \
+    git \
+    build-essential \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Install UV - быстрый менеджер зависимостей Python
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /app /tracks && \
+    chown -R appuser:appuser /app /tracks
+
+# Set working directory
+WORKDIR /app
+
+# Copy dependency files
+COPY --chown=appuser:appuser pyproject.toml uv.lock ./
+
+# Install Python dependencies
+# PyTorch уже установлен в базовом образе с ROCm поддержкой
+RUN uv sync --frozen --no-dev
+
+# Copy application code
+COPY --chown=appuser:appuser app/ ./app/
+
+# Switch to non-root user
+USER appuser
+
+# Environment variables
+ENV TRACKS_ROOT_DIR=/tracks \
+    UV_PYTHON=python3.10 \
+    HSA_OVERRIDE_GFX_VERSION=10.3.0
+
+# Note: HSA_OVERRIDE_GFX_VERSION может потребоваться для Rembrandt iGPU
+# Значение 10.3.0 соответствует RDNA 2 архитектуре
+
+# Default command
+CMD ["uv", "run", "python", "-m", "app.main"]
+
+# Labels
+LABEL maintainer="karaoke-bot" \
+      base.image="rocm/pytorch:rocm6.0_ubuntu24.04" \
+      python.version="3.10" \
+      variant="rocm-amd-gpu" \
+      gpu.support="AMD ROCm 6.0" \
+      warning="Experimental! Use CPU-only variant for production."
+
+# Build command:
+# docker build -f Dockerfile.ubuntu24-rocm -t karaoke-bot:rocm .
+#
+# Run command (requires ROCm runtime on host):
+# docker run --device=/dev/kfd --device=/dev/dri \
+#            --group-add video \
+#            --security-opt seccomp=unconfined \
+#            -v $(pwd)/tracks:/tracks \
+#            karaoke-bot:rocm

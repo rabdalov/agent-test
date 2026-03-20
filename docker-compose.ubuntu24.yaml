@@ -1,0 +1,83 @@
+# Docker Compose для Ubuntu 24.04 LTS
+# 
+# Варианты использования:
+# 1. CPU-only (рекомендуется для AMD iGPU):
+#    docker-compose -f docker-compose.ubuntu24.yaml up
+#
+# 2. С GPU (NVIDIA - раскомментируйте секцию deploy):
+#    docker-compose -f docker-compose.ubuntu24.yaml up
+#
+# 3. С GPU (AMD ROCm - используйте docker-compose.ubuntu24-rocm.yaml)
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.ubuntu24
+    container_name: karaoke-bot-ubuntu24
+    
+    # Environment variables from .env file
+    env_file:
+      - .env
+    
+    # Additional environment overrides
+    environment:
+      - TRACKS_ROOT_DIR=/tracks
+      - PYTHONUNBUFFERED=1
+    
+    volumes:
+      # Mount tracks directory for persistent storage
+      - ./tracks:/tracks
+      
+      # Optional: Mount models cache for faster startup
+      # - ./models:/home/appuser/.cache
+      
+      # Optional: Mount logs directory
+      # - ./logs:/app/logs
+    
+    # Uncomment for NVIDIA GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    
+    # Resource limits (optional, adjust based on your system)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '4'
+    #       memory: 8G
+    #     reservations:
+    #       cpus: '2'
+    #       memory: 4G
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "import app; print('OK')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Optional: Define volumes for named persistence
+# volumes:
+#   tracks_data:
+#   models_cache:
+
+# Optional: Define network
+# networks:
+#   karaoke-network:
+#     driver: bridge

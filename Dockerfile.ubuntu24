@@ -1,0 +1,94 @@
+# syntax=docker/dockerfile:1
+# Ubuntu 24.04 LTS (Noble) - Production Dockerfile for Karaoke Bot
+# CPU-only variant с FFmpeg 8.0 (статическая сборка)
+#
+# Рекомендация: Для AMD iGPU CPU-only вариант стабильнее и проще ROCm
+# FFmpeg 8.0 установлен через статическую сборку для максимальной производительности
+
+FROM ubuntu:24.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install FFmpeg 8.0 from static build
+# Используем официальные сборки johnvansickle.com
+# Размер: ~40 MB за счёт статической сборки с полным набором кодеков
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    xz-utils \
+    ca-certificates \
+    && wget -q https://johnvansickle.com/ffmpeg/releases/ffmpeg-8.0-amd64-static.tar.xz \
+    && tar -xf ffmpeg-8.0-amd64-static.tar.xz \
+    && mv ffmpeg-8.0-amd64-static/ffmpeg /usr/local/bin/ffmpeg \
+    && mv ffmpeg-8.0-amd64-static/ffprobe /usr/local/bin/ffprobe \
+    && rm -rf ffmpeg-8.0-amd64-static* \
+    && ffmpeg -version | head -1 \
+    && apt-get purge -y wget xz-utils \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install system dependencies
+# - python3.12: основной интерпретатор
+# - libsndfile1: аудио I/O для librosa
+# - git: для установки пакетов из репозиториев
+# - build-essential: компиляторы для C-расширений
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-venv \
+    python3-pip \
+    libsndfile1 \
+    git \
+    build-essential \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Install UV - быстрый менеджер зависимостей Python
+# Используем официальный образ UV для копирования бинарников
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /app /tracks && \
+    chown -R appuser:appuser /app /tracks
+
+# Set working directory
+WORKDIR /app
+
+# Copy dependency files first for better layer caching
+COPY --chown=appuser:appuser pyproject.toml uv.lock ./
+
+# Install Python dependencies using UV
+# --frozen: использовать uv.lock без обновления
+# --no-dev: не устанавливать dev-зависимости
+RUN uv sync --frozen --no-dev
+
+# Copy application code
+COPY --chown=appuser:appuser app/ ./app/
+
+# Switch to non-root user
+USER appuser
+
+# Environment variables for the application
+ENV TRACKS_ROOT_DIR=/tracks \
+    UV_PYTHON=python3.12
+
+# Default command
+CMD ["uv", "run", "python", "-m", "app.main"]
+
+# Health check (optional, можно включить при необходимости)
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+#     CMD uv run python -c "import app; print('OK')" || exit 1
+
+# Labels for documentation
+LABEL maintainer="karaoke-bot" \
+      base.image="ubuntu:24.04" \
+      ffmpeg.version="8.0-static" \
+      python.version="3.12" \
+      variant="cpu-only" \
+      gpu.support="none (CPU-only recommended for AMD iGPU)"
