@@ -2,14 +2,6 @@
 
 Документация диаграмм взаимодействия пользователя с ботом через Telegram.
 
-## Цветовое кодирование
-
-- **Синий** — команды пользователя
-- **Зелёный** — ответы бота
-- **Оранжевый** — FSM переходы
-- **Красный** — Admin действия
-- **Серый** — Pipeline шаги
-
 ---
 
 ## 1. Базовый сценарий обработки трека
@@ -22,45 +14,45 @@ sequenceDiagram
     participant FSM as 📋 FSM
     participant P as ⚙️ Pipeline
 
-    U->>B: <span style="color:blue">/start</span>
-    B->>U: <span style="color:green">Привет! Отправьте аудио или ссылку...</span>
+    U->>B: /start
+    B->>U: Привет! Отправьте аудио или ссылку...
 
-    U->>B: <span style="color:blue">[аудио файл]</span>
-    B->>FSM: <span style="color:orange">set_state(TrackLangStates)</span>
-    B->>U: <span style="color:green">⏳ Принято в обработку<br/>track_id: abc123...</span>
+    U->>B: [аудио файл]
+    B->>FSM: set_state(TrackLangStates)
+    B->>U: ⏳ Принято в обработку<br/>track_id: abc123...
 
     alt Язык не определён
-        B->>U: <span style="color:green">Выберите язык:</span>
+        B->>U: Выберите язык:
         Note over B,U: [RU] [EN] [AUTO]
-        U->>B: <span style="color:blue">RU</span>
-        B->>FSM: <span style="color:orange">clear_state()</span>
+        U->>B: RU
+        B->>FSM: clear_state()
     end
 
-    B->>P: <span style="color:gray">DOWNLOAD</span>
+    B->>P: DOWNLOAD
     P-->>B: ✅
-    B->>U: <span style="color:green">✅ DOWNLOAD завершён</span>
+    B->>U: ✅ DOWNLOAD завершён
 
     alt Текст песни не найден
-        B->>U: <span style="color:green">Текст не найден. Выберите:</span>
+        B->>U: Текст не найден. Выберите:
         Note over B,U: [📝 Транскрипция] [📤 Загрузить]
         
         alt Выбрана Транскрипция
-            U->>B: <span style="color:blue">📝 Транскрипция</span>
-            B->>FSM: <span style="color:orange">set_state(LyricsConfirmStates)</span>
-            B->>P: <span style="color:gray">GENERATE_LYRICS</span>
-            B->>U: <span style="color:green">Предпросмотр текста...<br/>[✅ Ок] [📤 Загрузить]</span>
-            U->>B: <span style="color:blue">✅ Ок</span>
-            B->>FSM: <span style="color:orange">clear_state()</span>
+            U->>B: 📝 Транскрипция
+            B->>FSM: set_state(LyricsConfirmStates)
+            B->>P: GENERATE_LYRICS
+            B->>U: Предпросмотр текста...<br/>[✅ Ок] [📤 Загрузить]
+            U->>B: ✅ Ок
+            B->>FSM: clear_state()
         end
     end
 
     loop Pipeline Steps
-        P->>P: <span style="color:gray">SEPARATE → TRANSCRIBE → ALIGN...</span>
-        B->>U: <span style="color:green">✅ Шаг завершён (редактирование)</span>
+        P->>P: SEPARATE → TRANSCRIBE → ALIGN...
+        B->>U: ✅ Шаг завершён (редактирование)
     end
 
     P->>B: COMPLETED
-    B->>U: <span style="color:green">🎉 Готово!<br/>📥 Скачать: [ссылка]</span>
+    B->>U: 🎉 Готово!<br/>📥 Скачать: [ссылка]
 ```
 
 ---
@@ -76,11 +68,11 @@ sequenceDiagram
     participant Store as 💾 Хранилище
     participant YM as 🎵 Яндекс Музыка
 
-    U->>B: <span style="color:blue">/search</span>
-    B->>FSM: <span style="color:orange">set_state(SearchStates)</span>
-    B->>U: <span style="color:green">Введите название трека или исполнителя:</span>
+    U->>B: /search
+    B->>FSM: set_state(SearchStates)
+    B->>U: Введите название трека или исполнителя:
 
-    U->>B: <span style="color:blue"> Beatles Yesterday</span>
+    U->>B: Beatles Yesterday
     
     par Параллельный поиск
         B->>Store: Поиск локально
@@ -89,17 +81,17 @@ sequenceDiagram
         YM-->>B: Результаты (топ-5)
     end
 
-    B->>U: <span style="color:green">Найдено:<br/>1. [Локально] Beatles - Yesterday<br/>2. [Яндекс] Beatles - Yesterday<br/>...</span>
+    B->>U: Найдено:<br/>1. [Локально] Beatles - Yesterday<br/>2. [Яндекс] Beatles - Yesterday<br/>...
     Note over B,U: Inline-кнопки выбора
 
-    U->>B: <span style="color:blue">[Выбрать: 1. Локально]</span>
-    B->>FSM: <span style="color:orange">clear_state()</span>
+    U->>B: [Выбрать: 1. Локально]
+    B->>FSM: clear_state()
     
     alt Локальный файл
-        B->>U: <span style="color:green">Запуск пайплайна с пропуском DOWNLOAD...</span>
+        B->>U: Запуск пайплайна с пропуском DOWNLOAD...
         Note over B: Начинается с SEPARATE
     else Яндекс Музыка
-        B->>U: <span style="color:green">Загрузка и запуск пайплайна...</span>
+        B->>U: Загрузка и запуск пайплайна...
         Note over B: Начинается с DOWNLOAD
     end
 ```
@@ -116,25 +108,25 @@ sequenceDiagram
     participant FSM as 📋 FSM
     participant SCS as 🔄 SegmentChangeService
 
-    U->>B: <span style="color:blue">/change 5-10</span>
+    U->>B: /change 5-10
     B->>SCS: Парсинг диапазона
     
     alt Некорректный диапазон
-        B->>U: <span style="color:green">❌ Неверный формат. Используйте: 1,2,3 или 5-10</span>
+        B->>U: ❌ Неверный формат. Используйте: 1,2,3 или 5-10
     else Корректный диапазон
-        B->>FSM: <span style="color:orange">set_state(SegmentChangeStates)</span>
-        B->>U: <span style="color:green">Выберите тип для сегментов 5-10:</span>
+        B->>FSM: set_state(SegmentChangeStates)
+        B->>U: Выберите тип для сегментов 5-10:
         Note over B,U: [🎵 Chorus] [🎤 Verse] [🎹 Instrumental]
         
-        U->>B: <span style="color:blue">🎵 Chorus</span>
+        U->>B: 🎵 Chorus
         B->>SCS: Изменить тип
         SCS-->>B: ✅ Тип изменён, volume пересчитан
         
-        B->>U: <span style="color:green">✅ Сегменты 5-10 изменены на Chorus<br/>[🔄 Пересчитать]</span>
+        B->>U: ✅ Сегменты 5-10 изменены на Chorus<br/>[🔄 Пересчитать]
         
-        U->>B: <span style="color:blue">🔄 Пересчитать</span>
-        B->>FSM: <span style="color:orange">clear_state()</span>
-        B->>U: <span style="color:green">Перезапуск с шага MIX_AUDIO...</span>
+        U->>B: 🔄 Пересчитать
+        B->>FSM: clear_state()
+        B->>U: Перезапуск с шага MIX_AUDIO...
     end
 ```
 
@@ -150,25 +142,25 @@ sequenceDiagram
     participant B as 🤖 Бот
     participant S as ⚙️ Settings
 
-    NU->>B: <span style="color:blue">Любое сообщение</span>
+    NU->>B: Любое сообщение
     B->>S: is_user_allowed(NU.id)?
     S-->>B: false
     B->>S: is_user_denied(NU.id)?
     S-->>B: false
     
-    B->>A: <span style="color:red">⚠️ Запрос доступа</span>
+    B->>A: ⚠️ Запрос доступа
     Note over B,A: ID: 123456789<br/>Имя: @newuser<br/>[✅ Добавить] [❌ Отклонить]
 
     alt Администратор разрешает
-        A->>B: <span style="color:red">✅ Добавить</span>
+        A->>B: ✅ Добавить
         B->>S: add_allowed_user(NU.id)
-        B->>NU: <span style="color:green">✅ Доступ разрешён!<br/>Отправьте /start</span>
-        B->>A: <span style="color:green">Пользователь добавлен</span>
+        B->>NU: ✅ Доступ разрешён!<br/>Отправьте /start
+        B->>A: Пользователь добавлен
     else Администратор отклоняет
-        A->>B: <span style="color:red">❌ Отклонить</span>
+        A->>B: ❌ Отклонить
         B->>S: add_denied_user(NU.id)
-        B->>NU: <span style="color:green">⛔ Доступ отклонён</span>
-        B->>A: <span style="color:green">Пользователь отклонён</span>
+        B->>NU: ⛔ Доступ отклонён
+        B->>A: Пользователь отклонён
         
         Note over NU,B: Последующие сообщения игнорируются
     end
@@ -188,23 +180,23 @@ sequenceDiagram
 
     Note over U,B: Произошла ошибка на шаге TRANSCRIBE
     
-    U->>B: <span style="color:blue">/continue</span>
+    U->>B: /continue
     B->>S: Загрузка последнего состояния
     S-->>B: status=FAILED, current_step=TRANSCRIBE
     
     alt Артефакты на месте
         B->>P: from_state(state)
         B->>P: run(start_from_step=TRANSCRIBE)
-        B->>U: <span style="color:green">🔄 Возобновление с шага TRANSCRIBE...</span>
+        B->>U: 🔄 Возобновление с шага TRANSCRIBE...
         
         loop Продолжение пайплайна
             P->>P: TRANSCRIBE → ALIGN → ...
-            B->>U: <span style="color:green">✅ Шаг завершён</span>
+            B->>U: ✅ Шаг завершён
         end
         
-        B->>U: <span style="color:green">🎉 Готово!</span>
+        B->>U: 🎉 Готово!
     else Артефакты потеряны
-        B->>U: <span style="color:green">❌ Невозможно продолжить. Начните заново.</span>
+        B->>U: ❌ Невозможно продолжить. Начните заново.
     end
 ```
 
