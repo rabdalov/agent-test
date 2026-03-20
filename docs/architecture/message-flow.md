@@ -134,6 +134,18 @@ sequenceDiagram
 
 ## 4. Сценарий управления доступом (Admin Flow)
 
+### Алгоритм проверки доступа
+
+Доступ разрешён, если выполняется **любое** из условий:
+1. Пользователь является администратором (`user_id == ADMIN_ID`)
+2. Пользователь явно добавлен в список разрешённых (`allowed_users`)
+3. Пользователь есть в списке `TLG_ALLOWED_ID`
+
+Доступ **отклонён** (без уведомления администратора), если:
+- Пользователь в списке `denied_users`
+
+Новые пользователи **не имеют доступа по умолчанию** — если списки пусты, доступ запрещён.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -143,27 +155,100 @@ sequenceDiagram
     participant S as ⚙️ Settings
 
     NU->>B: Любое сообщение
-    B->>S: is_user_allowed(NU.id)?
-    S-->>B: false
+    B->>B: _is_user_allowed(NU.id)
+    Note over B: Проверка: admin? → denied? → allowed?
     B->>S: is_user_denied(NU.id)?
     S-->>B: false
+    B->>S: is_user_allowed(NU.id)?
+    S-->>B: false
+    B->>S: user_id in tlg_allowed_id?
+    S-->>B: false
     
+    B->>NU: ⛔ У вас нет доступа к этому боту
     B->>A: ⚠️ Запрос доступа
     Note over B,A: ID: 123456789<br/>Имя: @newuser<br/>[✅ Добавить] [❌ Отклонить]
 
     alt Администратор разрешает
         A->>B: ✅ Добавить
         B->>S: add_allowed_user(NU.id)
-        B->>NU: ✅ Доступ разрешён!<br/>Отправьте /start
-        B->>A: Пользователь добавлен
+        B->>NU: ✅ Вам предоставлен доступ к боту!<br/>Отправьте /start
+        B->>A: ✅ Пользователь добавлен
     else Администратор отклоняет
         A->>B: ❌ Отклонить
         B->>S: add_denied_user(NU.id)
-        B->>NU: ⛔ Доступ отклонён
-        B->>A: Пользователь отклонён
+        B->>NU: ❌ Ваш запрос на доступ к боту отклонён
+        B->>A: ❌ Пользователь отклонён
         
         Note over NU,B: Последующие сообщения игнорируются
     end
+```
+
+### Реализация в коде
+
+**Проверка доступа для сообщений:**
+```python
+# app/handlers_karaoke.py
+
+def _is_user_allowed(self, message: types.Message) -> bool:
+    """Return True if the sender's user_id is in the allowed list."""
+    user_id = message.from_user.id if message.from_user else None
+    if user_id is None:
+        return False
+    # Admin always has access
+    if user_id == self._settings.admin_id:
+        return True
+    if self._settings.is_user_denied(user_id):
+        return False
+    if self._settings.is_user_allowed(user_id):
+        return True
+    allowed = self._settings.tlg_allowed_id
+    return user_id in allowed
+```
+
+**Проверка доступа для callback-запросов:**
+```python
+def _is_user_id_allowed(self, user_id: int | None) -> bool:
+    """Return True if the user_id is allowed (for callback handlers)."""
+    if user_id is None:
+        return False
+    # Admin always has access
+    if user_id == self._settings.admin_id:
+        return True
+    if self._settings.is_user_denied(user_id):
+        return False
+    if self._settings.is_user_allowed(user_id):
+        return True
+    allowed = self._settings.tlg_allowed_id
+    return user_id in allowed
+```
+
+**Обработка решения администратора:**
+```python
+async def _handle_admin_decision(
+    self,
+    callback: types.CallbackQuery,
+    decision: str,
+    user_id: int,
+    user_name: str | None
+) -> None:
+    """Handle admin's decision to allow or deny a user."""
+    if decision == "allow":
+        self._settings.add_allowed_user(user_id, user_name)
+        await callback.answer(f"✅ Пользователь {user_id} добавлен")
+        # Уведомляем пользователя
+        await callback.bot.send_message(
+            chat_id=user_id,
+            text="✅ Вам предоставлен доступ к боту!\n\n"
+                 "Отправьте /start для начала работы..."
+        )
+    else:
+        self._settings.add_denied_user(user_id, user_name)
+        await callback.answer(f"❌ Пользователь {user_id} отклонён")
+        # Уведомляем пользователя
+        await callback.bot.send_message(
+            chat_id=user_id,
+            text="❌ Ваш запрос на доступ к боту отклонён."
+        )
 ```
 
 ---

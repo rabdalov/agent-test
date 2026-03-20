@@ -27,7 +27,38 @@ async def stop(self) -> None   # Остановка бота
 
 ### [`KaraokeHandlers`](app/handlers_karaoke.py)
 
-Обработчики команд и сообщений Telegram-бота. Реализует FSM (Finite State Machine) для диалогов.
+Обработчики команд и сообщений Telegram-бота. Реализует FSM (Finite State Machine) для диалогов и управление доступом.
+
+**Управление доступом:**
+
+Доступ разрешён, если пользователь:
+1. Является администратором (`ADMIN_ID`)
+2. Явно добавлен в `allowed_users` через `_handle_admin_decision`
+3. Есть в списке `TLG_ALLOWED_ID`
+
+Доступ отклонён (без уведомления админа), если пользователь в `denied_users`.
+
+**Методы проверки доступа:**
+```python
+def _is_user_allowed(self, message: types.Message) -> bool
+    # Проверка доступа для обычных сообщений
+    # Порядок: admin → denied → allowed → tlg_allowed_id
+
+def _is_user_id_allowed(self, user_id: int | None) -> bool
+    # Проверка доступа для callback-запросов
+    # Та же логика, но принимает user_id напрямую
+
+async def _reject_unauthorized(self, message: types.Message) -> None
+    # Отклонение доступа + уведомление администратора
+
+async def _notify_admin_of_unauthorized_access(...)
+    # Отправка админу сообщения с кнопками Добавить/Отклонить
+
+async def _handle_admin_decision(...)
+    # Обработка решения администратора
+    # Добавляет в allowed_users или denied_users
+    # Уведомляет пользователя о результате
+```
 
 **Поддерживаемые команды:**
 
@@ -49,7 +80,7 @@ async def stop(self) -> None   # Остановка бота
 **Обработчики сообщений:**
 - Текстовые сообщения (URL-ссылки)
 - Аудио/видео файлы
-- Callback-запросы от inline-кнопок
+- Callback-запросы от inline-кнопок (все с проверкой доступа)
 
 ---
 
@@ -376,15 +407,47 @@ Pydantic-модель для загрузки конфигурации из пе
 **Особенности:**
 - Загрузка из `.env` файла
 - Маскирование чувствительных полей при логировании
-- Управление списком разрешённых/отклонённых пользователей
+- Управление списком разрешённых/отклонённых пользователей через `users.json`
 
-**Методы:**
+**Хранение пользователей:**
+```python
+# users.json
+{
+  "allowed_users": [
+    {"user_id": 123456789, "user_name": "@username"}
+  ],
+  "denied_users": [
+    {"user_id": 987654321, "user_name": "@spammer"}
+  ]
+}
+```
+
+**Методы управления доступом:**
 ```python
 def add_allowed_user(user_id: int, user_name: str | None) -> None
+    # Добавляет пользователя в allowed_users
+    # Удаляет из denied_users если был там
+    # Сохраняет в users.json
+
 def add_denied_user(user_id: int, user_name: str | None) -> None
+    # Добавляет пользователя в denied_users
+    # Удаляет из allowed_users если был там
+    # Сохраняет в users.json
+
 def is_user_allowed(user_id: int) -> bool
+    # Проверяет наличие в allowed_users
+
 def is_user_denied(user_id: int) -> bool
+    # Проверяет наличие в denied_users
 ```
+
+**Поля конфигурации для доступа:**
+| Поле | Описание |
+|------|----------|
+| `ADMIN_ID` | Telegram ID администратора (имеет полный доступ) |
+| `TLG_ALLOWED_ID` | JSON-массив разрешённых ID (например, `[123, 456]`) |
+| `allowed_users` | Список одобренных пользователей (загружается из `users.json`) |
+| `denied_users` | Список отклонённых пользователей (загружается из `users.json`) |
 
 ---
 

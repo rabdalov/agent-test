@@ -72,13 +72,28 @@ class KaraokeHandlers:
         user_id = message.from_user.id if message.from_user else None
         if user_id is None:
             return False
+        # Admin always has access
+        if user_id == self._settings.admin_id:
+            return True
         if self._settings.is_user_denied(user_id):
             return False
         if self._settings.is_user_allowed(user_id):
             return True
         allowed = self._settings.tlg_allowed_id
-        if not allowed:
+        return user_id in allowed
+
+    def _is_user_id_allowed(self, user_id: int | None) -> bool:
+        """Return True if the user_id is allowed (for callback handlers)."""
+        if user_id is None:
+            return False
+        # Admin always has access
+        if user_id == self._settings.admin_id:
             return True
+        if self._settings.is_user_denied(user_id):
+            return False
+        if self._settings.is_user_allowed(user_id):
+            return True
+        allowed = self._settings.tlg_allowed_id
         return user_id in allowed
 
     async def _reject_unauthorized(self, message: types.Message) -> None:
@@ -523,17 +538,9 @@ class KaraokeHandlers:
         ) -> None:
             """Обработчик выбора типа сегмента."""
             caller_id = callback.from_user.id if callback.from_user else None
-            if caller_id is None:
-                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
-                return
-            if self._settings.is_user_denied(caller_id):
+            if not self._is_user_id_allowed(caller_id):
                 await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
                 return
-            if not self._settings.is_user_allowed(caller_id):
-                allowed = self._settings.tlg_allowed_id
-                if allowed and caller_id not in allowed:
-                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
-                    return
 
             # Извлечение типа из callback
             try:
@@ -625,17 +632,9 @@ class KaraokeHandlers:
         ) -> None:
             """Запускает пайплайн с шага MIX_AUDIO."""
             caller_id = callback.from_user.id if callback.from_user else None
-            if caller_id is None:
-                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
-                return
-            if self._settings.is_user_denied(caller_id):
+            if not self._is_user_id_allowed(caller_id):
                 await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
                 return
-            if not self._settings.is_user_allowed(caller_id):
-                allowed = self._settings.tlg_allowed_id
-                if allowed and caller_id not in allowed:
-                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
-                    return
 
             await callback.answer("🔄 Запускаю пересчёт...")
 
@@ -784,17 +783,9 @@ class KaraokeHandlers:
         @self.router.callback_query(SearchStates.waiting_for_selection, F.data.startswith("search_select:"))
         async def handle_search_selection(callback: types.CallbackQuery, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             caller_id = callback.from_user.id if callback.from_user else None
-            if caller_id is None:
-                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
-                return
-            if self._settings.is_user_denied(caller_id):
+            if not self._is_user_id_allowed(caller_id):
                 await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
                 return
-            if not self._settings.is_user_allowed(caller_id):
-                allowed = self._settings.tlg_allowed_id
-                if allowed and caller_id not in allowed:
-                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
-                    return
 
             await callback.answer()
 
@@ -844,17 +835,9 @@ class KaraokeHandlers:
         @self.router.callback_query(SearchStates.waiting_for_selection, F.data.startswith("search_yandex:"))
         async def handle_search_yandex(callback: types.CallbackQuery, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             caller_id = callback.from_user.id if callback.from_user else None
-            if caller_id is None:
-                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
-                return
-            if self._settings.is_user_denied(caller_id):
+            if not self._is_user_id_allowed(caller_id):
                 await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
                 return
-            if not self._settings.is_user_allowed(caller_id):
-                allowed = self._settings.tlg_allowed_id
-                if allowed and caller_id not in allowed:
-                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
-                    return
 
             await callback.answer()
 
@@ -977,6 +960,11 @@ class KaraokeHandlers:
         @self.router.callback_query(LyricsChoiceStates.waiting_for_choice, F.data == "lyrics_choice:transcription")
         async def handle_lyrics_choice_transcription(callback: types.CallbackQuery, state: FSMContext) -> None:
             """Пользователь выбрал использовать транскрипцию."""
+            caller_id = callback.from_user.id if callback.from_user else None
+            if not self._is_user_id_allowed(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+
             # Получаем данные из FSM
             data = await state.get_data()
             track_id = data.get("track_id")
@@ -1019,6 +1007,11 @@ class KaraokeHandlers:
         @self.router.callback_query(LyricsChoiceStates.waiting_for_choice, F.data == "lyrics_choice:upload")
         async def handle_lyrics_choice_upload(callback: types.CallbackQuery, state: FSMContext) -> None:
             """Пользователь выбрал загрузить текст вручную."""
+            caller_id = callback.from_user.id if callback.from_user else None
+            if not self._is_user_id_allowed(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+
             # Переходим в FSM ожидания текста
             await state.set_state(LyricsStates.waiting_for_lyrics)
 
@@ -1035,6 +1028,11 @@ class KaraokeHandlers:
         @self.router.callback_query(LyricsConfirmStates.waiting_for_confirmation, F.data == "lyrics_confirm:ok")
         async def handle_lyrics_confirm_ok(callback: types.CallbackQuery, state: FSMContext) -> None:
             """Пользователь подтвердил текст из транскрипции."""
+            caller_id = callback.from_user.id if callback.from_user else None
+            if not self._is_user_id_allowed(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+
             # Получаем данные из FSM
             data = await state.get_data()
             track_id = data.get("track_id")
@@ -1093,6 +1091,11 @@ class KaraokeHandlers:
         @self.router.callback_query(LyricsConfirmStates.waiting_for_confirmation, F.data == "lyrics_confirm:upload")
         async def handle_lyrics_confirm_upload(callback: types.CallbackQuery, state: FSMContext) -> None:
             """Пользователь хочет загрузить свой текст вместо транскрипции."""
+            caller_id = callback.from_user.id if callback.from_user else None
+            if not self._is_user_id_allowed(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+
             # Получаем данные
             data = await state.get_data()
             track_folder = data.get("track_folder")
@@ -1160,17 +1163,9 @@ class KaraokeHandlers:
         @self.router.callback_query(TrackLangStates.waiting_for_lang, F.data.startswith("lang_choice:"))
         async def handle_lang_choice(callback: types.CallbackQuery, state: FSMContext) -> None:  # type: ignore[unused-ignore]
             caller_id = callback.from_user.id if callback.from_user else None
-            if caller_id is None:
-                await callback.answer("⛔ Не удалось определить пользователя.", show_alert=True)
-                return
-            if self._settings.is_user_denied(caller_id):
+            if not self._is_user_id_allowed(caller_id):
                 await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
                 return
-            if not self._settings.is_user_allowed(caller_id):
-                allowed = self._settings.tlg_allowed_id
-                if allowed and caller_id not in allowed:
-                    await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
-                    return
 
             lang = (callback.data or "").split(":", 1)[-1]  # "ru" or "en"
             data = await state.get_data()
@@ -1489,9 +1484,27 @@ class KaraokeHandlers:
         if decision == "allow":
             self._settings.add_allowed_user(user_id, user_name)
             await callback.answer(f"✅ Пользователь {user_id} добавлен в разрешённые.", show_alert=True)
+            # Notify the user that access has been granted
+            try:
+                await callback.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ Вам предоставлен доступ к боту!\n\n"
+                         "Отправьте /start для начала работы или сразу пришлите аудиофайл/ссылку на трек."
+                )
+            except Exception as exc:
+                self._logger.warning(f"Failed to notify user {user_id} about access grant: {exc}")
         else:
             self._settings.add_denied_user(user_id, user_name)
             await callback.answer(f"❌ Пользователь {user_id} добавлен в отклонённые.", show_alert=True)
+            # Notify the user that access has been denied
+            try:
+                await callback.bot.send_message(
+                    chat_id=user_id,
+                    text="❌ Ваш запрос на доступ к боту отклонён.\n\n"
+                         "Если вы считаете это ошибкой, обратитесь к администратору."
+                )
+            except Exception as exc:
+                self._logger.warning(f"Failed to notify user {user_id} about access denial: {exc}")
 
         if callback.message:
             try:
