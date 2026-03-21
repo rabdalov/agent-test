@@ -32,7 +32,7 @@ from .pipeline import KaraokePipeline, LyricsNotFoundError, WaitingForInputError
 from .yandex_music_downloader import YandexMusicDownloader
 from .utils import normalize_filename
 from .segment_change_service import SegmentChangeService
-from .chorus_detector import load_volume_segments, save_volume_segments
+from .chorus_detector import ChorusDetector, load_volume_segments, save_volume_segments
 
 
 class KaraokeHandlers:
@@ -421,6 +421,295 @@ class KaraokeHandlers:
                 "🔍 Введите информацию для поиска в формате Артист - Песня.\n"
                 "Например: Полина Гагарина - Shallow"
             )
+
+        @self.router.message(Command("split"))
+        async def handle_split(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
+            """Обработчик команды /split <время>."""
+            if not self._is_user_allowed(message):
+                await self._reject_unauthorized(message)
+                return
+
+            # Получаем аргумент (время разделения)
+            args = message.text.split(maxsplit=1) if message.text else []
+            if len(args) < 2:
+                await message.answer(
+                    "❌ Укажите время для разделения сегмента.\n"
+                    "Примеры: /split 1:15 (мин:сек), /split 75.5 (секунды)"
+                )
+                return
+
+            time_str = args[1].strip()
+
+            # Поиск последнего трека пользователя
+            caller_user_id = message.from_user.id if message.from_user else None
+            result = self._find_latest_state(user_id=caller_user_id)
+
+            if result is None:
+                await message.answer(
+                    "❌ Нет активного трека. Пожалуйста, начните обработку."
+                )
+                return
+
+            pipeline_state, track_dir = result
+            track_name = track_dir.name
+
+            # Проверка наличия volume_segments_file
+            if not pipeline_state.volume_segments_file:
+                await message.answer(
+                    "❌ Файл разметки сегментов не найден. Сначала выполните /step_chorus."
+                )
+                return
+
+            segments_path = Path(pipeline_state.volume_segments_file)
+            if not segments_path.exists():
+                await message.answer(
+                    "❌ Файл разметки сегментов не найден. Сначала выполните /step_chorus."
+                )
+                return
+
+            # Сервис для работы с сегментами
+            service = SegmentChangeService(
+                chorus_volume=self._settings.chorus_backvocal_volume,
+                default_volume=self._settings.audio_mix_voice_volume,
+            )
+
+            # Парсинг времени
+            try:
+                split_time = service.parse_split_time(time_str)
+            except ValueError:
+                await message.answer(
+                    "❌ Неверный формат времени. Используйте: /split 1:10.5 или /split 70.5"
+                )
+                return
+
+            # Загрузка сегментов
+            try:
+                segments = load_volume_segments(segments_path)
+            except Exception as exc:
+                self._logger.error("Failed to load volume segments for track_id=%s: %s", pipeline_state.track_id, exc)
+                await message.answer(f"❌ Ошибка загрузки разметки сегментов: {exc}")
+                return
+
+            if not segments:
+                await message.answer("❌ Список сегментов пуст.")
+                return
+
+            # Поиск сегмента по времени
+            seg_result = service.find_segment_by_time(split_time, segments)
+            if seg_result is None:
+                total_duration = segments[-1].end if segments else 0
+                await message.answer(
+                    f"❌ Указанное время не попадает ни в один сегмент. "
+                    f"Доступный диапазон: 0:00 - {service.format_time(total_duration)}"
+                )
+                return
+
+            seg_index, found_seg = seg_result
+
+            # Проверка минимальной длительности (1 сек с каждой стороны)
+            min_duration = 3.0  # минимум 3 секунды всего, 1 сек с каждой стороны
+            seg_duration = found_seg.end - found_seg.start
+
+            if seg_duration < min_duration:
+                await message.answer(
+                    f"❌ Сегмент слишком короткий для разделения (минимум {min_duration} секунды)."
+                )
+                return
+
+            # Проверка, что точка разделения не слишком близко к краям (мин 1 сек)
+            if split_time - found_seg.start < 1.0 or found_seg.end - split_time < 1.0:
+                await message.answer(
+                    "❌ Точка разделения слишком близка к границе сегмента. Минимум 1 секунда от края."
+                )
+                return
+
+            # Подготовка путей для пересчёта метрик
+            track_source = pipeline_state.track_source
+            vocal_file = pipeline_state.vocal_file
+            detailed_metrics_path = (
+                Path(pipeline_state.detailed_metrics_file)
+                if pipeline_state.detailed_metrics_file else None
+            )
+
+            # Разделение сегмента
+            try:
+                new_segments, seg1, seg2 = service.split_segment(
+                    seg_index,
+                    split_time,
+                    segments,
+                    track_source=track_source,
+                    vocal_file=vocal_file,
+                    detailed_metrics_path=detailed_metrics_path,
+                )
+            except Exception as exc:
+                self._logger.error("Failed to split segment for track_id=%s: %s", pipeline_state.track_id, exc)
+                await message.answer(f"❌ Ошибка при разделении сегмента: {exc}")
+                return
+
+            # Сохранение обновлённых сегментов
+            try:
+                save_volume_segments(new_segments, segments_path)
+            except Exception as exc:
+                self._logger.error("Failed to save volume segments: %s", exc)
+                await message.answer(f"❌ Ошибка сохранения разметки сегментов: {exc}")
+                return
+
+            # Обновление segment_groups_file если есть
+            if pipeline_state.segment_groups_file:
+                groups_path = Path(pipeline_state.segment_groups_file)
+                if groups_path.exists():
+                    try:
+                        from .chorus_detector import should_merge_same_type
+                        # Создаём временный ChorusDetector для group_volume_segments
+                        temp_detector = ChorusDetector(
+                            chorus_volume=self._settings.chorus_backvocal_volume,
+                            default_volume=self._settings.audio_mix_voice_volume,
+                        )
+                        grouped = temp_detector.merge_segments(
+                            new_segments, should_merge_same_type
+                        )
+                        from .chorus_detector import save_volume_segments as save_groups
+                        save_groups(grouped, groups_path)
+                    except Exception as exc:
+                        self._logger.warning("Failed to update segment groups: %s", exc)
+
+            # Логирование
+            self._logger.info(
+                "User %s split segment #%d at %s for track %s",
+                caller_user_id, seg_index + 1, time_str, pipeline_state.track_id
+            )
+
+            # Форматирование ответа
+            seg_type_label = {
+                "chorus": "Припев",
+                "verse": "Куплет",
+                "instrumental": "Инструментал",
+                "intro": "Интро",
+                "outro": "Аутро",
+                "bridge": "Бридж",
+            }.get(found_seg.segment_type or "verse", found_seg.segment_type or "verse")
+
+            response = (
+                f"✅ Сегмент разделён:\n\n"
+                f"Было:\n"
+                f"<code>{service.format_time(found_seg.start)} - {service.format_time(found_seg.end)} "
+                f"({found_seg.duration:.0f} сек) {seg_type_label}</code>\n\n"
+                f"Стало:\n"
+                f"<code>{service.format_time(seg1.start)} - {service.format_time(seg1.end)} "
+                f"({seg1.duration:.0f} сек) {seg_type_label}</code>\n"
+                f"<code>{service.format_time(seg2.start)} - {service.format_time(seg2.end)} "
+                f"({seg2.duration:.0f} сек) {seg_type_label}</code>"
+            )
+
+            # Клавиатура с действиями
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🔄 Пересчитать", callback_data="split_recalc"),
+                        InlineKeyboardButton(text="📊 Показать", callback_data="split_visualize"),
+                    ]
+                ]
+            )
+
+            await message.answer(
+                response,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+
+        @self.router.callback_query(F.data == "split_recalc")
+        async def handle_split_recalc(
+            callback: types.CallbackQuery,
+            state: FSMContext
+        ) -> None:
+            """Запускает пайплайн с шага MIX_AUDIO после разделения."""
+            caller_id = callback.from_user.id if callback.from_user else None
+            if not self._is_user_id_allowed(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+
+            await callback.answer("🔄 Запускаю пересчёт...")
+
+            # Получение последнего трека пользователя
+            result = self._find_latest_state(user_id=caller_id)
+
+            if result is None:
+                if callback.message:
+                    await callback.message.edit_text(
+                        "❌ Нет активного трека. Пожалуйста, начните обработку."
+                    )
+                return
+
+            pipeline_state, track_dir = result
+            track_name = track_dir.name
+
+            self._logger.info(
+                "User %s triggered recalculation from MIX_AUDIO (split) for track %s",
+                caller_id, pipeline_state.track_id
+            )
+
+            # Отправка нового сообщения
+            if callback.message:
+                try:
+                    await callback.message.edit_text(
+                        f"▶️ Запускаю пересчёт с шага MIX_AUDIO...\n"
+                        f"track: <code>{track_name}</code>",
+                        parse_mode="HTML",
+                    )
+                    pipeline_state.notification_chat_id = callback.message.chat.id
+                    pipeline_state.notification_message_id = callback.message.message_id
+                except Exception:
+                    sent_msg = await callback.message.answer(
+                        f"▶️ Запускаю пересчёт с шага MIX_AUDIO...\n"
+                        f"track: <code>{track_name}</code>",
+                        parse_mode="HTML",
+                    )
+                    pipeline_state.notification_chat_id = sent_msg.chat.id
+                    pipeline_state.notification_message_id = sent_msg.message_id
+            else:
+                sent_msg = await callback.bot.send_message(
+                    chat_id=caller_id,
+                    text=f"▶️ Запускаю пересчёт с шага MIX_AUDIO...\n"
+                         f"track: <code>{track_name}</code>",
+                    parse_mode="HTML",
+                )
+                pipeline_state.notification_chat_id = sent_msg.chat.id
+                pipeline_state.notification_message_id = sent_msg.message_id
+
+            # Сохраняем обновлённые notification IDs
+            state_path = track_dir / "state.json"
+            try:
+                state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+            except OSError as exc:
+                self._logger.error(
+                    "Failed to update state.json with notification IDs for track_id=%s: %s",
+                    pipeline_state.track_id, exc,
+                )
+
+            # Запуск пайплайна с шага MIX_AUDIO
+            await self._run_from_step(
+                callback.message,  # type: ignore[arg-type]
+                track_dir,
+                pipeline_state,
+                PipelineStep.MIX_AUDIO,
+                state,
+            )
+
+        @self.router.callback_query(F.data == "split_visualize")
+        async def handle_split_visualize(
+            callback: types.CallbackQuery,
+            state: FSMContext
+        ) -> None:
+            """Показывает визуализацию после разделения."""
+            caller_id = callback.from_user.id if callback.from_user else None
+            if not self._is_user_id_allowed(caller_id):
+                await callback.answer("⛔ У вас нет доступа к этому боту.", show_alert=True)
+                return
+
+            await callback.answer("📊 Генерирую визуализацию...")
+
+            # Вызываем существующий обработчик визуализации
+            await self._handle_visualize_internal(callback, state)
 
         @self.router.message(Command("change"))
         async def handle_change(message: types.Message, state: FSMContext) -> None:  # type: ignore[unused-ignore]
@@ -2267,3 +2556,86 @@ class KaraokeHandlers:
 
     def _ensure_tracks_root(self) -> None:
         self._tracks_root_dir.mkdir(parents=True, exist_ok=True)
+
+    async def _handle_visualize_internal(
+        self,
+        callback: types.CallbackQuery,
+        state: FSMContext,
+    ) -> None:
+        """Внутренний метод для отправки визуализации."""
+        caller_id = callback.from_user.id if callback.from_user else None
+        result = self._find_latest_state(user_id=caller_id)
+
+        if result is None:
+            if callback.message:
+                await callback.message.edit_text(
+                    "❌ Нет активного трека. Пожалуйста, начните обработку."
+                )
+            return
+
+        pipeline_state, track_dir = result
+        track_name = track_dir.name
+
+        # Проверяем наличие файла визуализации
+        viz_file_str = pipeline_state.visualization_file
+        if viz_file_str and Path(viz_file_str).exists():
+            # Отправляем существующий файл
+            try:
+                from aiogram.types import FSInputFile
+                viz_path = Path(viz_file_str)
+                viz_file = FSInputFile(viz_path, filename=viz_path.name)
+                await callback.message.answer_photo(  # type: ignore[union-attr]
+                    photo=viz_file,
+                    caption=f"📊 Визуализация сегментирования трека\n<code>{track_name}</code>",
+                    parse_mode="HTML",
+                )
+                return
+            except Exception as exc:
+                self._logger.warning("Failed to send existing visualization: %s", exc)
+
+        # Генерируем новую визуализацию
+        try:
+            from .track_visualizer import TrackVisualizer
+
+            visualizer = TrackVisualizer()
+            output_path = track_dir / f"{track_dir.name}_visualization.png"
+
+            await callback.message.answer(  # type: ignore[union-attr]
+                "⏳ Генерирую визуализацию..."
+            )
+
+            viz_result = visualizer.generate(
+                transcribe_json_file=pipeline_state.transcribe_json_file,
+                corrected_transcribe_json_file=pipeline_state.corrected_transcribe_json_file,
+                aligned_lyrics_file=pipeline_state.aligned_lyrics_file,
+                source_lyrics_file=pipeline_state.source_lyrics_file,
+                volume_segments_file=pipeline_state.volume_segments_file,
+                output_path=str(output_path),
+            )
+
+            if viz_result and Path(viz_result).exists():
+                from aiogram.types import FSInputFile
+                viz_file = FSInputFile(viz_result, filename=Path(viz_result).name)
+                await callback.message.answer_photo(  # type: ignore[union-attr]
+                    photo=viz_file,
+                    caption=f"📊 Визуализация сегментирования трека\n<code>{track_name}</code>",
+                    parse_mode="HTML",
+                )
+
+                # Обновляем state.json
+                pipeline_state.visualization_file = str(viz_result)
+                state_path = track_dir / "state.json"
+                try:
+                    state_path.write_text(pipeline_state.model_dump_json(indent=2), encoding="utf-8")
+                except OSError as exc:
+                    self._logger.error("Failed to update state.json with visualization: %s", exc)
+            else:
+                await callback.message.answer(  # type: ignore[union-attr]
+                    "❌ Не удалось сгенерировать визуализацию."
+                )
+
+        except Exception as exc:
+            self._logger.error("Failed to generate visualization: %s", exc)
+            await callback.message.answer(  # type: ignore[union-attr]
+                f"❌ Ошибка при генерации визуализации: {exc}"
+            )
